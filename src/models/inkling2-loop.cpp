@@ -77,21 +77,22 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     const int end   = m.core_end;
 
     auto * cur = build_inputs();
-    std::vector<ggml_tensor *> blocks;
+    ggml_tensor * blocks = nullptr;
     for (int il = 0; il < start; ++il) {
         cur = build_layer(il, il, cur, blocks);
     }
 
     // every pass starts from the prelude output
     auto * prelude = cur;
-    const auto prelude_blocks = blocks;
+    auto * prelude_blocks = blocks;
+    const int64_t n_prelude_blocks = blocks ? blocks->ne[1] : 0;
     for (uint32_t pass = 0; pass < m.n_passes; ++pass) {
-        // the bank of the previous pass: its blocks after the first core block, and its output
-        std::vector<ggml_tensor *> bank;
-        ggml_tensor * bank_out = nullptr;
+        // the mix states of the previous pass: its blocks after the first core block (newest first), and its output
+        ggml_tensor * bank = nullptr;
         if (pass > 0) {
-            bank.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
-            bank_out = cur;
+            const int64_t n_bank = blocks->ne[1] - n_prelude_blocks - 1;
+            ggml_tensor * bank_blocks = n_bank > 0 ? ggml_view_3d(ctx0, blocks, n_embd, n_bank, n_tokens, blocks->nb[1], blocks->nb[2], 0) : nullptr;
+            bank = stack(bank_blocks, ggml_rms_norm(ctx0, cur, 1e-6f));
             cur = prelude;
             blocks = prelude_blocks;
         }
@@ -102,7 +103,7 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
                 continue;
             }
             const auto & loop = m.loop_layers[ip - start];
-            cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query), &loop);
+            cur = build_layer(il, ip, cur, blocks, mix(bank, loop.msg_query), &loop);
         }
     }
 
