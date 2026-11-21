@@ -239,8 +239,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 }
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
-ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
-    ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
+// cur_norm and message_norm are cur and message after an RMS norm
+ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * cur_norm, ggml_tensor * message, ggml_tensor * message_norm,
+        const loop_layer & loop, int ctrl) {
+    ggml_tensor * gate = ggml_concat(ctx0, cur_norm, message_norm, 0);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
     ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
@@ -284,9 +286,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     const int64_t n_embd_head  = hparams.n_embd_head_k(il);
     const int64_t n_embd_k_gqa = n_embd_head*n_head_kv;
 
-    // the message of controller ctrl, [n_embd, n_tokens]
-    auto message = [&](int ctrl) {
-        return ggml_cont(ctx0, ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
+    // row j of a [n_embd, n, n_tokens] tensor, [n_embd, n_tokens]
+    auto row = [&](ggml_tensor * t, int64_t j) {
+        return ggml_view_2d(ctx0, t, n_embd, n_tokens, t->nb[2], j*t->nb[1]);
     };
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
@@ -297,18 +299,20 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     ggml_tensor * inp_norm = ggml_rms_norm(ctx0, cur, 1e-6f);
 
     // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
-    ggml_tensor * inputs[3] = {cur, cur, cur};
-    if (layer.attn_res_query) {
-        ggml_tensor * mixed = mix(stack(blocks, inp_norm), layer.attn_res_query);
-        for (int j = 0; j < 3; ++j) {
-            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
-        }
+    ggml_tensor * mixed = layer.attn_res_query ? mix(stack(blocks, inp_norm), layer.attn_res_query) : ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    ggml_tensor * inputs[3];
+    for (int j = 0; j < 3; ++j) {
+        inputs[j] = row(mixed, std::min<int64_t>(j, mixed->ne[1] - 1));
     }
 
+    ggml_tensor * messages_norm = messages ? ggml_rms_norm(ctx0, messages, 1e-6f) : nullptr;
     if (messages) {
+        ggml_tensor * mixed_norm = ggml_rms_norm(ctx0, mixed, 1e-6f);
+
         // the messages make the Q, K and V inputs of a SWA layer differ
         for (int j = 0; j < 3; ++j) {
-            inputs[j] = control(inputs[j], message(LOOP_CTRL_Q + j), *loop, LOOP_CTRL_Q + j);
+            const int ctrl = LOOP_CTRL_Q + j;
+            inputs[j] = control(inputs[j], row(mixed_norm, std::min<int64_t>(j, mixed->ne[1] - 1)), row(messages, ctrl), row(messages_norm, ctrl), *loop, ctrl);
         }
     }
 
@@ -393,7 +397,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     // MoE
     cur = ggml_reshape_2d(ctx0, mix(stack(blocks, ggml_rms_norm(ctx0, cur, 1e-6f)), layer.ffn_res_query), n_embd, n_tokens);
     if (messages) {
-        cur = control(cur, message(LOOP_CTRL_FFN), *loop, LOOP_CTRL_FFN);
+        cur = control(cur, ggml_rms_norm(ctx0, cur, 1e-6f), row(messages, LOOP_CTRL_FFN), row(messages_norm, LOOP_CTRL_FFN), *loop, LOOP_CTRL_FFN);
     }
     cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
 
