@@ -398,39 +398,34 @@ static __global__ void inkling2_mix_f32(
     }
     __syncthreads();
 
-    // p[j] = softmax weight of block j, p[n_blocks] = weight of x, p[nb_max + 1] = norm scale of x
-    if (threadIdx.x == 0) {
-        float sc[nb_max + 1];
+    // warp 0, lane j: the score of state j (block j, then x at n_blocks), softmax in registers
+    // p[j] = softmax weight of state j, p[nb_max + 1] = norm scale of x
+    if (warp == 0) {
         float sum_ss = 0.0f;
         float sum_dx = 0.0f;
+        float d      = 0.0f;
         for (int w = 0; w < nw; ++w) {
             sum_ss += red[nb_max + 0][w];
             sum_dx += red[nb_max + 1][w];
+            if (lane < n_blocks) {
+                d += red[lane][w];
+            }
         }
         const float s = rsqrtf(sum_ss/n + eps);
+        if (lane == n_blocks) {
+            d = sum_dx*s;
+        }
 
-        float max = -INFINITY;
-        for (int j = 0; j <= n_blocks; ++j) {
-            float d = 0.0f;
-            if (j < n_blocks) {
-                for (int w = 0; w < nw; ++w) {
-                    d += red[j][w];
-                }
-            } else {
-                d = sum_dx*s;
-            }
-            sc[j] = d*scale;
-            max   = fmaxf(max, sc[j]);
+        const float sc  = lane <= n_blocks ? d*scale : -INFINITY;
+        const float max = warp_reduce_max(sc);
+        const float e   = lane <= n_blocks ? expf(sc - max) : 0.0f;
+        const float sum = warp_reduce_sum(e);
+        if (lane <= n_blocks) {
+            p[lane] = e/sum;
         }
-        float sum = 0.0f;
-        for (int j = 0; j <= n_blocks; ++j) {
-            sc[j] = expf(sc[j] - max);
-            sum  += sc[j];
+        if (lane == 0) {
+            p[nb_max + 1] = s;
         }
-        for (int j = 0; j <= n_blocks; ++j) {
-            p[j] = sc[j]/sum;
-        }
-        p[nb_max + 1] = s;
     }
     __syncthreads();
 
@@ -470,8 +465,9 @@ void ggml_cuda_op_inkling2_mix(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int nq       = query->ne[1];
     const int n_blocks = blocks ? blocks->ne[1] : 0;
 
+    // decode runs only nq blocks: a big block keeps more loads in flight
     const dim3 grid(nq, T);
-    const dim3 threads(256);
+    const dim3 threads(1024);
 
     const float * b_d  = blocks ? (const float *) blocks->data : nullptr;
     const int64_t s_b1 = blocks ? blocks->nb[1]/sizeof(float) : 0;

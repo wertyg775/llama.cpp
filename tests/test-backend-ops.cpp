@@ -14098,6 +14098,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n_tokens, true));       // synthetic, Qwen4-Exp kernel without the gate chain
     }
 
+    // INKLING2_MIX: Inkling 2 Mini depth mix, decode
+    test_cases.emplace_back(new test_inkling2_mix(GGML_TYPE_F32, 2304, 5, 1, 1));
+    test_cases.emplace_back(new test_inkling2_mix(GGML_TYPE_F32, 2304, 4, 4, 1, true));
+
     // INKLING2_CTRL: Inkling 2 Mini loop controller, decode and small batches
     for (int64_t n_tokens : {1, 4, 8}) {
         test_cases.emplace_back(new test_inkling2_ctrl(GGML_TYPE_BF16, 2304, 64, n_tokens, true));
