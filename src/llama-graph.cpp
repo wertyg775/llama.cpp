@@ -2670,6 +2670,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float beta = hparams.situ_beta;
                     const float lb   = hparams.situ_linear_beta;
 
+                    if (arch == LLM_ARCH_INKLING2_LOOP && gate_up_exps && gate_up_exps->buffer &&
+                        !ggml_backend_buffer_is_host(gate_up_exps->buffer)) {
+                        cur = ggml_cont(ctx0, cur);
+                        up = ggml_cont(ctx0, up);
+                    }
+
                     ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
                     act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
                     if (lb > 0.0f) {
