@@ -1100,6 +1100,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_POST",
     "TOP_K_MASK",
     "INKLING2_CTRL",
+    "INKLING2_CLIP",
 
     "UNARY",
 
@@ -1119,7 +1120,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1216,6 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
     "inkling2_ctrl(cur, msg, down, gain, forget)",
+    "inkling2_clip(x, scale, tau)",
 
     "unary(x)",
 
@@ -1235,7 +1237,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6607,6 +6609,41 @@ struct ggml_tensor * ggml_inkling2_ctrl(
     result->src[2] = down;
     result->src[3] = gain;
     result->src[4] = forget;
+
+    return result;
+}
+
+// ggml_inkling2_clip
+
+struct ggml_tensor * ggml_inkling2_clip(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * tau,
+        float                 threshold,
+        float                 eps) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->nb[0] == sizeof(float));
+    GGML_ASSERT(threshold > 0.0f);
+
+    if (scale) {
+        GGML_ASSERT(scale->type == GGML_TYPE_F32 && ggml_is_contiguous(scale));
+        GGML_ASSERT(scale->ne[0] == x->ne[0] && (scale->ne[1] == 1 || scale->ne[1] == x->ne[1]) && scale->ne[2] == 1 && scale->ne[3] == 1);
+    }
+    if (tau) {
+        GGML_ASSERT(tau->type == GGML_TYPE_F32 && ggml_is_contiguous(tau));
+        GGML_ASSERT(tau->ne[0] == 1 && tau->ne[1] == 1 && (tau->ne[2] == 1 || tau->ne[2] == x->ne[2]) && tau->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
+
+    ggml_set_op_params_f32(result, 0, threshold);
+    ggml_set_op_params_f32(result, 1, eps);
+
+    result->op     = GGML_OP_INKLING2_CLIP;
+    result->src[0] = x;
+    result->src[1] = scale;
+    result->src[2] = tau;
 
     return result;
 }

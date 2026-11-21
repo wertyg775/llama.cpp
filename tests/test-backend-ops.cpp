@@ -4925,6 +4925,50 @@ struct test_inkling2_ctrl : public test_case {
     }
 };
 
+// GGML_OP_INKLING2_CLIP
+struct test_inkling2_clip : public test_case {
+    const std::array<int64_t, 3> ne; // d, heads, tokens
+    const int   scale;               // 0: none, 1: [d, heads], 2: [d, 1]
+    const int   tau;                 // 0: none, 1: per token, 2: one value
+    const bool  view;                // x has padded rows
+    const float threshold;
+
+    std::string vars() override {
+        return VARS_TO_STR5(ne, scale, tau, view, threshold);
+    }
+
+    test_inkling2_clip(std::array<int64_t, 3> ne = {128, 4, 3}, int scale = 1, int tau = 1, bool view = false, float threshold = 4.0f)
+        : ne(ne), scale(scale), tau(tau), view(view), threshold(threshold) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x;
+        if (view) {
+            ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0] + 5, ne[1], ne[2]);
+            ggml_set_name(a, "a");
+            x = ggml_view_3d(ctx, a, ne[0], ne[1], ne[2], a->nb[1], a->nb[2], 0);
+        } else {
+            x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+        }
+        ggml_set_name(x, "x");
+
+        ggml_tensor * s = nullptr;
+        if (scale) {
+            s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], scale == 1 ? ne[1] : 1);
+            ggml_set_name(s, "scale");
+        }
+
+        ggml_tensor * t = nullptr;
+        if (tau) {
+            t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, tau == 1 ? ne[2] : 1);
+            ggml_set_name(t, "tau");
+        }
+
+        ggml_tensor * out = ggml_inkling2_clip(ctx, x, s, t, threshold, 1e-6f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -10866,6 +10910,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true));
+    for (int scale : {0, 1, 2}) {
+        for (int tau : {0, 1, 2}) {
+            test_cases.emplace_back(new test_inkling2_clip({128, 4, 3}, scale, tau));
+            test_cases.emplace_back(new test_inkling2_clip({16, 24, 5}, scale, tau, true));
+        }
+    }
+    test_cases.emplace_back(new test_inkling2_clip({128, 24, 1}, 1, 1, false, 22.6f)); // Inkling 2 Mini Q, no row is clipped
+    test_cases.emplace_back(new test_inkling2_clip({128, 8, 17}, 0, 0, false, 4.0f));
+    test_cases.emplace_back(new test_inkling2_clip({37, 3, 2}, 1, 1, true, 2.0f));      // odd row size
+    test_cases.emplace_back(new test_inkling2_clip({300, 2, 2}, 2, 0, false, 6.0f));    // row longer than a warp x 8
     for (ggml_type type : {GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int64_t n_tokens : {1, 3, 8, 17}) {
             test_cases.emplace_back(new test_inkling2_ctrl(type, 64, 16, n_tokens));

@@ -160,8 +160,14 @@ std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const 
     return std::make_unique<graph>(params);
 }
 
-// scale each row down to an L2 norm of at most threshold, after the optional per-channel scale
-ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, float threshold) {
+// scale each row down to an L2 norm of at most threshold, after the optional per-channel scale, then multiply by the optional tau
+ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, ggml_tensor * tau, float threshold, int il) {
+    if (cparams.fused_inkling2) {
+        cur = ggml_inkling2_clip(ctx0, cur, scale, tau, threshold, 1e-6f);
+        res->add_fused_node({LLM_FUSED_OP_INKLING2, cur, il});
+        return cur;
+    }
+
     if (scale) {
         cur = ggml_mul(ctx0, cur, scale);
     }
@@ -171,7 +177,9 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
     // x*min(1, t/(norm + eps)) = x/max(1, (norm + eps)/t)
     norm = ggml_clamp(ctx0, ggml_scale_bias(ctx0, norm, 1.0f/threshold, 1e-6f/threshold), 1.0f, INFINITY);
 
-    return ggml_div(ctx0, cur, norm);
+    cur = ggml_div(ctx0, cur, norm);
+
+    return tau ? ggml_mul(ctx0, cur, tau) : cur;
 }
 
 // attention over the depth: mix the normalized states [n_embd, n, n_tokens] with learned queries
@@ -247,7 +255,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 // the fused controller op reads the plain weights and normalizes its inputs itself
 // it is a mat-vec per token, so large batches keep the mul_mat graph
 bool llama_model_inkling2::graph::fused_control(const loop_layer & loop) const {
-    if (!cparams.fused_inkling2_ctrl || n_tokens > std::max<int64_t>(8, ubatch.n_seqs)) {
+    if (!cparams.fused_inkling2 || n_tokens > std::max<int64_t>(8, ubatch.n_seqs)) {
         return false;
     }
 
@@ -276,7 +284,7 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
         const loop_layer & loop, int ctrl, int il) {
     if (!cur_norm) {
         ggml_tensor * out = ggml_inkling2_ctrl(ctx0, cur, message, loop.ctrl_down[ctrl], loop.ctrl_gain[ctrl], loop.ctrl_forget[ctrl], 1e-6f);
-        res->add_fused_node({LLM_FUSED_OP_INKLING2_CTRL, out, il});
+        res->add_fused_node({LLM_FUSED_OP_INKLING2, out, il});
         return out;
     }
 
@@ -381,15 +389,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
         ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
 
-        Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
-        Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);
-        Vcur = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), hparams.f_norm_rms_eps);
-        Rcur = clip(ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip);
+        // full-attention layers scale q and r by the log-scaled positions
+        ggml_tensor * tau_l = is_swa ? nullptr : tau;
 
-        if (!is_swa) {
-            Qcur = ggml_mul(ctx0, Qcur, tau);
-            Rcur = ggml_mul(ctx0, Rcur, tau);
-        }
+        Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, tau_l, hparams.f_qk_clip, ip);
+        Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           nullptr, hparams.f_qk_clip, ip);
+        Vcur = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), hparams.f_norm_rms_eps);
+        Rcur = clip(ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, tau_l, hparams.f_relative_clip, ip);
 
         cb(Qcur, "Qcur", il);
         cb(Kcur, "Kcur", il);

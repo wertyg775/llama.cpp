@@ -11770,6 +11770,70 @@ void ggml_compute_forward_inkling2_ctrl(
     }
 }
 
+// ggml_compute_forward_inkling2_clip
+
+static void ggml_compute_forward_inkling2_clip_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0  = dst->src[0];
+    const ggml_tensor * scale = dst->src[1];
+    const ggml_tensor * tau   = dst->src[2];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst));
+
+    const float threshold = ggml_get_op_params_f32(dst, 0);
+    const float eps       = ggml_get_op_params_f32(dst, 1);
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nr  = ne01*ne02*ne03;
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i1 = ir % ne01;
+        const int64_t i2 = (ir / ne01) % ne02;
+        const int64_t i3 = ir / (ne01*ne02);
+
+        const float * xs = (const float *) ((const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03);
+        const float * ss = scale ? (const float *) scale->data + (scale->ne[1] == 1 ? 0 : i1)*ne00 : nullptr;
+        float       * y  = (float *) ((char *) dst->data + i1*nb1 + i2*nb2 + i3*nb3);
+
+        ggml_float sum = 0.0;
+        for (int64_t i0 = 0; i0 < ne00; ++i0) {
+            y[i0] = ss ? xs[i0]*ss[i0] : xs[i0];
+            sum += (ggml_float) (y[i0]*y[i0]);
+        }
+
+        const float norm = sqrtf(sum);
+        const float d    = MAX(norm*(1.0f/threshold) + eps/threshold, 1.0f);
+        const float t    = tau ? ((const float *) tau->data)[tau->ne[2] == 1 ? 0 : i2] : 1.0f;
+
+        for (int64_t i0 = 0; i0 < ne00; ++i0) {
+            y[i0] = y[i0]/d*t;
+        }
+    }
+}
+
+void ggml_compute_forward_inkling2_clip(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_inkling2_clip_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_top_k_mask
 
 void ggml_compute_forward_top_k_mask(

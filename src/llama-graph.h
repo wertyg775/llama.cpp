@@ -54,7 +54,7 @@ enum llm_fused_op {
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
     LLM_FUSED_OP_TOP_K_MASK,
-    LLM_FUSED_OP_INKLING2_CTRL,
+    LLM_FUSED_OP_INKLING2,
 };
 
 enum llm_ffn_op_type : int {

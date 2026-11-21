@@ -191,3 +191,67 @@ void ggml_cuda_op_inkling2_ctrl(ggml_backend_cuda_context & ctx, ggml_tensor * d
         default: GGML_ABORT("unsupported type %s", ggml_type_name(gain->type));
     }
 }
+
+// dst = y/max(1, (|y| + eps)/threshold)*tau with y = x*scale, one warp per row
+template <bool has_scale, bool has_tau>
+static __global__ void inkling2_clip_f32(
+        const float * __restrict__ x, const float * __restrict__ scale, const float * __restrict__ tau, float * __restrict__ dst,
+        const int ne00, const int ne01, const int ne02, const int64_t nr, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t s_scale1, const int s_tau2, const float inv_threshold, const float eps_threshold) {
+    const int64_t ir = (int64_t) blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    if (ir >= nr) {
+        return;
+    }
+    const int lane = threadIdx.x % WARP_SIZE;
+
+    const int64_t i1 = ir % ne01;
+    const int64_t i2 = (ir/ne01) % ne02;
+    const int64_t i3 = ir/((int64_t) ne01*ne02);
+
+    const float * xs = x + i1*s01 + i2*s02 + i3*s03;
+    const float * ss = has_scale ? scale + i1*s_scale1 : nullptr;
+    float       * y  = dst + ir*ne00;
+
+    float sum = 0.0f;
+    for (int i0 = lane; i0 < ne00; i0 += WARP_SIZE) {
+        const float v = has_scale ? xs[i0]*ss[i0] : xs[i0];
+        sum += v*v;
+    }
+    sum = warp_reduce_sum(sum);
+
+    const float d = fmaxf(sqrtf(sum)*inv_threshold + eps_threshold, 1.0f);
+    const float t = has_tau ? tau[i2*s_tau2] : 1.0f;
+
+    for (int i0 = lane; i0 < ne00; i0 += WARP_SIZE) {
+        const float v = has_scale ? xs[i0]*ss[i0] : xs[i0];
+        y[i0] = v/d*t;
+    }
+}
+
+void ggml_cuda_op_inkling2_clip(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * scale = dst->src[1];
+    const ggml_tensor * tau   = dst->src[2];
+
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    float threshold;
+    float eps;
+    memcpy(&threshold, (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&eps,       (const float *) dst->op_params + 1, sizeof(float));
+
+    const int64_t nr = ggml_nrows(x);
+
+    const int  rows_per_block = 256/WARP_SIZE;
+    const dim3 blocks((nr + rows_per_block - 1)/rows_per_block);
+    const dim3 threads(rows_per_block*WARP_SIZE);
+
+    const int64_t s_scale1 = scale && scale->ne[1] > 1 ? x->ne[0] : 0;
+    const int     s_tau2   = tau && tau->ne[2] > 1 ? 1 : 0;
+
+    auto kernel = scale ? (tau ? inkling2_clip_f32<true,  true> : inkling2_clip_f32<true,  false>)
+                        : (tau ? inkling2_clip_f32<false, true> : inkling2_clip_f32<false, false>);
+    kernel<<<blocks, threads, 0, ctx.stream()>>>((const float *) x->data, scale ? (const float *) scale->data : nullptr,
+            tau ? (const float *) tau->data : nullptr, (float *) dst->data, x->ne[0], x->ne[1], x->ne[2], nr,
+            x->nb[1]/sizeof(float), x->nb[2]/sizeof(float), x->nb[3]/sizeof(float), s_scale1, s_tau2, 1.0f/threshold, eps/threshold);
+}

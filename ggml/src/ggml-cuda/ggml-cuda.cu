@@ -3139,6 +3139,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_INKLING2_CTRL:
             ggml_cuda_op_inkling2_ctrl(ctx, dst);
             break;
+        case GGML_OP_INKLING2_CLIP:
+            ggml_cuda_op_inkling2_clip(ctx, dst);
+            break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
@@ -6816,6 +6819,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->type == GGML_TYPE_F32;
         case GGML_OP_INKLING2_CTRL:
             return ggml_cuda_inkling2_ctrl_supported(op);
+        case GGML_OP_INKLING2_CLIP:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->nb[0] == sizeof(float) && op->src[0]->nb[1] % sizeof(float) == 0;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:

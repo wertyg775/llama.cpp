@@ -166,9 +166,9 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
-static const llm_fused_op_probe llm_fused_op_inkling2_ctrl_probe = {
-    /*.op               =*/ LLM_FUSED_OP_INKLING2_CTRL,
-    /*.name             =*/ "fused Inkling 2 loop controller",
+static const llm_fused_op_probe llm_fused_op_inkling2_probe = {
+    /*.op               =*/ LLM_FUSED_OP_INKLING2,
+    /*.name             =*/ "fused Inkling 2 ops",
     /*.n_tokens_per_seq =*/ 1,
 };
 
@@ -352,8 +352,8 @@ llama_context::llama_context(
     cparams.fused_top_k_mask = true;
     cparams.auto_ftkm        = hparams.indexer_top_k > 0;
 
-    cparams.fused_inkling2_ctrl = true;
-    cparams.auto_fictrl         = model.arch == LLM_ARCH_INKLING2_LOOP;
+    cparams.fused_inkling2 = true;
+    cparams.auto_finkling2 = model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -754,10 +754,10 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         cparams.auto_ftkm = false;
     }
 
-    if (cparams.auto_fictrl) {
-        LLAMA_LOG_INFO("%s: resolving fused Inkling 2 loop controller support:\n", func);
-        resolve(llm_fused_op_inkling2_ctrl_probe, cparams.fused_inkling2_ctrl);
-        cparams.auto_fictrl = false;
+    if (cparams.auto_finkling2) {
+        LLAMA_LOG_INFO("%s: resolving fused Inkling 2 op support:\n", func);
+        resolve(llm_fused_op_inkling2_probe, cparams.fused_inkling2);
+        cparams.auto_finkling2 = false;
     }
 }
 

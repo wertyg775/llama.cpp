@@ -416,6 +416,7 @@ extern "C" {
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
         GGML_OP_INKLING2_CTRL,
+        GGML_OP_INKLING2_CLIP,
 
         GGML_OP_UNARY,
 
@@ -2512,6 +2513,21 @@ extern "C" {
             struct ggml_tensor  * down,
             struct ggml_tensor  * gain,
             struct ggml_tensor  * forget,
+            float                 eps);
+
+    // inkling2 row clip: scale each row down to an L2 norm of at most threshold, then multiply by tau
+    //   x:     [d, ne1, ne2, ne3] f32, rows contiguous
+    //   scale: [d, ne1 or 1] f32 or NULL, multiplies x before the norm
+    //   tau:   [1, 1, ne2 or 1] f32 or NULL
+    //   y      = x*scale
+    //   result = y/max(1, (|y| + eps)/threshold)*tau, contiguous
+    //
+    GGML_API struct ggml_tensor * ggml_inkling2_clip(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * tau,
+            float                 threshold,
             float                 eps);
 
     // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
