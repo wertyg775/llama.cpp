@@ -418,6 +418,7 @@ extern "C" {
         GGML_OP_INKLING2_CTRL,
         GGML_OP_INKLING2_CLIP,
         GGML_OP_INKLING2_CONV,
+        GGML_OP_INKLING2_MIX,
 
         GGML_OP_UNARY,
 
@@ -2547,6 +2548,20 @@ extern "C" {
             struct ggml_tensor  * weight,
             struct ggml_tensor  * dynamic,
             float                 scale);
+
+    // inkling2 depth mix: attention over the states [blocks, rms_norm(x, eps)] with learned queries
+    //   blocks: [n, n_blocks, T] f32 or NULL, rows contiguous
+    //   x:      [n, T] f32, rows contiguous
+    //   query:  [n, nq] f32, f16 or bf16
+    //   result[:, q, t] = sum_j softmax_j(scale*state_j.query_q)*state_j, [n, nq, T]
+    //
+    GGML_API struct ggml_tensor * ggml_inkling2_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * query,
+            float                 scale,
+            float                 eps);
 
     // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
     //

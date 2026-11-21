@@ -1102,6 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "INKLING2_CTRL",
     "INKLING2_CLIP",
     "INKLING2_CONV",
+    "INKLING2_MIX",
 
     "UNARY",
 
@@ -1121,7 +1122,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1220,6 +1221,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "inkling2_ctrl(cur, msg, down, gain, forget)",
     "inkling2_clip(x, scale, tau)",
     "inkling2_conv(cur, past, weight, dynamic)",
+    "inkling2_mix(x, query, blocks)",
 
     "unary(x)",
 
@@ -1239,7 +1241,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6685,6 +6687,36 @@ struct ggml_tensor * ggml_inkling2_conv(
     result->src[1] = past;
     result->src[2] = weight;
     result->src[3] = dynamic;
+
+    return result;
+}
+
+// ggml_inkling2_mix
+
+struct ggml_tensor * ggml_inkling2_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * blocks,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * query,
+        float                 scale,
+        float                 eps) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && ggml_nrows(x) == x->ne[1]);
+    GGML_ASSERT(query->ne[0] == x->ne[0] && ggml_nrows(query) == query->ne[1] && query->nb[0] == ggml_type_size(query->type));
+
+    if (blocks) {
+        GGML_ASSERT(blocks->type == GGML_TYPE_F32 && blocks->nb[0] == sizeof(float));
+        GGML_ASSERT(blocks->ne[0] == x->ne[0] && blocks->ne[2] == x->ne[1] && blocks->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, x->ne[0], query->ne[1], x->ne[1]);
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_f32(result, 1, eps);
+
+    result->op     = GGML_OP_INKLING2_MIX;
+    result->src[0] = x;
+    result->src[1] = query;
+    result->src[2] = blocks;
 
     return result;
 }

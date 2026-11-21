@@ -11911,6 +11911,104 @@ void ggml_compute_forward_inkling2_conv(
     }
 }
 
+// ggml_compute_forward_inkling2_mix
+
+static void ggml_compute_forward_inkling2_mix_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x      = dst->src[0];
+    const ggml_tensor * query  = dst->src[1];
+    const ggml_tensor * blocks = dst->src[2];
+
+    const float scale = ggml_get_op_params_f32(dst, 0);
+    const float eps   = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t n        = x->ne[0];
+    const int64_t T        = x->ne[1];
+    const int64_t nq       = query->ne[1];
+    const int64_t n_blocks = blocks ? blocks->ne[1] : 0;
+    const int64_t n_states = n_blocks + 1;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    float * q  = (float *) params->wdata + ith*(2*n + n_states + CACHE_LINE_SIZE_F32);
+    float * xn = q + n;
+    float * p  = xn + n;
+
+    // state j of token t: block j, the normalized x last
+    auto state = [&](int64_t j, int64_t t) {
+        return j < n_blocks ? (const float *) ((const char *) blocks->data + j*blocks->nb[1] + t*blocks->nb[2]) : xn;
+    };
+
+    int64_t tx = -1;
+    for (int64_t ir = ith; ir < nq*T; ir += nth) {
+        const int64_t iq = ir % nq;
+        const int64_t t  = ir / nq;
+
+        if (t != tx) {
+            const float * xs = (const float *) ((const char *) x->data + t*x->nb[1]);
+
+            ggml_float sum = 0.0;
+            for (int64_t i = 0; i < n; ++i) {
+                sum += (ggml_float) (xs[i]*xs[i]);
+            }
+            const float mean = sum/n;
+            const float s    = 1.0f/sqrtf(mean + eps);
+            for (int64_t i = 0; i < n; ++i) {
+                xn[i] = xs[i]*s;
+            }
+            tx = t;
+        }
+
+        const char * qs = (const char *) query->data + iq*query->nb[1];
+        if (query->type == GGML_TYPE_F32) {
+            memcpy(q, qs, n*sizeof(float));
+        } else {
+            ggml_get_type_traits(query->type)->to_float(qs, q, n);
+        }
+
+        float max = -INFINITY;
+        for (int64_t j = 0; j < n_states; ++j) {
+            ggml_vec_dot_f32(n, &p[j], 0, state(j, t), 0, q, 0, 1);
+            p[j] *= scale;
+            max = MAX(max, p[j]);
+        }
+        ggml_float psum = 0.0;
+        for (int64_t j = 0; j < n_states; ++j) {
+            p[j] = expf(p[j] - max);
+            psum += p[j];
+        }
+        for (int64_t j = 0; j < n_states; ++j) {
+            p[j] /= psum;
+        }
+
+        float * y = (float *) ((char *) dst->data + iq*dst->nb[1] + t*dst->nb[2]);
+        for (int64_t i = 0; i < n; ++i) {
+            float acc = 0.0f;
+            for (int64_t j = 0; j < n_states; ++j) {
+                acc += state(j, t)[i]*p[j];
+            }
+            y[i] = acc;
+        }
+    }
+}
+
+void ggml_compute_forward_inkling2_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_inkling2_mix_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_top_k_mask
 
 void ggml_compute_forward_top_k_mask(

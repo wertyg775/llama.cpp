@@ -2507,7 +2507,8 @@ struct llama_model_inkling2 : public llama_model_base {
 
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
-        ggml_tensor * mix(ggml_tensor * states, ggml_tensor * query);
+        ggml_tensor * mix(ggml_tensor * blocks, ggml_tensor * cur, ggml_tensor * cur_norm, ggml_tensor * query, int il);
+        ggml_tensor * mix_states(ggml_tensor * states, ggml_tensor * query);
         ggml_tensor * stack(ggml_tensor * blocks, ggml_tensor * cur);
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, ggml_tensor * tau, float threshold, int il);
         ggml_tensor * convolve(

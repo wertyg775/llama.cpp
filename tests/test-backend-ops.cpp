@@ -5010,6 +5010,56 @@ struct test_inkling2_conv : public test_case {
     }
 };
 
+// GGML_OP_INKLING2_MIX
+struct test_inkling2_mix : public test_case {
+    const ggml_type type;     // of the queries
+    const int64_t   n;
+    const int64_t   n_blocks; // 0: no blocks
+    const int64_t   nq;
+    const int64_t   n_tokens;
+    const bool      view;     // the blocks are the first n_blocks of a bigger stack
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, n, n_blocks, nq, n_tokens, view);
+    }
+
+    test_inkling2_mix(ggml_type type = GGML_TYPE_F32, int64_t n = 64, int64_t n_blocks = 3, int64_t nq = 1, int64_t n_tokens = 1, bool view = false)
+        : type(type), n(n), n_blocks(n_blocks), nq(nq), n_tokens(n_tokens), view(view) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * blocks = nullptr;
+        if (n_blocks) {
+            blocks = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, n_blocks + (view ? 2 : 0), n_tokens);
+            ggml_set_name(blocks, "blocks");
+            if (view) {
+                blocks = ggml_view_3d(ctx, blocks, n, n_blocks, n_tokens, blocks->nb[1], blocks->nb[2], 0);
+            }
+        }
+
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * query = ggml_new_tensor_2d(ctx, type, n, nq);
+        ggml_set_name(query, "query");
+
+        ggml_tensor * out = ggml_inkling2_mix(ctx, blocks, x, query, 1.0f/sqrtf(n), 1e-6f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    // normalized states and unit queries give scores near unit size, so the softmax does not saturate
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "blocks") {
+                init_tensor_uniform(t, -1.7f, 1.7f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -10951,6 +11001,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true));
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
+        for (int64_t n_blocks : {0, 1, 5, 15}) {
+            test_cases.emplace_back(new test_inkling2_mix(type, 64, n_blocks, 1, 1));
+            test_cases.emplace_back(new test_inkling2_mix(type, 2304, n_blocks, 3, 2, n_blocks > 0)); // Inkling 2 Mini
+        }
+        test_cases.emplace_back(new test_inkling2_mix(type, 2304, 4, 4, 1, true));
+        test_cases.emplace_back(new test_inkling2_mix(type, 100, 6, 2, 17));
+    }
+    test_cases.emplace_back(new test_inkling2_mix(GGML_TYPE_F16, 300, 2, 1, 3));
     for (int64_t n_heads : {0, 4}) {
         for (auto [n_seqs, n_seq_tokens] : std::vector<std::pair<int64_t, int64_t>>{{1, 1}, {3, 1}, {1, 2}, {1, 5}, {2, 70}, {1, 200}}) {
             test_cases.emplace_back(new test_inkling2_conv(64, 4, n_seqs, n_seq_tokens, n_heads));

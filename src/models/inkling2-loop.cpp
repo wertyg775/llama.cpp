@@ -88,11 +88,15 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     const int64_t n_prelude_blocks = blocks ? blocks->ne[1] : 0;
     for (uint32_t pass = 0; pass < m.n_passes; ++pass) {
         // the mix states of the previous pass: its blocks after the first core block (newest first), and its output
-        ggml_tensor * bank = nullptr;
+        // the fused mix takes the blocks and the output apart, the other path stacks them once per pass
+        ggml_tensor * bank_blocks = nullptr;
+        ggml_tensor * bank_cur    = nullptr;
+        ggml_tensor * bank        = nullptr;
         if (pass > 0) {
             const int64_t n_bank = blocks->ne[1] - n_prelude_blocks - 1;
-            ggml_tensor * bank_blocks = n_bank > 0 ? ggml_view_3d(ctx0, blocks, n_embd, n_bank, n_tokens, blocks->nb[1], blocks->nb[2], 0) : nullptr;
-            bank = stack(bank_blocks, ggml_rms_norm(ctx0, cur, 1e-6f));
+            bank_blocks = n_bank > 0 ? ggml_view_3d(ctx0, blocks, n_embd, n_bank, n_tokens, blocks->nb[1], blocks->nb[2], 0) : nullptr;
+            bank_cur    = cur;
+            bank        = cparams.fused_inkling2 ? nullptr : stack(bank_blocks, ggml_rms_norm(ctx0, cur, 1e-6f));
             cur = prelude;
             blocks = prelude_blocks;
         }
@@ -103,7 +107,8 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
                 continue;
             }
             const auto & loop = m.loop_layers[ip - start];
-            cur = build_layer(il, ip, cur, blocks, mix(bank, loop.msg_query), &loop);
+            ggml_tensor * messages = bank ? mix_states(bank, loop.msg_query) : mix(bank_blocks, bank_cur, nullptr, loop.msg_query, ip);
+            cur = build_layer(il, ip, cur, blocks, messages, &loop);
         }
     }
 

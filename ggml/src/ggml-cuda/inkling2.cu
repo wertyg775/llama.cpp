@@ -333,3 +333,166 @@ void ggml_cuda_op_inkling2_conv(ggml_backend_cuda_context & ctx, ggml_tensor * d
             cur->nb[1]/sizeof(float), past->nb[0]/sizeof(float), past->nb[1]/sizeof(float), past->nb[2]/sizeof(float),
             dynamic ? dynamic->nb[1]/sizeof(float) : 0, scale);
 }
+
+// the most blocks a mix kernel keeps in registers
+static constexpr int INKLING2_MIX_MAX_BLOCKS = 15;
+
+// one block per (query, token): the scores of all states in one pass, the softmax, then the weighted sum
+template <typename T>
+static __global__ void inkling2_mix_f32(
+        const float * __restrict__ x, const T * __restrict__ query, const float * __restrict__ blocks, float * __restrict__ dst,
+        const int n, const int nq, const int n_blocks, const int64_t s_x1, const int64_t s_q1, const int64_t s_b1, const int64_t s_b2,
+        const float scale, const float eps) {
+    constexpr int nb_max = INKLING2_MIX_MAX_BLOCKS;
+
+    const int iq = blockIdx.x;
+    const int t  = blockIdx.y;
+
+    const float * xs = x + t*s_x1;
+    const T     * qs = query + iq*s_q1;
+    const float * bs = blocks + t*s_b2;
+
+    float dot[nb_max];
+#pragma unroll
+    for (int j = 0; j < nb_max; ++j) {
+        dot[j] = 0.0f;
+    }
+    float ss = 0.0f;
+    float dx = 0.0f;
+
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float qi = ggml_cuda_cast<float>(qs[i]);
+        const float xi = xs[i];
+        ss += xi*xi;
+        dx += xi*qi;
+#pragma unroll
+        for (int j = 0; j < nb_max; ++j) {
+            if (j < n_blocks) {
+                dot[j] += bs[j*s_b1 + i]*qi;
+            }
+        }
+    }
+
+    // per warp sums: the block dots, then the sum of squares and the dot of x
+    __shared__ float red[nb_max + 2][32];
+    __shared__ float p[nb_max + 2];
+
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int nw   = blockDim.x / WARP_SIZE;
+
+#pragma unroll
+    for (int j = 0; j < nb_max; ++j) {
+        if (j < n_blocks) {
+            const float v = warp_reduce_sum(dot[j]);
+            if (lane == 0) {
+                red[j][warp] = v;
+            }
+        }
+    }
+    ss = warp_reduce_sum(ss);
+    dx = warp_reduce_sum(dx);
+    if (lane == 0) {
+        red[nb_max + 0][warp] = ss;
+        red[nb_max + 1][warp] = dx;
+    }
+    __syncthreads();
+
+    // p[j] = softmax weight of block j, p[n_blocks] = weight of x, p[nb_max + 1] = norm scale of x
+    if (threadIdx.x == 0) {
+        float sc[nb_max + 1];
+        float sum_ss = 0.0f;
+        float sum_dx = 0.0f;
+        for (int w = 0; w < nw; ++w) {
+            sum_ss += red[nb_max + 0][w];
+            sum_dx += red[nb_max + 1][w];
+        }
+        const float s = rsqrtf(sum_ss/n + eps);
+
+        float max = -INFINITY;
+        for (int j = 0; j <= n_blocks; ++j) {
+            float d = 0.0f;
+            if (j < n_blocks) {
+                for (int w = 0; w < nw; ++w) {
+                    d += red[j][w];
+                }
+            } else {
+                d = sum_dx*s;
+            }
+            sc[j] = d*scale;
+            max   = fmaxf(max, sc[j]);
+        }
+        float sum = 0.0f;
+        for (int j = 0; j <= n_blocks; ++j) {
+            sc[j] = expf(sc[j] - max);
+            sum  += sc[j];
+        }
+        for (int j = 0; j <= n_blocks; ++j) {
+            p[j] = sc[j]/sum;
+        }
+        p[nb_max + 1] = s;
+    }
+    __syncthreads();
+
+    const float px = p[n_blocks];
+    const float s  = p[nb_max + 1];
+
+    float * y = dst + ((int64_t) t*nq + iq)*n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j < n_blocks; ++j) {
+            acc += bs[j*s_b1 + i]*p[j];
+        }
+        y[i] = acc + (xs[i]*s)*px;
+    }
+}
+
+bool ggml_cuda_inkling2_mix_supported(const ggml_tensor * op) {
+    const ggml_tensor * query  = op->src[1];
+    const ggml_tensor * blocks = op->src[2];
+
+    return (query->type == GGML_TYPE_F32 || query->type == GGML_TYPE_F16 || query->type == GGML_TYPE_BF16) &&
+        (!blocks || blocks->ne[1] <= INKLING2_MIX_MAX_BLOCKS) && op->ne[2] <= 65535;
+}
+
+void ggml_cuda_op_inkling2_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x      = dst->src[0];
+    const ggml_tensor * query  = dst->src[1];
+    const ggml_tensor * blocks = dst->src[2];
+
+    float scale;
+    float eps;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&eps,   (const float *) dst->op_params + 1, sizeof(float));
+
+    const int n        = x->ne[0];
+    const int T        = x->ne[1];
+    const int nq       = query->ne[1];
+    const int n_blocks = blocks ? blocks->ne[1] : 0;
+
+    const dim3 grid(nq, T);
+    const dim3 threads(256);
+
+    const float * b_d  = blocks ? (const float *) blocks->data : nullptr;
+    const int64_t s_b1 = blocks ? blocks->nb[1]/sizeof(float) : 0;
+    const int64_t s_b2 = blocks ? blocks->nb[2]/sizeof(float) : 0;
+    const int64_t s_x1 = x->nb[1]/sizeof(float);
+    const int64_t s_q1 = query->nb[1]/ggml_type_size(query->type);
+
+    switch (query->type) {
+        case GGML_TYPE_F32:
+            inkling2_mix_f32<<<grid, threads, 0, ctx.stream()>>>((const float *) x->data, (const float *) query->data, b_d, (float *) dst->data,
+                    n, nq, n_blocks, s_x1, s_q1, s_b1, s_b2, scale, eps);
+            break;
+        case GGML_TYPE_F16:
+            inkling2_mix_f32<<<grid, threads, 0, ctx.stream()>>>((const float *) x->data, (const half *) query->data, b_d, (float *) dst->data,
+                    n, nq, n_blocks, s_x1, s_q1, s_b1, s_b2, scale, eps);
+            break;
+        case GGML_TYPE_BF16:
+            inkling2_mix_f32<<<grid, threads, 0, ctx.stream()>>>((const float *) x->data, (const nv_bfloat16 *) query->data, b_d, (float *) dst->data,
+                    n, nq, n_blocks, s_x1, s_q1, s_b1, s_b2, scale, eps);
+            break;
+        default:
+            GGML_ABORT("unsupported type %s", ggml_type_name(query->type));
+    }
+}

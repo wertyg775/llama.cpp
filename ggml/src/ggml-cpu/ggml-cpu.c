@@ -2129,6 +2129,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_inkling2_conv(params, tensor);
             } break;
+        case GGML_OP_INKLING2_MIX:
+            {
+                ggml_compute_forward_inkling2_mix(params, tensor);
+            } break;
         case GGML_OP_TOP_K_MASK:
             {
                 ggml_compute_forward_top_k_mask(params, tensor);
@@ -2319,6 +2323,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_INKLING2_CTRL:
         case GGML_OP_INKLING2_CLIP:
         case GGML_OP_INKLING2_CONV:
+        case GGML_OP_INKLING2_MIX:
             {
                 n_tasks = n_threads;
             } break;
@@ -3061,6 +3066,13 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         GGML_ABORT("fatal error");
                     }
+                case GGML_OP_INKLING2_MIX:
+                    {
+                        // per thread: one query row, the normalized x and the softmax weights
+                        const int64_t n        = node->src[0]->ne[0];
+                        const int64_t n_states = (node->src[2] ? node->src[2]->ne[1] : 0) + 1;
+                        cur = sizeof(float)*n_tasks*(2*n + n_states + CACHE_LINE_SIZE_F32);
+                    } break;
                 case GGML_OP_INKLING2_CTRL:
                     {
                         // the gates [r, n_tokens], then per thread one weight row and the normalized inputs

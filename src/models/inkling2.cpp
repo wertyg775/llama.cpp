@@ -182,8 +182,22 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
     return tau ? ggml_mul(ctx0, cur, tau) : cur;
 }
 
+// attention over the depth: mix the normalized blocks [n_embd, n, n_tokens] (or null) and rms_norm(cur) with learned queries
+// cur_norm is rms_norm(cur) when the caller has it, or null; the fused node of layer il is registered when il >= 0
+ggml_tensor * llama_model_inkling2::graph::mix(ggml_tensor * blocks, ggml_tensor * cur, ggml_tensor * cur_norm, ggml_tensor * query, int il) {
+    if (cparams.fused_inkling2) {
+        ggml_tensor * out = ggml_inkling2_mix(ctx0, blocks, cur, query, 1.0f/sqrtf(n_embd), 1e-6f);
+        if (il >= 0) {
+            res->add_fused_node({LLM_FUSED_OP_INKLING2, out, il});
+        }
+        return out;
+    }
+
+    return mix_states(stack(blocks, cur_norm ? cur_norm : ggml_rms_norm(ctx0, cur, 1e-6f)), query);
+}
+
 // attention over the depth: mix the normalized states [n_embd, n, n_tokens] with learned queries
-ggml_tensor * llama_model_inkling2::graph::mix(ggml_tensor * states, ggml_tensor * query) {
+ggml_tensor * llama_model_inkling2::graph::mix_states(ggml_tensor * states, ggml_tensor * query) {
     // one token needs no repeat, the query broadcasts
     ggml_tensor * queries = n_tokens == 1 ? query :
         ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
@@ -357,10 +371,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
 
     ggml_tensor * inpSA    = cur;
-    ggml_tensor * inp_norm = ggml_rms_norm(ctx0, cur, 1e-6f);
+    ggml_tensor * inp_norm = cparams.fused_inkling2 ? nullptr : ggml_rms_norm(ctx0, cur, 1e-6f);
 
     // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
-    ggml_tensor * mixed = layer.attn_res_query ? mix(stack(blocks, inp_norm), layer.attn_res_query) : ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    ggml_tensor * mixed = layer.attn_res_query ? mix(blocks, cur, inp_norm, layer.attn_res_query, ip) : ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     ggml_tensor * inputs[3];
     for (int j = 0; j < 3; ++j) {
         inputs[j] = row(mixed, std::min<int64_t>(j, mixed->ne[1] - 1));
@@ -450,7 +464,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // the first layer of each block starts a new residual stream, the earlier one joins the mixed blocks
     if (ip % hparams.attn_res_block_size == 0) {
-        inp_norm = ggml_reshape_3d(ctx0, inp_norm, n_embd, 1, n_tokens);
+        inp_norm = ggml_reshape_3d(ctx0, inp_norm ? inp_norm : ggml_rms_norm(ctx0, inpSA, 1e-6f), n_embd, 1, n_tokens);
         blocks   = blocks ? ggml_concat(ctx0, inp_norm, blocks, 1) : inp_norm;
     } else {
         cur = ggml_add(ctx0, inpSA, cur);
@@ -460,7 +474,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     cb(ffn_inp, "ffn_inp", il);
 
     // MoE
-    cur = ggml_reshape_2d(ctx0, mix(stack(blocks, ggml_rms_norm(ctx0, cur, 1e-6f)), layer.ffn_res_query), n_embd, n_tokens);
+    cur = ggml_reshape_2d(ctx0, mix(blocks, cur, nullptr, layer.ffn_res_query, ip), n_embd, n_tokens);
     if (messages) {
         cur = control(cur, fused ? nullptr : ggml_rms_norm(ctx0, cur, 1e-6f), row(messages, LOOP_CTRL_FFN),
                 fused ? nullptr : row(messages_norm, LOOP_CTRL_FFN), *loop, LOOP_CTRL_FFN, ip);
@@ -495,7 +509,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 }
 
 void llama_model_inkling2::graph::build_output(ggml_tensor * cur, ggml_tensor * blocks) {
-    cur = ggml_reshape_2d(ctx0, mix(stack(blocks, ggml_rms_norm(ctx0, cur, 1e-6f)), model.output_res_query), n_embd, n_tokens);
+    cur = ggml_reshape_2d(ctx0, mix(blocks, cur, nullptr, model.output_res_query, -1), n_embd, n_tokens);
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
     if (inp_out_ids) {
