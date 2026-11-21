@@ -419,6 +419,7 @@ extern "C" {
         GGML_OP_INKLING2_CLIP,
         GGML_OP_INKLING2_CONV,
         GGML_OP_INKLING2_MIX,
+        GGML_OP_INKLING2_REL_BIAS,
 
         GGML_OP_UNARY,
 
@@ -2562,6 +2563,22 @@ extern "C" {
             struct ggml_tensor  * query,
             float                 scale,
             float                 eps);
+
+    // inkling2 relative-position attention bias, with the per-query sink logit subtracted
+    //   table:   [n_rel, n_extent] f32, f16 or bf16, the bias of distance d is table[:, d].r
+    //   r:       [n_rel, n_head, T] f32
+    //   sinks:   [n_head, T] f32
+    //   rel_pos: [n_kv, T] i32, distances in [0, n_extent], n_extent has no bias
+    //   result:  [n_kv, T/n_stream, n_head, n_stream] f32, the kq_b of ggml_soft_max_ext / flash attention
+    //   result[kv, i, h, s] = table[:, d].r[:, h, t] - sinks[h, t], t = s*T/n_stream + i, d = rel_pos[kv, t]
+    //
+    GGML_API struct ggml_tensor * ggml_inkling2_rel_bias(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * sinks,
+            struct ggml_tensor  * rel_pos,
+            int64_t               n_stream);
 
     // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
     //

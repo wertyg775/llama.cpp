@@ -5060,6 +5060,60 @@ struct test_inkling2_mix : public test_case {
     }
 };
 
+// GGML_OP_INKLING2_REL_BIAS
+struct test_inkling2_rel_bias : public test_case {
+    const ggml_type type; // of the table
+    const int64_t   n_rel;
+    const int64_t   n_extent;
+    const int64_t   n_head;
+    const int64_t   n_kv;
+    const int64_t   n_tokens;
+    const int64_t   n_stream;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, n_rel, n_extent, n_head, n_kv, n_tokens, n_stream);
+    }
+
+    test_inkling2_rel_bias(ggml_type type = GGML_TYPE_F32, int64_t n_rel = 16, int64_t n_extent = 100, int64_t n_head = 4,
+            int64_t n_kv = 256, int64_t n_tokens = 1, int64_t n_stream = 1)
+        : type(type), n_rel(n_rel), n_extent(n_extent), n_head(n_head), n_kv(n_kv), n_tokens(n_tokens), n_stream(n_stream) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * table = ggml_new_tensor_2d(ctx, type, n_rel, n_extent);
+        ggml_set_name(table, "table");
+
+        ggml_tensor * r = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_rel, n_head, n_tokens);
+        ggml_set_name(r, "r");
+
+        ggml_tensor * sinks = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_tokens);
+        ggml_set_name(sinks, "sinks");
+
+        ggml_tensor * rel_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_tokens);
+        ggml_set_name(rel_pos, "rel_pos");
+
+        ggml_tensor * out = ggml_inkling2_rel_bias(ctx, table, r, sinks, rel_pos, n_stream);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    // distances in [0, n_extent], n_extent included (the cell without a bias)
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::uniform_int_distribution<int32_t> dist(0, n_extent);
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int32_t & v : data) {
+                    v = dist(rng);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -11001,6 +11055,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true));
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_F16}) {
+        test_cases.emplace_back(new test_inkling2_rel_bias(type, 16, 100, 4, 256, 1));
+        test_cases.emplace_back(new test_inkling2_rel_bias(type, 16, 1024, 24, 1000, 3));
+        test_cases.emplace_back(new test_inkling2_rel_bias(type, 16, 100, 4, 300, 6, 2));
+        test_cases.emplace_back(new test_inkling2_rel_bias(type, 5, 7, 3, 13, 4, 4));
+    }
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int64_t n_blocks : {0, 1, 5, 15}) {
             test_cases.emplace_back(new test_inkling2_mix(type, 64, n_blocks, 1, 1));

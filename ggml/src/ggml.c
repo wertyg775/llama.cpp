@@ -1103,6 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "INKLING2_CLIP",
     "INKLING2_CONV",
     "INKLING2_MIX",
+    "INKLING2_REL_BIAS",
 
     "UNARY",
 
@@ -1122,7 +1123,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1222,6 +1223,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "inkling2_clip(x, scale, tau)",
     "inkling2_conv(cur, past, weight, dynamic)",
     "inkling2_mix(x, query, blocks)",
+    "inkling2_rel_bias(table, r, sinks, rel_pos)",
 
     "unary(x)",
 
@@ -1241,7 +1243,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6717,6 +6719,37 @@ struct ggml_tensor * ggml_inkling2_mix(
     result->src[0] = x;
     result->src[1] = query;
     result->src[2] = blocks;
+
+    return result;
+}
+
+// ggml_inkling2_rel_bias
+
+struct ggml_tensor * ggml_inkling2_rel_bias(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * table,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * sinks,
+        struct ggml_tensor  * rel_pos,
+        int64_t               n_stream) {
+    const int64_t n_rel  = table->ne[0];
+    const int64_t n_head = r->ne[1];
+    const int64_t T      = r->ne[2];
+    const int64_t n_kv   = rel_pos->ne[0];
+
+    GGML_ASSERT(table->nb[0] == ggml_type_size(table->type) && ggml_nrows(table) == table->ne[1]);
+    GGML_ASSERT(r->type == GGML_TYPE_F32 && r->ne[0] == n_rel && r->nb[0] == sizeof(float) && r->ne[3] == 1);
+    GGML_ASSERT(sinks->type == GGML_TYPE_F32 && sinks->ne[0] == n_head && sinks->ne[1] == T && ggml_nrows(sinks) == T && sinks->nb[0] == sizeof(float));
+    GGML_ASSERT(rel_pos->type == GGML_TYPE_I32 && rel_pos->ne[1] == T && ggml_nrows(rel_pos) == T && rel_pos->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(n_stream > 0 && T % n_stream == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, T/n_stream, n_head, n_stream);
+
+    result->op     = GGML_OP_INKLING2_REL_BIAS;
+    result->src[0] = table;
+    result->src[1] = r;
+    result->src[2] = sinks;
+    result->src[3] = rel_pos;
 
     return result;
 }

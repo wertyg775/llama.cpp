@@ -111,6 +111,7 @@ void ggml_compute_forward_inkling2_ctrl(const struct ggml_compute_params * param
 void ggml_compute_forward_inkling2_clip(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_inkling2_conv(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_inkling2_mix(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_inkling2_rel_bias(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_top_k_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);

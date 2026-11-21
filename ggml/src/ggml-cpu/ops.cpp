@@ -12009,6 +12009,71 @@ void ggml_compute_forward_inkling2_mix(
     }
 }
 
+// ggml_compute_forward_inkling2_rel_bias
+
+static void ggml_compute_forward_inkling2_rel_bias_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * table   = dst->src[0];
+    const ggml_tensor * r       = dst->src[1];
+    const ggml_tensor * sinks   = dst->src[2];
+    const ggml_tensor * rel_pos = dst->src[3];
+
+    const int64_t n_rel    = table->ne[0];
+    const int64_t n_extent = table->ne[1];
+    const int64_t n_kv     = dst->ne[0];
+    const int64_t n_ps     = dst->ne[1]; // tokens per stream
+    const int64_t n_head   = dst->ne[2];
+    const int64_t T        = r->ne[2];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    float * row = (float *) params->wdata + ith*(n_rel + CACHE_LINE_SIZE_F32);
+
+    for (int64_t ir = ith; ir < n_kv*T; ir += nth) {
+        const int64_t kv = ir % n_kv;
+        const int64_t t  = ir / n_kv;
+
+        const int32_t d = *(const int32_t *) ((const char *) rel_pos->data + kv*sizeof(int32_t) + t*rel_pos->nb[1]);
+        GGML_ASSERT(d >= 0 && d <= n_extent);
+
+        if (d < n_extent) {
+            const char * src = (const char *) table->data + d*table->nb[1];
+            if (table->type == GGML_TYPE_F32) {
+                memcpy(row, src, n_rel*sizeof(float));
+            } else {
+                ggml_get_type_traits(table->type)->to_float(src, row, n_rel);
+            }
+        }
+
+        for (int64_t h = 0; h < n_head; ++h) {
+            float v = 0.0f;
+            if (d < n_extent) {
+                ggml_vec_dot_f32(n_rel, &v, 0, row, 0, (const float *) ((const char *) r->data + h*r->nb[1] + t*r->nb[2]), 0, 1);
+            }
+            v -= *(const float *) ((const char *) sinks->data + h*sizeof(float) + t*sinks->nb[1]);
+
+            *(float *) ((char *) dst->data + kv*sizeof(float) + (t % n_ps)*dst->nb[1] + h*dst->nb[2] + (t / n_ps)*dst->nb[3]) = v;
+        }
+    }
+}
+
+void ggml_compute_forward_inkling2_rel_bias(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[1]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_inkling2_rel_bias_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_top_k_mask
 
 void ggml_compute_forward_top_k_mask(

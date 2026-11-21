@@ -496,3 +496,78 @@ void ggml_cuda_op_inkling2_mix(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             GGML_ABORT("unsupported type %s", ggml_type_name(query->type));
     }
 }
+
+// one thread per kv cell, one block row per (head, token)
+template <typename T>
+static __global__ void inkling2_rel_bias_f32(
+        const T * __restrict__ table, const float * __restrict__ r, const float * __restrict__ sinks, const int32_t * __restrict__ rel_pos,
+        float * __restrict__ dst, const int n_rel, const int n_extent, const int n_kv, const int n_ps,
+        const int64_t s_table1, const int64_t s_r1, const int64_t s_r2, const int64_t s_sinks1, const int64_t s_pos1,
+        const int64_t s_dst1, const int64_t s_dst2, const int64_t s_dst3) {
+    extern __shared__ float r_s[];
+
+    const int h = blockIdx.y;
+    const int t = blockIdx.z;
+
+    for (int k = threadIdx.x; k < n_rel; k += blockDim.x) {
+        r_s[k] = r[h*s_r1 + t*s_r2 + k];
+    }
+    __syncthreads();
+
+    const int kv = blockIdx.x*blockDim.x + threadIdx.x;
+    if (kv >= n_kv) {
+        return;
+    }
+
+    const int d = rel_pos[t*s_pos1 + kv];
+
+    float v = 0.0f;
+    if (d < n_extent) {
+        const T * col = table + d*s_table1;
+        for (int k = 0; k < n_rel; ++k) {
+            v += ggml_cuda_cast<float>(col[k])*r_s[k];
+        }
+    }
+    v -= sinks[t*s_sinks1 + h];
+
+    dst[(t % n_ps)*s_dst1 + h*s_dst2 + (t / n_ps)*s_dst3 + kv] = v;
+}
+
+bool ggml_cuda_inkling2_rel_bias_supported(const ggml_tensor * op) {
+    const ggml_type type = op->src[0]->type;
+    return (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16) && op->src[1]->ne[1] <= 65535 && op->src[1]->ne[2] <= 65535;
+}
+
+void ggml_cuda_op_inkling2_rel_bias(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * table   = dst->src[0];
+    const ggml_tensor * r       = dst->src[1];
+    const ggml_tensor * sinks   = dst->src[2];
+    const ggml_tensor * rel_pos = dst->src[3];
+
+    const int n_rel    = table->ne[0];
+    const int n_extent = table->ne[1];
+    const int n_kv     = dst->ne[0];
+    const int n_ps     = dst->ne[1];
+    const int n_head   = dst->ne[2];
+    const int T        = r->ne[2];
+
+    const int  n_threads = 256;
+    const dim3 grid((n_kv + n_threads - 1)/n_threads, n_head, T);
+    const size_t smem = n_rel*sizeof(float);
+
+    const int64_t s_table1 = table->nb[1]/ggml_type_size(table->type);
+
+    auto launch = [&](auto kernel, const auto * table_d) {
+        kernel<<<grid, n_threads, smem, ctx.stream()>>>(table_d, (const float *) r->data, (const float *) sinks->data,
+                (const int32_t *) rel_pos->data, (float *) dst->data, n_rel, n_extent, n_kv, n_ps, s_table1,
+                r->nb[1]/sizeof(float), r->nb[2]/sizeof(float), sinks->nb[1]/sizeof(float), rel_pos->nb[1]/sizeof(int32_t),
+                dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), dst->nb[3]/sizeof(float));
+    };
+
+    switch (table->type) {
+        case GGML_TYPE_F32:  launch(inkling2_rel_bias_f32<float>,       (const float *)       table->data); break;
+        case GGML_TYPE_F16:  launch(inkling2_rel_bias_f32<half>,        (const half *)        table->data); break;
+        case GGML_TYPE_BF16: launch(inkling2_rel_bias_f32<nv_bfloat16>, (const nv_bfloat16 *) table->data); break;
+        default: GGML_ABORT("unsupported type %s", ggml_type_name(table->type));
+    }
+}

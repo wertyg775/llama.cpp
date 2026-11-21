@@ -437,16 +437,22 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
-        // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
-        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
-
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
-        table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
-        table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+        ggml_tensor * kq_b;
+        if (cparams.fused_inkling2) {
+            kq_b = ggml_inkling2_rel_bias(ctx0, layer.attn_rel_bias, Rcur, sinks, rel_pos, n_stream);
+            res->add_fused_node({LLM_FUSED_OP_INKLING2, kq_b, ip});
+        } else {
+            // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
+            ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
 
-        ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
-        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
-        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+            table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
+            table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+
+            kq_b = ggml_get_rows(ctx0, table, rel_pos);
+            kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
+            kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+        }
         cb(kq_b, "kq_b", il);
 
         if (!sinks_zero || sinks_zero->ne[0] != n_head) {
