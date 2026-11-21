@@ -11772,36 +11772,21 @@ void ggml_compute_forward_inkling2_ctrl(
 
 // ggml_compute_forward_inkling2_clip
 
-static void ggml_compute_forward_inkling2_clip_f32(
-        const ggml_compute_params * params,
-        ggml_tensor * dst) {
-    const ggml_tensor * src0  = dst->src[0];
-    const ggml_tensor * scale = dst->src[1];
-    const ggml_tensor * tau   = dst->src[2];
-
-    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst));
-
-    const float threshold = ggml_get_op_params_f32(dst, 0);
-    const float eps       = ggml_get_op_params_f32(dst, 1);
-
-    GGML_TENSOR_UNARY_OP_LOCALS
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
-    const int64_t nr  = ne01*ne02*ne03;
-    const int64_t dr  = (nr + nth - 1)/nth;
-    const int64_t ir0 = dr*ith;
-    const int64_t ir1 = MIN(ir0 + dr, nr);
+// clip the rows of x into dst (contiguous), from row ir0 to ir1
+static void ggml_inkling2_clip_rows(const ggml_tensor * x, const ggml_tensor * scale, const ggml_tensor * tau, float * dst,
+        float threshold, float eps, int64_t ir0, int64_t ir1) {
+    const int64_t ne00 = x->ne[0];
+    const int64_t ne01 = x->ne[1];
+    const int64_t ne02 = x->ne[2];
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t i1 = ir % ne01;
         const int64_t i2 = (ir / ne01) % ne02;
         const int64_t i3 = ir / (ne01*ne02);
 
-        const float * xs = (const float *) ((const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03);
+        const float * xs = (const float *) ((const char *) x->data + i1*x->nb[1] + i2*x->nb[2] + i3*x->nb[3]);
         const float * ss = scale ? (const float *) scale->data + (scale->ne[1] == 1 ? 0 : i1)*ne00 : nullptr;
-        float       * y  = (float *) ((char *) dst->data + i1*nb1 + i2*nb2 + i3*nb3);
+        float       * y  = dst + ir*ne00;
 
         ggml_float sum = 0.0;
         for (int64_t i0 = 0; i0 < ne00; ++i0) {
@@ -11816,6 +11801,39 @@ static void ggml_compute_forward_inkling2_clip_f32(
         for (int64_t i0 = 0; i0 < ne00; ++i0) {
             y[i0] = y[i0]/d*t;
         }
+    }
+}
+
+static void ggml_compute_forward_inkling2_clip_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x      = dst->src[0];
+    const ggml_tensor * scale  = dst->src[1];
+    const ggml_tensor * tau    = dst->src[2];
+    const ggml_tensor * x2     = dst->src[3];
+    const ggml_tensor * scale2 = dst->src[4];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst));
+
+    const float threshold  = ggml_get_op_params_f32(dst, 0);
+    const float eps        = ggml_get_op_params_f32(dst, 1);
+    const float threshold2 = ggml_get_op_params_f32(dst, 2);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nr1 = ggml_nrows(x);
+    const int64_t nr  = nr1 + (x2 ? ggml_nrows(x2) : 0);
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    float * y = (float *) dst->data;
+    if (ir0 < nr1) {
+        ggml_inkling2_clip_rows(x, scale, tau, y, threshold, eps, ir0, MIN(ir1, nr1));
+    }
+    if (x2 && ir1 > nr1) {
+        ggml_inkling2_clip_rows(x2, scale2, tau, y + ggml_nelements(x), threshold2, eps, MAX(ir0, nr1) - nr1, ir1 - nr1);
     }
 }
 
@@ -11900,6 +11918,37 @@ static void ggml_compute_forward_inkling2_conv_f32(
 
         for (int64_t k = 0; k < K - 1; ++k) {
             s[(q*C + c)*(K - 1) + k] = x(c, q, n_st + k);
+        }
+    }
+
+    const int     post  = ggml_get_op_params_i32(dst, 2);
+    const int64_t hd    = ggml_get_op_params_i32(dst, 3);
+    const float   param = ggml_get_op_params_f32(dst, 4);
+    if (post == GGML_INKLING2_HEAD_POST_NONE) {
+        return;
+    }
+
+    ggml_barrier(params->threadpool);
+
+    for (int64_t ir = ith; ir < (C/hd)*T; ir += nth) {
+        float * yh = y + (ir/(C/hd))*C + (ir % (C/hd))*hd;
+
+        ggml_float sum = 0.0;
+        for (int64_t i = 0; i < hd; ++i) {
+            sum += (ggml_float) (yh[i]*yh[i]);
+        }
+
+        if (post == GGML_INKLING2_HEAD_POST_CLIP) {
+            const float d = MAX(sqrtf(sum)*(1.0f/param) + 1e-6f/param, 1.0f);
+            for (int64_t i = 0; i < hd; ++i) {
+                yh[i] = yh[i]/d;
+            }
+        } else {
+            const float mean  = sum/hd;
+            const float scale = 1.0f/sqrtf(mean + param);
+            for (int64_t i = 0; i < hd; ++i) {
+                yh[i] = yh[i]*scale;
+            }
         }
     }
 }

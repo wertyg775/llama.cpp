@@ -1223,7 +1223,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
     "inkling2_ctrl(cur, msg, down, gain, forget)",
-    "inkling2_clip(x, scale, tau)",
+    "inkling2_clip(x, scale, tau, x2, scale2)",
     "inkling2_conv(cur, past, weight, dynamic, residual, ids)",
     "inkling2_mix(x, query, blocks)",
     "inkling2_rel_bias(table, r, sinks, rel_pos, mask)",
@@ -6627,13 +6627,7 @@ struct ggml_tensor * ggml_inkling2_ctrl(
 
 // ggml_inkling2_clip
 
-struct ggml_tensor * ggml_inkling2_clip(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * x,
-        struct ggml_tensor  * scale,
-        struct ggml_tensor  * tau,
-        float                 threshold,
-        float                 eps) {
+static void ggml_inkling2_clip_check(struct ggml_tensor * x, struct ggml_tensor * scale, struct ggml_tensor * tau, float threshold) {
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(x->nb[0] == sizeof(float));
     GGML_ASSERT(threshold > 0.0f);
@@ -6646,6 +6640,16 @@ struct ggml_tensor * ggml_inkling2_clip(
         GGML_ASSERT(tau->type == GGML_TYPE_F32 && ggml_is_contiguous(tau));
         GGML_ASSERT(tau->ne[0] == 1 && tau->ne[1] == 1 && (tau->ne[2] == 1 || tau->ne[2] == x->ne[2]) && tau->ne[3] == 1);
     }
+}
+
+struct ggml_tensor * ggml_inkling2_clip(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * tau,
+        float                 threshold,
+        float                 eps) {
+    ggml_inkling2_clip_check(x, scale, tau, threshold);
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
 
@@ -6656,6 +6660,36 @@ struct ggml_tensor * ggml_inkling2_clip(
     result->src[0] = x;
     result->src[1] = scale;
     result->src[2] = tau;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling2_clip2(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * scale,
+        float                 threshold,
+        struct ggml_tensor  * x2,
+        struct ggml_tensor  * scale2,
+        float                 threshold2,
+        struct ggml_tensor  * tau,
+        float                 eps) {
+    ggml_inkling2_clip_check(x,  scale,  tau, threshold);
+    ggml_inkling2_clip_check(x2, scale2, tau, threshold2);
+    GGML_ASSERT(!tau || x->ne[2] == x2->ne[2]);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(x) + ggml_nelements(x2));
+
+    ggml_set_op_params_f32(result, 0, threshold);
+    ggml_set_op_params_f32(result, 1, eps);
+    ggml_set_op_params_f32(result, 2, threshold2);
+
+    result->op     = GGML_OP_INKLING2_CLIP;
+    result->src[0] = x;
+    result->src[1] = scale;
+    result->src[2] = tau;
+    result->src[3] = x2;
+    result->src[4] = scale2;
 
     return result;
 }
@@ -6712,6 +6746,19 @@ struct ggml_tensor * ggml_inkling2_conv(
     result->src[5] = ids;
 
     return result;
+}
+
+void ggml_inkling2_conv_set_head_post(
+        struct ggml_tensor           * conv,
+        enum ggml_inkling2_head_post   post,
+        int64_t                        head_dim,
+        float                          param) {
+    GGML_ASSERT(conv->op == GGML_OP_INKLING2_CONV);
+    GGML_ASSERT(head_dim > 0 && conv->src[0]->ne[0] % head_dim == 0);
+
+    ggml_set_op_params_i32(conv, 2, (int32_t) post);
+    ggml_set_op_params_i32(conv, 3, (int32_t) head_dim);
+    ggml_set_op_params_f32(conv, 4, param);
 }
 
 // ggml_inkling2_mix

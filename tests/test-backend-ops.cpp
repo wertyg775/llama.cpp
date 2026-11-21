@@ -4932,13 +4932,14 @@ struct test_inkling2_clip : public test_case {
     const int   tau;                 // 0: none, 1: per token, 2: one value
     const bool  view;                // x has padded rows
     const float threshold;
+    const bool  two;                 // a second input of 16-element rows, as Inkling 2 clips q and r together
 
     std::string vars() override {
-        return VARS_TO_STR5(ne, scale, tau, view, threshold);
+        return VARS_TO_STR6(ne, scale, tau, view, threshold, two);
     }
 
-    test_inkling2_clip(std::array<int64_t, 3> ne = {128, 4, 3}, int scale = 1, int tau = 1, bool view = false, float threshold = 4.0f)
-        : ne(ne), scale(scale), tau(tau), view(view), threshold(threshold) {}
+    test_inkling2_clip(std::array<int64_t, 3> ne = {128, 4, 3}, int scale = 1, int tau = 1, bool view = false, float threshold = 4.0f, bool two = false)
+        : ne(ne), scale(scale), tau(tau), view(view), threshold(threshold), two(two) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x;
@@ -4963,7 +4964,19 @@ struct test_inkling2_clip : public test_case {
             ggml_set_name(t, "tau");
         }
 
-        ggml_tensor * out = ggml_inkling2_clip(ctx, x, s, t, threshold, 1e-6f);
+        ggml_tensor * out;
+        if (two) {
+            ggml_tensor * x2 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, ne[1], ne[2]);
+            ggml_set_name(x2, "x2");
+            ggml_tensor * s2 = nullptr;
+            if (scale) {
+                s2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, scale == 1 ? ne[1] : 1);
+                ggml_set_name(s2, "scale2");
+            }
+            out = ggml_inkling2_clip2(ctx, x, s, threshold, x2, s2, 1.5f, t, 1e-6f);
+        } else {
+            out = ggml_inkling2_clip(ctx, x, s, t, threshold, 1e-6f);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -4979,9 +4992,10 @@ struct test_inkling2_conv : public test_case {
     const bool    residual;
     const bool    cells;   // read the past from cache cells by id
     const bool    store;   // copy the new state into a cache, as the model does (a backend can fuse the copy)
+    const int     post;    // ggml_inkling2_head_post, heads of 64 channels
 
     std::string vars() override {
-        return VARS_TO_STR8(C, K, n_seqs, n_seq_tokens, n_heads, residual, cells, store);
+        return VARS_TO_STR8(C, K, n_seqs, n_seq_tokens, n_heads, residual, cells, store) + "," + VAR_TO_STR(post);
     }
 
     bool run_whole_graph() override { return store; }
@@ -4992,8 +5006,8 @@ struct test_inkling2_conv : public test_case {
     }
 
     test_inkling2_conv(int64_t C = 64, int64_t K = 4, int64_t n_seqs = 1, int64_t n_seq_tokens = 1, int64_t n_heads = 0, bool residual = false,
-            bool cells = false, bool store = false)
-        : C(C), K(K), n_seqs(n_seqs), n_seq_tokens(n_seq_tokens), n_heads(n_heads), residual(residual), cells(cells), store(store) {}
+            bool cells = false, bool store = false, int post = 0)
+        : C(C), K(K), n_seqs(n_seqs), n_seq_tokens(n_seq_tokens), n_heads(n_heads), residual(residual), cells(cells), store(store), post(post) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t T = n_seqs*n_seq_tokens;
@@ -5031,6 +5045,10 @@ struct test_inkling2_conv : public test_case {
         }
 
         ggml_tensor * out = ggml_inkling2_conv(ctx, cur, past, weight, dynamic, res, ids, cells ? 5 : 0, 1.0f/sqrtf(2*K + 1));
+        if (post) {
+            // a small clip threshold, so that some heads are clipped and some are not
+            ggml_inkling2_conv_set_head_post(out, (ggml_inkling2_head_post) post, 64, post == GGML_INKLING2_HEAD_POST_CLIP ? 4.0f : 1e-6f);
+        }
 
         if (store) {
             ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (K - 1)*(C + 9), n_seqs + 2);
@@ -11352,6 +11370,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_inkling2_conv(2304, 4, 1, 1, 0, true, true, true)); // Inkling 2 Mini decode
+    for (int post : {GGML_INKLING2_HEAD_POST_CLIP, GGML_INKLING2_HEAD_POST_RMS_NORM}) {
+        test_cases.emplace_back(new test_inkling2_conv(512, 4, 1, 1, 4, false, true, true, post));  // Inkling 2 Mini K / V decode
+        test_cases.emplace_back(new test_inkling2_conv(512, 4, 1, 70, 4, false, true, false, post));
+        test_cases.emplace_back(new test_inkling2_conv(192, 4, 2, 3, 3, true, false, false, post));
+    }
     for (int scale : {0, 1, 2}) {
         for (int tau : {0, 1, 2}) {
             test_cases.emplace_back(new test_inkling2_clip({128, 4, 3}, scale, tau));
@@ -11359,6 +11382,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_inkling2_clip({128, 24, 1}, 1, 1, false, 22.6f)); // Inkling 2 Mini Q, no row is clipped
+    for (int tau : {0, 1}) {
+        test_cases.emplace_back(new test_inkling2_clip({128, 24, 1}, 1, tau, false, 4.0f, true)); // Inkling 2 Mini Q and R
+        test_cases.emplace_back(new test_inkling2_clip({128, 24, 5}, 1, tau, false, 4.0f, true));
+        test_cases.emplace_back(new test_inkling2_clip({37, 3, 2}, 0, tau, true, 2.0f, true));
+    }
     test_cases.emplace_back(new test_inkling2_clip({128, 8, 17}, 0, 0, false, 4.0f));
     test_cases.emplace_back(new test_inkling2_clip({37, 3, 2}, 1, 1, true, 2.0f));      // odd row size
     test_cases.emplace_back(new test_inkling2_clip({300, 2, 2}, 2, 0, false, 6.0f));    // row longer than a warp x 8

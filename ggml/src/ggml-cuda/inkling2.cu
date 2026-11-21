@@ -192,68 +192,101 @@ void ggml_cuda_op_inkling2_ctrl(ggml_backend_cuda_context & ctx, ggml_tensor * d
     }
 }
 
-// dst = y/max(1, (|y| + eps)/threshold)*tau with y = x*scale, one warp per row
+// one input of the clip kernel
+struct inkling2_clip_src {
+    const float * x;
+    const float * scale;
+    float       * dst;
+    int           ne00, ne01, ne02;
+    int64_t       nr, s01, s02, s03, s_scale1;
+    float         inv_threshold, eps_threshold;
+};
+
+// dst = y/max(1, (|y| + eps)/threshold)*tau with y = x*scale, one warp per row; rows of a, then rows of b
 template <bool has_scale, bool has_tau>
-static __global__ void inkling2_clip_f32(
-        const float * __restrict__ x, const float * __restrict__ scale, const float * __restrict__ tau, float * __restrict__ dst,
-        const int ne00, const int ne01, const int ne02, const int64_t nr, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t s_scale1, const int s_tau2, const float inv_threshold, const float eps_threshold) {
-    const int64_t ir = (int64_t) blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
-    if (ir >= nr) {
+static __global__ void inkling2_clip_f32(const inkling2_clip_src a, const inkling2_clip_src b, const float * __restrict__ tau, const int s_tau2) {
+    int64_t ir = (int64_t) blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    if (ir >= a.nr + b.nr) {
         return;
+    }
+    const inkling2_clip_src & p = ir < a.nr ? a : b;
+    if (ir >= a.nr) {
+        ir -= a.nr;
     }
     const int lane = threadIdx.x % WARP_SIZE;
 
-    const int64_t i1 = ir % ne01;
-    const int64_t i2 = (ir/ne01) % ne02;
-    const int64_t i3 = ir/((int64_t) ne01*ne02);
+    const int64_t i1 = ir % p.ne01;
+    const int64_t i2 = (ir/p.ne01) % p.ne02;
+    const int64_t i3 = ir/((int64_t) p.ne01*p.ne02);
 
-    const float * xs = x + i1*s01 + i2*s02 + i3*s03;
-    const float * ss = has_scale ? scale + i1*s_scale1 : nullptr;
-    float       * y  = dst + ir*ne00;
+    const float * xs = p.x + i1*p.s01 + i2*p.s02 + i3*p.s03;
+    const float * ss = has_scale ? p.scale + i1*p.s_scale1 : nullptr;
+    float       * y  = p.dst + ir*p.ne00;
 
     float sum = 0.0f;
-    for (int i0 = lane; i0 < ne00; i0 += WARP_SIZE) {
+    for (int i0 = lane; i0 < p.ne00; i0 += WARP_SIZE) {
         const float v = has_scale ? xs[i0]*ss[i0] : xs[i0];
         sum += v*v;
     }
     sum = warp_reduce_sum(sum);
 
-    const float d = fmaxf(sqrtf(sum)*inv_threshold + eps_threshold, 1.0f);
+    const float d = fmaxf(sqrtf(sum)*p.inv_threshold + p.eps_threshold, 1.0f);
     const float t = has_tau ? tau[i2*s_tau2] : 1.0f;
 
-    for (int i0 = lane; i0 < ne00; i0 += WARP_SIZE) {
+    for (int i0 = lane; i0 < p.ne00; i0 += WARP_SIZE) {
         const float v = has_scale ? xs[i0]*ss[i0] : xs[i0];
         y[i0] = v/d*t;
     }
 }
 
+static inkling2_clip_src inkling2_clip_make_src(const ggml_tensor * x, const ggml_tensor * scale, float * dst, float threshold, float eps) {
+    inkling2_clip_src p;
+    p.x             = (const float *) x->data;
+    p.scale         = scale ? (const float *) scale->data : nullptr;
+    p.dst           = dst;
+    p.ne00          = x->ne[0];
+    p.ne01          = x->ne[1];
+    p.ne02          = x->ne[2];
+    p.nr            = ggml_nrows(x);
+    p.s01           = x->nb[1]/sizeof(float);
+    p.s02           = x->nb[2]/sizeof(float);
+    p.s03           = x->nb[3]/sizeof(float);
+    p.s_scale1      = scale && scale->ne[1] > 1 ? x->ne[0] : 0;
+    p.inv_threshold = 1.0f/threshold;
+    p.eps_threshold = eps/threshold;
+    return p;
+}
+
 void ggml_cuda_op_inkling2_clip(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * x     = dst->src[0];
-    const ggml_tensor * scale = dst->src[1];
-    const ggml_tensor * tau   = dst->src[2];
+    const ggml_tensor * x      = dst->src[0];
+    const ggml_tensor * scale  = dst->src[1];
+    const ggml_tensor * tau    = dst->src[2];
+    const ggml_tensor * x2     = dst->src[3];
+    const ggml_tensor * scale2 = dst->src[4];
 
     GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(!x2 || !scale == !scale2);
 
-    float threshold;
-    float eps;
-    memcpy(&threshold, (const float *) dst->op_params + 0, sizeof(float));
-    memcpy(&eps,       (const float *) dst->op_params + 1, sizeof(float));
+    const float threshold  = ggml_get_op_params_f32(dst, 0);
+    const float eps        = ggml_get_op_params_f32(dst, 1);
+    const float threshold2 = ggml_get_op_params_f32(dst, 2);
 
-    const int64_t nr = ggml_nrows(x);
+    float * y = (float *) dst->data;
+    const inkling2_clip_src a = inkling2_clip_make_src(x, scale, y, threshold, eps);
+    inkling2_clip_src       b = {};
+    if (x2) {
+        b = inkling2_clip_make_src(x2, scale2, y + ggml_nelements(x), threshold2, eps);
+    }
 
-    const int  rows_per_block = 256/WARP_SIZE;
-    const dim3 blocks((nr + rows_per_block - 1)/rows_per_block);
-    const dim3 threads(rows_per_block*WARP_SIZE);
-
-    const int64_t s_scale1 = scale && scale->ne[1] > 1 ? x->ne[0] : 0;
-    const int     s_tau2   = tau && tau->ne[2] > 1 ? 1 : 0;
+    const int64_t nr             = a.nr + b.nr;
+    const int     rows_per_block = 256/WARP_SIZE;
+    const dim3    blocks((nr + rows_per_block - 1)/rows_per_block);
+    const dim3    threads(rows_per_block*WARP_SIZE);
+    const int     s_tau2 = tau && tau->ne[2] > 1 ? 1 : 0;
 
     auto kernel = scale ? (tau ? inkling2_clip_f32<true,  true> : inkling2_clip_f32<true,  false>)
                         : (tau ? inkling2_clip_f32<false, true> : inkling2_clip_f32<false, false>);
-    kernel<<<blocks, threads, 0, ctx.stream()>>>((const float *) x->data, scale ? (const float *) scale->data : nullptr,
-            tau ? (const float *) tau->data : nullptr, (float *) dst->data, x->ne[0], x->ne[1], x->ne[2], nr,
-            x->nb[1]/sizeof(float), x->nb[2]/sizeof(float), x->nb[3]/sizeof(float), s_scale1, s_tau2, 1.0f/threshold, eps/threshold);
+    kernel<<<blocks, threads, 0, ctx.stream()>>>(a, b, tau ? (const float *) tau->data : nullptr, s_tau2);
 }
 
 // tokens of one sequence per block in the conv kernel
@@ -266,11 +299,11 @@ static __global__ void inkling2_conv_f32(
         const float * __restrict__ residual, const int32_t * __restrict__ ids, float * __restrict__ y, float * state,
         const int C, const int K, const int n_st, const int n_cph, const int offset,
         const int64_t s_cur1, const int64_t s_past0, const int64_t s_past1, const int64_t s_past2, const int64_t s_dyn1, const int64_t s_res1,
-        const int64_t s_state_q, const float scale) {
-    const int c = blockIdx.x*blockDim.x + threadIdx.x;
-    if (c >= C) {
-        return;
-    }
+        const int64_t s_state_q, const float scale, const int post, const int hd, const float post_param) {
+    // every thread of the block takes part in the head reductions of the post op, so none returns early
+    const int  c_raw = blockIdx.x*blockDim.x + threadIdx.x;
+    const bool valid = c_raw < C;
+    const int  c     = valid ? c_raw : C - 1;
     const int q  = blockIdx.y;
     const int i0 = blockIdx.z*INKLING2_CONV_CHUNK;
     const int i1 = min(i0 + INKLING2_CONV_CHUNK, n_st);
@@ -301,10 +334,35 @@ static __global__ void inkling2_conv_f32(
 
         // no fused multiply-add: the product rounds first, as in the scale and add ops
         const float out = __fmul_rn(sum + x(i + K - 1), scale);
-        y[t*C + c] = has_residual ? residual[t*s_res1 + c] + out : out;
+        float       yv  = has_residual ? residual[t*s_res1 + c] + out : out;
+
+        if (post != GGML_INKLING2_HEAD_POST_NONE) {
+            // sum of squares of the head of channel c: hd/WARP_SIZE warps, all in this block
+            __shared__ float hs[1024/WARP_SIZE];
+            const float ss = warp_reduce_sum(yv*yv);
+            if (threadIdx.x % WARP_SIZE == 0) {
+                hs[threadIdx.x / WARP_SIZE] = ss;
+            }
+            __syncthreads();
+            float sum_h = 0.0f;
+            const int w0 = (threadIdx.x / hd)*(hd / WARP_SIZE);
+            for (int w = 0; w < hd / WARP_SIZE; ++w) {
+                sum_h += hs[w0 + w];
+            }
+            __syncthreads();
+            if (post == GGML_INKLING2_HEAD_POST_CLIP) {
+                yv = yv/fmaxf(sqrtf(sum_h)*(1.0f/post_param) + 1e-6f/post_param, 1.0f);
+            } else {
+                yv = yv*rsqrtf(sum_h/hd + post_param);
+            }
+        }
+
+        if (valid) {
+            y[t*C + c] = yv;
+        }
     }
 
-    if (i1 == n_st) {
+    if (valid && i1 == n_st) {
         for (int k = 0; k < K - 1; ++k) {
             state[q*s_state_q + (int64_t) c*(K - 1) + k] = x(n_st + k);
         }
@@ -335,6 +393,11 @@ void ggml_cuda_op_inkling2_conv(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int  n_threads = 256;
     const dim3 blocks((C + n_threads - 1)/n_threads, n_seqs, (n_st + INKLING2_CONV_CHUNK - 1)/INKLING2_CONV_CHUNK);
 
+    const int   post       = ggml_get_op_params_i32(dst, 2);
+    const int   hd         = ggml_get_op_params_i32(dst, 3);
+    const float post_param = ggml_get_op_params_f32(dst, 4);
+    GGML_ASSERT(post == GGML_INKLING2_HEAD_POST_NONE || (n_threads % hd == 0 && hd % WARP_SIZE == 0));
+
     auto kernel = dynamic ? (residual ? inkling2_conv_f32<true,  true> : inkling2_conv_f32<true,  false>)
                           : (residual ? inkling2_conv_f32<false, true> : inkling2_conv_f32<false, false>);
     float * state = state_dst ? state_dst : y + (int64_t) C*T;
@@ -346,7 +409,7 @@ void ggml_cuda_op_inkling2_conv(ggml_backend_cuda_context & ctx, ggml_tensor * d
             dynamic ? (const float *) dynamic->data : nullptr, residual ? (const float *) residual->data : nullptr,
             ids ? (const int32_t *) ids->data : nullptr, y, state, C, K, n_st, n_cph, offset,
             cur->nb[1]/sizeof(float), past->nb[0]/sizeof(float), past->nb[1]/sizeof(float), ids ? 0 : past->nb[2]/sizeof(float),
-            dynamic ? dynamic->nb[1]/sizeof(float) : 0, residual ? residual->nb[1]/sizeof(float) : 0, s_state_q, scale);
+            dynamic ? dynamic->nb[1]/sizeof(float) : 0, residual ? residual->nb[1]/sizeof(float) : 0, s_state_q, scale, post, hd, post_param);
 }
 
 // a conv followed by the copy of its new state into the cache can write the state there directly, when one block reads

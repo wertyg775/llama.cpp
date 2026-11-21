@@ -2536,6 +2536,18 @@ extern "C" {
             float                 threshold,
             float                 eps);
 
+    // two clips in one op, the same tau: the result is 1D, the clipped x then the clipped x2 (same rules for x2 and scale2)
+    GGML_API struct ggml_tensor * ggml_inkling2_clip2(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * scale,
+            float                 threshold,
+            struct ggml_tensor  * x2,
+            struct ggml_tensor  * scale2,
+            float                 threshold2,
+            struct ggml_tensor  * tau,
+            float                 eps);
+
     // inkling2 causal short convolution with a residual and the new conv state
     //   cur:     [C, T] f32, T = n_seqs*n_seq_tokens, the tokens of a sequence are adjacent
     //   past:    [K - 1, C, n_seqs] f32, the last K - 1 inputs of each sequence,
@@ -2557,6 +2569,19 @@ extern "C" {
             struct ggml_tensor  * ids,
             int64_t               offset,
             float                 scale);
+
+    enum ggml_inkling2_head_post {
+        GGML_INKLING2_HEAD_POST_NONE,
+        GGML_INKLING2_HEAD_POST_CLIP,     // scale each head down to an L2 norm of at most param (as ggml_inkling2_clip, eps 1e-6)
+        GGML_INKLING2_HEAD_POST_RMS_NORM, // RMS norm of each head, eps param
+    };
+
+    // apply post to each head of head_dim channels of the output of an ggml_inkling2_conv, per token
+    GGML_API void ggml_inkling2_conv_set_head_post(
+            struct ggml_tensor           * conv,
+            enum ggml_inkling2_head_post   post,
+            int64_t                        head_dim,
+            float                          param);
 
     // inkling2 depth mix: attention over the states [blocks, rms_norm(x, eps)] with learned queries
     //   blocks: [n, n_blocks, T] f32 or NULL, rows contiguous

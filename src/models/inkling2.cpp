@@ -225,7 +225,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         llm_graph_input_rs * inp,
         int64_t offset,
         int il,
-        ggml_tensor * residual) {
+        ggml_tensor * residual,
+        int post,
+        int64_t head_dim,
+        float post_param) {
     const int64_t n_conv       = hparams.n_shortconv_l_cache;
     const int64_t n_channels   = cur->ne[0];
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
@@ -241,6 +244,9 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
             ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
         ggml_tensor * res_conv = ggml_inkling2_conv(ctx0, cur, past, weight, dynamic, residual, cells ? inp->s_copy_main : nullptr, cells ? offset : 0, scale);
+        if (post != GGML_INKLING2_HEAD_POST_NONE) {
+            ggml_inkling2_conv_set_head_post(res_conv, (ggml_inkling2_head_post) post, head_dim, post_param);
+        }
         res->add_fused_node({LLM_FUSED_OP_INKLING2, res_conv, il});
 
         ggml_tensor * x_new = ggml_view_3d(ctx0, res_conv, n_conv - 1, n_channels, n_seqs,
@@ -286,8 +292,15 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     }
 
     out = ggml_scale(ctx0, ggml_add(ctx0, out, cur), scale);
+    out = residual ? ggml_add(ctx0, residual, out) : out;
 
-    return residual ? ggml_add(ctx0, residual, out) : out;
+    if (post != GGML_INKLING2_HEAD_POST_NONE) {
+        out = ggml_reshape_3d(ctx0, out, head_dim, n_channels/head_dim, n_tokens);
+        out = post == GGML_INKLING2_HEAD_POST_CLIP ? clip(out, nullptr, nullptr, post_param, il) : ggml_rms_norm(ctx0, out, post_param);
+        out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+    }
+
+    return out;
 }
 
 // a weight that a fused op can read directly: a float type, no Hadamard transform, no LoRA
@@ -497,19 +510,35 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         };
 
         ggml_tensor * Qcur = mm(0, layer.wq, inputs[0]);
+        // the K clip and the V norm run per head on the conv output (in the fused conv when possible)
         ggml_tensor * Kcur = convolve(mm(1, layer.wk, inputs[1]), layer.attn_k_conv,
-                is_swa ? nullptr : mm(3, layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0, ip);
+                is_swa ? nullptr : mm(3, layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0, ip,
+                nullptr, GGML_INKLING2_HEAD_POST_CLIP, n_embd_head, hparams.f_qk_clip);
         ggml_tensor * Vcur = convolve(mm(2, layer.wv, inputs[2]), layer.attn_v_conv,
-                is_swa ? nullptr : mm(4, layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa, ip);
+                is_swa ? nullptr : mm(4, layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa, ip,
+                nullptr, GGML_INKLING2_HEAD_POST_RMS_NORM, n_embd_head, hparams.f_norm_rms_eps);
         ggml_tensor * Rcur = mm(5, layer.attn_rel, inputs[0]);
 
         // full-attention layers scale q and r by the log-scaled positions
         ggml_tensor * tau_l = is_swa ? nullptr : tau;
 
-        Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, tau_l, hparams.f_qk_clip, ip);
-        Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           nullptr, hparams.f_qk_clip, ip);
-        Vcur = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), hparams.f_norm_rms_eps);
-        Rcur = clip(ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, tau_l, hparams.f_relative_clip, ip);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+        // Q and R are clipped in one op when fused
+        if (cparams.fused_inkling2) {
+            ggml_tensor * qr = ggml_inkling2_clip2(ctx0,
+                    ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), layer.attn_q_clip, hparams.f_qk_clip,
+                    ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip, tau_l, 1e-6f);
+            res->add_fused_node({LLM_FUSED_OP_INKLING2, qr, ip});
+
+            Qcur = ggml_view_3d(ctx0, qr, n_embd_head, n_head, n_tokens, n_embd_head*sizeof(float), n_embd_head*n_head*sizeof(float), 0);
+            Rcur = ggml_view_3d(ctx0, qr, hparams.n_relative, n_head, n_tokens, hparams.n_relative*sizeof(float),
+                    hparams.n_relative*n_head*sizeof(float), n_embd_head*n_head*n_tokens*sizeof(float));
+        } else {
+            Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, tau_l, hparams.f_qk_clip, ip);
+            Rcur = clip(ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, tau_l, hparams.f_relative_clip, ip);
+        }
 
         cb(Qcur, "Qcur", il);
         cb(Kcur, "Kcur", il);

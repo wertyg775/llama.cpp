@@ -6850,9 +6850,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_INKLING2_CTRL:
             return ggml_cuda_inkling2_ctrl_supported(op);
         case GGML_OP_INKLING2_CLIP:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->nb[0] == sizeof(float) && op->src[0]->nb[1] % sizeof(float) == 0;
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->nb[0] == sizeof(float) && op->src[0]->nb[1] % sizeof(float) == 0 &&
+                (!op->src[3] || !op->src[1] == !op->src[4]);
         case GGML_OP_INKLING2_CONV:
-            return op->src[1]->ne[2] <= 65535;
+            // a head of the post op must lie in one block of 256 threads
+            return op->src[1]->ne[2] <= 65535 && (ggml_get_op_params_i32(op, 2) == GGML_INKLING2_HEAD_POST_NONE ||
+                (256 % ggml_get_op_params_i32(op, 3) == 0 && ggml_get_op_params_i32(op, 3) % WARP_SIZE == 0));
         case GGML_OP_INKLING2_MIX:
             return ggml_cuda_inkling2_mix_supported(op);
         case GGML_OP_INKLING2_REL_BIAS:

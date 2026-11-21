@@ -2520,7 +2520,10 @@ struct llama_model_inkling2 : public llama_model_base {
                 llm_graph_input_rs * inp,
                 int64_t offset,
                 int il,
-                ggml_tensor * residual = nullptr);
+                ggml_tensor * residual = nullptr,
+                int post = 0, // ggml_inkling2_head_post, applied per head of head_dim channels
+                int64_t head_dim = 0,
+                float post_param = 0.0f);
         bool          plain_weight(const ggml_tensor * w) const;
         bool          fused_control(const loop_layer & loop) const;
         ggml_tensor * control(ggml_tensor * cur, ggml_tensor * cur_norm, ggml_tensor * message, ggml_tensor * message_norm,
