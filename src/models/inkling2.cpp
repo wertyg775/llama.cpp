@@ -167,11 +167,11 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
     }
 
     ggml_tensor * norm = ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, cur)));
-    norm = ggml_scale_bias(ctx0, norm, 1.0f, 1e-6f);
 
-    ggml_tensor * factor = ggml_div(ctx0, ggml_fill(ctx0, norm, threshold), norm);
+    // x*min(1, t/(norm + eps)) = x/max(1, (norm + eps)/t)
+    norm = ggml_clamp(ctx0, ggml_scale_bias(ctx0, norm, 1.0f/threshold, 1e-6f/threshold), 1.0f, INFINITY);
 
-    return ggml_mul(ctx0, cur, ggml_clamp(ctx0, factor, 0.0f, 1.0f));
+    return ggml_div(ctx0, cur, norm);
 }
 
 // attention over the depth: mix the earlier block outputs and cur with learned queries
