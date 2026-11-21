@@ -693,3 +693,135 @@ void ggml_cuda_op_inkling2_situ(ggml_backend_cuda_context & ctx, ggml_tensor * d
             gate->nb[1]/sizeof(float), gate->nb[2]/sizeof(float), gate->nb[3]/sizeof(float),
             up->nb[1]/sizeof(float), up->nb[2]/sizeof(float), up->nb[3]/sizeof(float), beta, lb);
 }
+
+static constexpr int INKLING2_PROJ_MAX_W          = GGML_MAX_SRC - 2;
+static constexpr int INKLING2_PROJ_ROWS_PER_BLOCK = 32;
+
+struct inkling2_proj_weights {
+    const void * w[INKLING2_PROJ_MAX_W];
+    int64_t      s_w[INKLING2_PROJ_MAX_W];       // row stride in elements
+    int          rows[INKLING2_PROJ_MAX_W];
+    int          out_off[INKLING2_PROJ_MAX_W];   // first output row
+    int          blk_start[INKLING2_PROJ_MAX_W + 1];
+    int          rpb;                            // rows per block
+};
+
+// the input row (normalized) in LDS, then one warp per weight row; blockIdx.x walks the row blocks of all weights
+template <typename T, bool vec, bool has_norm>
+static __global__ void inkling2_proj_f32(
+        const float * __restrict__ x, const float * __restrict__ norm, float * __restrict__ dst, const inkling2_proj_weights p,
+        const int n, const int64_t s_x1, const int64_t s_d1, const float eps) {
+    constexpr int v = vec ? 16/sizeof(T) : 1;
+
+    extern __shared__ float xs[];
+
+    const int t = blockIdx.y;
+    const float * xr = x + t*s_x1;
+
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float xi = xr[i];
+        xs[i] = xi;
+        ss += xi*xi;
+    }
+    if constexpr (has_norm) {
+        __shared__ float buf[32];
+        ss = block_reduce<block_reduce_method::SUM>(ss, buf);
+        const float scale = rsqrtf(ss/n + eps);
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            xs[i] = (xs[i]*scale)*norm[i];
+        }
+    }
+    __syncthreads();
+
+    int k = 0;
+    while ((int) blockIdx.x >= p.blk_start[k + 1]) {
+        ++k;
+    }
+    const T * w    = (const T *) p.w[k];
+    const int r0   = (blockIdx.x - p.blk_start[k])*p.rpb;
+    const int r1   = min(r0 + p.rpb, p.rows[k]);
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int nw   = blockDim.x / WARP_SIZE;
+
+    for (int r = r0 + warp; r < r1; r += nw) {
+        const T * wr = w + r*p.s_w[k];
+        float acc = 0.0f;
+#pragma unroll 4
+        for (int c = lane*v; c < n; c += WARP_SIZE*v) {
+            float wf[v];
+            inkling2_load<v>(wr + c, wf);
+#pragma unroll
+            for (int q = 0; q < v; ++q) {
+                acc += wf[q]*xs[c + q];
+            }
+        }
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) {
+            dst[t*s_d1 + p.out_off[k] + r] = acc;
+        }
+    }
+}
+
+bool ggml_cuda_inkling2_proj_supported(const ggml_tensor * op) {
+    const ggml_type type = op->src[1]->type;
+    return (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16) && op->ne[1] <= 65535 &&
+        op->src[0]->ne[0]*sizeof(float) <= 48*1024;
+}
+
+void ggml_cuda_op_inkling2_proj(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+
+    float eps;
+    memcpy(&eps, (const float *) dst->op_params + 0, sizeof(float));
+    const int n_w = ggml_get_op_params_i32(dst, 1);
+
+    const ggml_tensor * norm = dst->src[1 + n_w];
+    const ggml_type     type = dst->src[1]->type;
+    const size_t        ts   = ggml_type_size(type);
+    const int           n    = x->ne[0];
+
+    // each block normalizes the input again, so a block takes many rows
+    inkling2_proj_weights p = {};
+    p.rpb = INKLING2_PROJ_ROWS_PER_BLOCK;
+    bool aligned = n % (16/ts) == 0;
+    int  off     = 0;
+    for (int i = 0; i < n_w; ++i) {
+        const ggml_tensor * w = dst->src[1 + i];
+        p.w[i]             = w->data;
+        p.s_w[i]           = w->nb[1]/ts;
+        p.rows[i]          = w->ne[1];
+        p.out_off[i]       = off;
+        p.blk_start[i + 1] = p.blk_start[i] + (w->ne[1] + p.rpb - 1)/p.rpb;
+        off               += w->ne[1];
+        aligned            = aligned && inkling2_aligned(w->data, w->nb[1]);
+    }
+    for (int i = n_w; i < INKLING2_PROJ_MAX_W; ++i) {
+        p.blk_start[i + 1] = p.blk_start[n_w];
+    }
+
+    const dim3   grid(p.blk_start[n_w], x->ne[1]);
+    const int    n_threads = 512;
+    const size_t smem      = n*sizeof(float);
+
+    auto launch = [&](auto kernel) {
+        kernel<<<grid, n_threads, smem, ctx.stream()>>>((const float *) x->data, norm ? (const float *) norm->data : nullptr,
+                (float *) dst->data, p, n, x->nb[1]/sizeof(float), dst->nb[1]/sizeof(float), eps);
+    };
+    auto launch_t = [&](auto tag) {
+        using T = decltype(tag);
+        if (aligned) {
+            norm ? launch(inkling2_proj_f32<T, true,  true>) : launch(inkling2_proj_f32<T, true,  false>);
+        } else {
+            norm ? launch(inkling2_proj_f32<T, false, true>) : launch(inkling2_proj_f32<T, false, false>);
+        }
+    };
+
+    switch (type) {
+        case GGML_TYPE_F32:  launch_t(float());       break;
+        case GGML_TYPE_F16:  launch_t(half());        break;
+        case GGML_TYPE_BF16: launch_t(nv_bfloat16()); break;
+        default: GGML_ABORT("unsupported type %s", ggml_type_name(type));
+    }
+}

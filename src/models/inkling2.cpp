@@ -290,6 +290,22 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     return residual ? ggml_add(ctx0, residual, out) : out;
 }
 
+// a weight that a fused op can read directly: a float type, no Hadamard transform, no LoRA
+bool llama_model_inkling2::graph::plain_weight(const ggml_tensor * w) const {
+    if (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_F16 && w->type != GGML_TYPE_BF16) {
+        return false;
+    }
+    if (hdmd && hdmd->rot.count(w)) {
+        return false;
+    }
+    for (const auto & lora : *loras) {
+        if (lora.first->get_weight(const_cast<ggml_tensor *>(w))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // the fused controller op reads the plain weights and normalizes its inputs itself
 // it is a mat-vec per token, so large batches keep the mul_mat graph
 bool llama_model_inkling2::graph::fused_control(const loop_layer & loop) const {
@@ -299,16 +315,8 @@ bool llama_model_inkling2::graph::fused_control(const loop_layer & loop) const {
 
     for (int ctrl = 0; ctrl < LOOP_CTRL_COUNT; ++ctrl) {
         for (ggml_tensor * w : {loop.ctrl_down[ctrl], loop.ctrl_gain[ctrl], loop.ctrl_forget[ctrl]}) {
-            if (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_F16 && w->type != GGML_TYPE_BF16) {
+            if (!plain_weight(w)) {
                 return false;
-            }
-            if (hdmd && hdmd->rot.count(w)) {
-                return false;
-            }
-            for (const auto & lora : *loras) {
-                if (lora.first->get_weight(w)) {
-                    return false;
-                }
             }
         }
     }
@@ -417,7 +425,59 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         }
     }
 
-    if (is_swa && messages) {
+    // at decode the projections of each distinct input run as one fused op, with the input norm
+    // proj: q, k, v, k taps, v taps, r, sink logits, output gate
+    ggml_tensor * proj[8] = {};
+    {
+        ggml_tensor * ws_all[8] = { layer.wq, layer.wk, layer.wv, layer.attn_k_conv_proj, layer.attn_v_conv_proj, layer.attn_rel, layer.attn_sink_proj, layer.wqkv_gate };
+
+        bool fused_proj = cparams.fused_inkling2 && n_tokens == 1;
+        for (ggml_tensor * w : ws_all) {
+            fused_proj = fused_proj && (!w || (plain_weight(w) && w->type == layer.wq->type));
+        }
+        for (ggml_tensor * g : {layer.attn_norm, layer.attn_q_inp_norm, layer.attn_k_inp_norm, layer.attn_v_inp_norm}) {
+            fused_proj = fused_proj && (!g || g->type == GGML_TYPE_F32);
+        }
+
+        if (fused_proj) {
+            struct proj_group {
+                ggml_tensor *    x;
+                ggml_tensor *    norm;
+                std::vector<int> outs;
+            };
+            std::vector<proj_group> groups;
+            if (is_swa && !messages) {
+                groups.push_back({inputs[0], layer.attn_norm, {0, 5, 6, 7, 1, 2}});
+            } else if (is_swa) {
+                groups.push_back({inputs[0], layer.attn_norm, {0, 5, 6, 7}});
+                groups.push_back({inputs[1], layer.attn_norm, {1}});
+                groups.push_back({inputs[2], layer.attn_norm, {2}});
+            } else {
+                groups.push_back({inputs[0], layer.attn_q_inp_norm, {0, 5, 6, 7}});
+                groups.push_back({inputs[1], layer.attn_k_inp_norm, {1, 3}});
+                groups.push_back({inputs[2], layer.attn_v_inp_norm, {2, 4}});
+            }
+
+            for (const auto & g : groups) {
+                std::vector<ggml_tensor *> ws;
+                for (int i : g.outs) {
+                    ws.push_back(ws_all[i]);
+                }
+                ggml_tensor * out = ggml_inkling2_proj(ctx0, g.x, ws.data(), (int) ws.size(), g.norm, hparams.f_norm_rms_eps);
+                res->add_fused_node({LLM_FUSED_OP_INKLING2, out, ip});
+
+                size_t offs = 0;
+                for (int i : g.outs) {
+                    proj[i] = ggml_view_2d(ctx0, out, ws_all[i]->ne[1], n_tokens, out->nb[1], offs);
+                    offs   += ws_all[i]->ne[1]*sizeof(float);
+                }
+            }
+        }
+    }
+
+    if (proj[0]) {
+        // the inputs are normalized inside the projections
+    } else if (is_swa && messages) {
         for (int j = 0; j < 3; ++j) {
             inputs[j] = build_norm(inputs[j], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
         }
@@ -432,12 +492,16 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // self-attention
     {
-        ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
-        ggml_tensor * Kcur = convolve(build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
-                is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0, ip);
-        ggml_tensor * Vcur = convolve(build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
-                is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa, ip);
-        ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
+        auto mm = [&](int i, ggml_tensor * w, ggml_tensor * x) {
+            return proj[0] ? proj[i] : build_lora_mm(w, x);
+        };
+
+        ggml_tensor * Qcur = mm(0, layer.wq, inputs[0]);
+        ggml_tensor * Kcur = convolve(mm(1, layer.wk, inputs[1]), layer.attn_k_conv,
+                is_swa ? nullptr : mm(3, layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0, ip);
+        ggml_tensor * Vcur = convolve(mm(2, layer.wv, inputs[2]), layer.attn_v_conv,
+                is_swa ? nullptr : mm(4, layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa, ip);
+        ggml_tensor * Rcur = mm(5, layer.attn_rel, inputs[0]);
 
         // full-attention layers scale q and r by the log-scaled positions
         ggml_tensor * tau_l = is_swa ? nullptr : tau;
@@ -457,7 +521,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
         const int64_t n_kv     = rel_pos->ne[0];
 
-        ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+        ggml_tensor * sinks = mm(6, layer.attn_sink_proj, inputs[0]);
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
         ggml_tensor * kq_b;
@@ -488,7 +552,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 nullptr, nullptr, nullptr,
                 Qcur, Kcur, Vcur, kq_b, sinks_zero, 1.0f/sqrtf(n_embd_head), il, cparams.fused_inkling2);
 
-        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
+        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, mm(7, layer.wqkv_gate, inputs[0])));
         // the first layer of each block starts a new residual stream, the earlier one joins the mixed blocks
         const bool new_block = ip % hparams.attn_res_block_size == 0;
 

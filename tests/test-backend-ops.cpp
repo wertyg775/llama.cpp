@@ -5212,6 +5212,50 @@ struct test_inkling2_situ : public test_case {
     }
 };
 
+// GGML_OP_INKLING2_PROJ
+struct test_inkling2_proj : public test_case {
+    const ggml_type            type;
+    const int64_t              n;
+    const std::vector<int64_t> rows;
+    const int64_t              n_tokens;
+    const bool                 norm;
+
+    std::string vars() override {
+        std::string r;
+        for (int64_t v : rows) {
+            r += (r.empty() ? "" : ":") + std::to_string(v);
+        }
+        return VARS_TO_STR4(type, n, n_tokens, norm) + ",rows=" + r;
+    }
+
+    test_inkling2_proj(ggml_type type = GGML_TYPE_BF16, int64_t n = 64, std::vector<int64_t> rows = {32, 5}, int64_t n_tokens = 1, bool norm = true)
+        : type(type), n(n), rows(rows), n_tokens(n_tokens), norm(norm) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_set_name(x, "x");
+
+        std::vector<ggml_tensor *> ws;
+        for (int64_t r : rows) {
+            ws.push_back(ggml_new_tensor_2d(ctx, type, n, r));
+        }
+
+        ggml_tensor * g = nullptr;
+        if (norm) {
+            g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+            ggml_set_name(g, "norm");
+        }
+
+        ggml_tensor * out = ggml_inkling2_proj(ctx, x, ws.data(), (int) ws.size(), g, 1e-6f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    double max_nmse_err() override {
+        return 5e-7;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -11153,6 +11197,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true));
+    for (ggml_type type : {GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (bool norm : {true, false}) {
+            test_cases.emplace_back(new test_inkling2_proj(type, 64, {32, 5}, 1, norm));
+            test_cases.emplace_back(new test_inkling2_proj(type, 2304, {3072, 384, 24, 3072, 512, 512}, 1, norm)); // Inkling 2 Mini SWA
+            test_cases.emplace_back(new test_inkling2_proj(type, 2304, {512, 16}, 3, norm));
+            test_cases.emplace_back(new test_inkling2_proj(type, 37, {3, 17, 1, 2, 5, 7, 9, 11}, 2, norm));         // 8 weights, odd sizes
+        }
+    }
     for (float lb : {25.0f, 0.0f}) {
         for (bool merged : {true, false}) {
             test_cases.emplace_back(new test_inkling2_situ({64, 8, 2}, lb, merged));
@@ -14220,6 +14272,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n_tokens, true, true)); // Qwen4-Exp, with the post gate chain
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n_tokens, true));       // synthetic, Qwen4-Exp kernel without the gate chain
     }
+
+    // INKLING2_PROJ: Inkling 2 Mini projections of a SWA layer input, decode
+    test_cases.emplace_back(new test_inkling2_proj(GGML_TYPE_BF16, 2304, {3072, 384, 24, 3072, 512, 512}, 1, true));
+    test_cases.emplace_back(new test_inkling2_proj(GGML_TYPE_BF16, 2304, {3072}, 1, true));
 
     // INKLING2_MIX: Inkling 2 Mini depth mix, decode
     test_cases.emplace_back(new test_inkling2_mix(GGML_TYPE_F32, 2304, 5, 1, 1));

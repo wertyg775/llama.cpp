@@ -12141,6 +12141,89 @@ void ggml_compute_forward_inkling2_situ(
     }
 }
 
+// ggml_compute_forward_inkling2_proj
+
+static void ggml_compute_forward_inkling2_proj_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+
+    const float eps = ggml_get_op_params_f32(dst, 0);
+    const int   n_w = ggml_get_op_params_i32(dst, 1);
+
+    const ggml_tensor * norm = dst->src[1 + n_w];
+
+    const int64_t n = x->ne[0];
+    const int64_t T = x->ne[1];
+    const int64_t R = dst->ne[0];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    float * xn  = (float *) params->wdata + ith*(2*n + CACHE_LINE_SIZE_F32);
+    float * row = xn + n;
+
+    const int64_t dr  = (R*T + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, R*T);
+
+    int64_t tx = -1;
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t r = ir % R;
+        const int64_t t = ir / R;
+
+        if (t != tx) {
+            const float * xs = (const float *) ((const char *) x->data + t*x->nb[1]);
+            if (norm) {
+                ggml_float sum = 0.0;
+                for (int64_t i = 0; i < n; ++i) {
+                    sum += (ggml_float) (xs[i]*xs[i]);
+                }
+                const float mean  = sum/n;
+                const float scale = 1.0f/sqrtf(mean + eps);
+                for (int64_t i = 0; i < n; ++i) {
+                    xn[i] = (xs[i]*scale)*((const float *) norm->data)[i];
+                }
+            } else {
+                memcpy(xn, xs, n*sizeof(float));
+            }
+            tx = t;
+        }
+
+        // row r of the stacked weights
+        int     k  = 0;
+        int64_t rk = r;
+        while (rk >= dst->src[1 + k]->ne[1]) {
+            rk -= dst->src[1 + k]->ne[1];
+            ++k;
+        }
+        const ggml_tensor * w = dst->src[1 + k];
+        const char * src = (const char *) w->data + rk*w->nb[1];
+        if (w->type == GGML_TYPE_F32) {
+            memcpy(row, src, n*sizeof(float));
+        } else {
+            ggml_get_type_traits(w->type)->to_float(src, row, n);
+        }
+
+        ggml_vec_dot_f32(n, (float *) ((char *) dst->data + t*dst->nb[1]) + r, 0, row, 0, xn, 0, 1);
+    }
+}
+
+void ggml_compute_forward_inkling2_proj(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_inkling2_proj_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_top_k_mask
 
 void ggml_compute_forward_top_k_mask(

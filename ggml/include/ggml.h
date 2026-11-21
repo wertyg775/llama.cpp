@@ -421,6 +421,7 @@ extern "C" {
         GGML_OP_INKLING2_MIX,
         GGML_OP_INKLING2_REL_BIAS,
         GGML_OP_INKLING2_SITU,
+        GGML_OP_INKLING2_PROJ,
 
         GGML_OP_UNARY,
 
@@ -2598,6 +2599,20 @@ extern "C" {
             struct ggml_tensor  * up,
             float                 beta,
             float                 lb);
+
+    // inkling2 projections of one input: the mat-vecs of n_w weights, after an optional RMS norm with a weight
+    //   x:    [n, T] f32, rows contiguous
+    //   ws:   n_w <= 8 weights [n, rows_i], all of one type: f32, f16 or bf16
+    //   norm: [n] f32 or NULL; then x is rms_norm(x, eps)*norm
+    //   result: [sum rows_i, T], the outputs of the weights one after the other
+    //
+    GGML_API struct ggml_tensor * ggml_inkling2_proj(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor ** ws,
+            int                   n_w,
+            struct ggml_tensor  * norm,
+            float                 eps);
 
     // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
     //

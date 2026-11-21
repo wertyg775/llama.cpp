@@ -1105,6 +1105,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "INKLING2_MIX",
     "INKLING2_REL_BIAS",
     "INKLING2_SITU",
+    "INKLING2_PROJ",
 
     "UNARY",
 
@@ -1124,7 +1125,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1226,6 +1227,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "inkling2_mix(x, query, blocks)",
     "inkling2_rel_bias(table, r, sinks, rel_pos, mask)",
     "inkling2_situ(gate, up)",
+    "inkling2_proj(x, ws, norm)",
 
     "unary(x)",
 
@@ -1245,7 +1247,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6798,6 +6800,43 @@ struct ggml_tensor * ggml_inkling2_situ(
     result->op     = GGML_OP_INKLING2_SITU;
     result->src[0] = gate;
     result->src[1] = up;
+
+    return result;
+}
+
+// ggml_inkling2_proj
+
+struct ggml_tensor * ggml_inkling2_proj(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor ** ws,
+        int                   n_w,
+        struct ggml_tensor  * norm,
+        float                 eps) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && ggml_nrows(x) == x->ne[1]);
+    GGML_ASSERT(n_w > 0 && n_w <= GGML_MAX_SRC - 2);
+
+    int64_t rows = 0;
+    for (int i = 0; i < n_w; ++i) {
+        GGML_ASSERT(ws[i]->type == ws[0]->type && ws[i]->ne[0] == x->ne[0] && ggml_nrows(ws[i]) == ws[i]->ne[1]);
+        GGML_ASSERT(ws[i]->nb[0] == ggml_type_size(ws[i]->type));
+        rows += ws[i]->ne[1];
+    }
+    if (norm) {
+        GGML_ASSERT(norm->type == GGML_TYPE_F32 && ggml_is_contiguous(norm) && ggml_nelements(norm) == x->ne[0]);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rows, x->ne[1]);
+
+    ggml_set_op_params_f32(result, 0, eps);
+    ggml_set_op_params_i32(result, 1, n_w);
+
+    result->op     = GGML_OP_INKLING2_PROJ;
+    result->src[0] = x;
+    for (int i = 0; i < n_w; ++i) {
+        result->src[1 + i] = ws[i];
+    }
+    result->src[1 + n_w] = norm;
 
     return result;
 }
