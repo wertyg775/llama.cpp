@@ -10,6 +10,8 @@ struct topk_moe_config {
     bool use_sigmoid;
     bool use_sqrt_softplus;
     bool with_norm;
+    float norm_mul; // the weight sum is max(sum*norm_mul + norm_add, clamp_val)
+    float norm_add;
     bool delayed_softmax;
     int  n_groups;
     int  n_group_used;
@@ -334,7 +336,7 @@ __global__ void topk_moe_cuda(const float *         logits,
 
     if (config.with_norm) {
         wt_sum              = warp_reduce_sum<warp_size>(wt_sum);
-        wt_sum              = max(wt_sum, clamp_val);
+        wt_sum              = max(wt_sum*config.norm_mul + config.norm_add, clamp_val);
         const float inv_sum = 1.0f / wt_sum;
 
         for (int i = 0; i < experts_per_thread; i++) {
@@ -463,7 +465,12 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     const bool with_norm = clamp != nullptr;
 
     float clamp_val = -INFINITY;
-    if (clamp) {
+    float norm_mul  = 1.0f;
+    float norm_add  = 0.0f;
+    if (clamp && clamp->op == GGML_OP_SCALE) {
+        norm_mul = ggml_get_op_params_f32(clamp, 0);
+        norm_add = ggml_get_op_params_f32(clamp, 1);
+    } else if (clamp) {
         clamp_val = ggml_get_op_params_f32(clamp, 0);
     }
 
@@ -471,6 +478,8 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.use_sigmoid       = args.sigmoid;
     config.use_sqrt_softplus = args.sqrt_softplus;
     config.with_norm         = with_norm;
+    config.norm_mul          = norm_mul;
+    config.norm_add          = norm_add;
     config.delayed_softmax   = args.delayed_softmax;
     config.n_groups          = args.n_groups;
     config.n_group_used      = args.n_group_used;

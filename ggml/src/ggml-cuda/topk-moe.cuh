@@ -13,6 +13,7 @@ struct ggml_cuda_topk_moe_args {
     bool delayed_softmax{};
     bool prob_bias{};
     bool norm{};
+    ggml_op norm_op = GGML_OP_CLAMP; // the op that bounds the weight sum: CLAMP(min) or SCALE(scale, bias)
     bool scale{};
     int  n_groups{};     // > 0: pick experts only from the top n_group_used expert groups
     int  n_group_used{};
