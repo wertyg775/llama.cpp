@@ -485,7 +485,8 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     } else if (table_id == MMVQ_PARAMETERS_GCN) {
         switch (ncols_dst) {
             case 1:
-                return 2;
+                // NVFP4 on gfx906 (Inkling 2 Mini experts): 1 warp per row is 25-30% faster than 2
+                return type == GGML_TYPE_NVFP4 ? 1 : 2;
             case 2:
             case 3:
                 return type == GGML_TYPE_Q3_K ? 1 : 2;
