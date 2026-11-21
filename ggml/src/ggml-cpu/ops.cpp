@@ -12074,6 +12074,55 @@ void ggml_compute_forward_inkling2_rel_bias(
     }
 }
 
+// ggml_compute_forward_inkling2_situ
+
+static void ggml_compute_forward_inkling2_situ_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * gate = dst->src[0];
+    const ggml_tensor * up   = dst->src[1];
+
+    const float beta = ggml_get_op_params_f32(dst, 0);
+    const float lb   = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t n  = gate->ne[0];
+    const int64_t nr = ggml_nrows(gate);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    for (int64_t ir = ith; ir < nr; ir += nth) {
+        const int64_t i1 = ir % gate->ne[1];
+        const int64_t i2 = (ir / gate->ne[1]) % gate->ne[2];
+        const int64_t i3 = ir / (gate->ne[1]*gate->ne[2]);
+
+        const float * g = (const float *) ((const char *) gate->data + i1*gate->nb[1] + i2*gate->nb[2] + i3*gate->nb[3]);
+        const float * u = (const float *) ((const char *) up->data   + i1*up->nb[1]   + i2*up->nb[2]   + i3*up->nb[3]);
+        float       * y = (float *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+
+        for (int64_t i0 = 0; i0 < n; ++i0) {
+            const float a = tanhf(g[i0]*(1.0f/beta))*beta*(1.0f/(1.0f + expf(-g[i0])));
+            const float b = lb > 0.0f ? tanhf(u[i0]*(1.0f/lb))*lb : u[i0];
+            y[i0] = a*b;
+        }
+    }
+}
+
+void ggml_compute_forward_inkling2_situ(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_inkling2_situ_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_top_k_mask
 
 void ggml_compute_forward_top_k_mask(

@@ -1104,6 +1104,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "INKLING2_CONV",
     "INKLING2_MIX",
     "INKLING2_REL_BIAS",
+    "INKLING2_SITU",
 
     "UNARY",
 
@@ -1123,7 +1124,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1224,6 +1225,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "inkling2_conv(cur, past, weight, dynamic)",
     "inkling2_mix(x, query, blocks)",
     "inkling2_rel_bias(table, r, sinks, rel_pos)",
+    "inkling2_situ(gate, up)",
 
     "unary(x)",
 
@@ -1243,7 +1245,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6750,6 +6752,30 @@ struct ggml_tensor * ggml_inkling2_rel_bias(
     result->src[1] = r;
     result->src[2] = sinks;
     result->src[3] = rel_pos;
+
+    return result;
+}
+
+// ggml_inkling2_situ
+
+struct ggml_tensor * ggml_inkling2_situ(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * up,
+        float                 beta,
+        float                 lb) {
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 && ggml_are_same_shape(gate, up));
+    GGML_ASSERT(gate->nb[0] == sizeof(float) && up->nb[0] == sizeof(float));
+    GGML_ASSERT(beta > 0.0f);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, gate->ne);
+
+    ggml_set_op_params_f32(result, 0, beta);
+    ggml_set_op_params_f32(result, 1, lb);
+
+    result->op     = GGML_OP_INKLING2_SITU;
+    result->src[0] = gate;
+    result->src[1] = up;
 
     return result;
 }

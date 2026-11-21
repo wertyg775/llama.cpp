@@ -420,6 +420,7 @@ extern "C" {
         GGML_OP_INKLING2_CONV,
         GGML_OP_INKLING2_MIX,
         GGML_OP_INKLING2_REL_BIAS,
+        GGML_OP_INKLING2_SITU,
 
         GGML_OP_UNARY,
 
@@ -2579,6 +2580,17 @@ extern "C" {
             struct ggml_tensor  * sinks,
             struct ggml_tensor  * rel_pos,
             int64_t               n_stream);
+
+    // inkling2 SiTU activation of the expert FFN
+    //   gate, up: same shape f32, rows contiguous (views of the merged gate_up output are fine)
+    //   result = beta*tanh(gate/beta)*sigmoid(gate)*(lb > 0 ? lb*tanh(up/lb) : up), contiguous
+    //
+    GGML_API struct ggml_tensor * ggml_inkling2_situ(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * up,
+            float                 beta,
+            float                 lb);
 
     // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
     //

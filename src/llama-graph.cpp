@@ -2670,6 +2670,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float beta = hparams.situ_beta;
                     const float lb   = hparams.situ_linear_beta;
 
+                    if (cparams.fused_inkling2) {
+                        cur = ggml_inkling2_situ(ctx0, cur, up, beta, lb);
+                        cb(cur, "ffn_moe_situ", il);
+                        break;
+                    }
+
                     if (arch == LLM_ARCH_INKLING2_LOOP && gate_up_exps && gate_up_exps->buffer &&
                         !ggml_backend_buffer_is_host(gate_up_exps->buffer)) {
                         cur = ggml_cont(ctx0, cur);

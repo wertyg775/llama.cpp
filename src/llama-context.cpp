@@ -352,8 +352,8 @@ llama_context::llama_context(
     cparams.fused_top_k_mask = true;
     cparams.auto_ftkm        = hparams.indexer_top_k > 0;
 
-    cparams.fused_inkling2 = true;
-    cparams.auto_finkling2 = model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP;
+    cparams.fused_inkling2 = model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP;
+    cparams.auto_finkling2 = cparams.fused_inkling2;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;

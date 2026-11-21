@@ -5114,6 +5114,47 @@ struct test_inkling2_rel_bias : public test_case {
     }
 };
 
+// GGML_OP_INKLING2_SITU
+struct test_inkling2_situ : public test_case {
+    const std::array<int64_t, 3> ne; // n_ff, n_used, tokens
+    const float lb;
+    const bool  merged; // gate and up are the halves of one gate_up tensor
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, lb, merged);
+    }
+
+    test_inkling2_situ(std::array<int64_t, 3> ne = {64, 8, 2}, float lb = 25.0f, bool merged = true)
+        : ne(ne), lb(lb), merged(merged) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate;
+        ggml_tensor * up;
+        if (merged) {
+            ggml_tensor * gu = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*ne[0], ne[1], ne[2]);
+            ggml_set_name(gu, "gate_up");
+            gate = ggml_view_3d(ctx, gu, ne[0], ne[1], ne[2], gu->nb[1], gu->nb[2], 0);
+            up   = ggml_view_3d(ctx, gu, ne[0], ne[1], ne[2], gu->nb[1], gu->nb[2], ne[0]*gu->nb[0]);
+        } else {
+            gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+            up   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+        }
+        ggml_set_name(gate, "gate");
+        ggml_set_name(up,   "up");
+
+        ggml_tensor * out = ggml_inkling2_situ(ctx, gate, up, 4.0f, lb);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    // gate and up span the bend of tanh at beta = 4 and lb
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -30.0f, 30.0f);
+        }
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -11055,6 +11096,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true));
+    for (float lb : {25.0f, 0.0f}) {
+        for (bool merged : {true, false}) {
+            test_cases.emplace_back(new test_inkling2_situ({64, 8, 2}, lb, merged));
+            test_cases.emplace_back(new test_inkling2_situ({1152, 8, 1}, lb, merged)); // Inkling 2 Mini decode
+            test_cases.emplace_back(new test_inkling2_situ({37, 3, 5}, lb, merged));
+        }
+    }
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_F16}) {
         test_cases.emplace_back(new test_inkling2_rel_bias(type, 16, 100, 4, 256, 1));
         test_cases.emplace_back(new test_inkling2_rel_bias(type, 16, 1024, 24, 1000, 3));

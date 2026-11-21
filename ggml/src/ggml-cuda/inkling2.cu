@@ -567,3 +567,45 @@ void ggml_cuda_op_inkling2_rel_bias(ggml_backend_cuda_context & ctx, ggml_tensor
         default: GGML_ABORT("unsupported type %s", ggml_type_name(table->type));
     }
 }
+
+// one thread per element; gate and up may be strided views
+static __global__ void inkling2_situ_f32(
+        const float * __restrict__ gate, const float * __restrict__ up, float * __restrict__ dst, const int64_t ne,
+        const int ne0, const int ne1, const int ne2, const int64_t sg1, const int64_t sg2, const int64_t sg3,
+        const int64_t su1, const int64_t su2, const int64_t su3, const float beta, const float lb) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= ne) {
+        return;
+    }
+    const int64_t i0 = i % ne0;
+    const int64_t i1 = (i / ne0) % ne1;
+    const int64_t i2 = (i / ((int64_t) ne0*ne1)) % ne2;
+    const int64_t i3 = i / ((int64_t) ne0*ne1*ne2);
+
+    const float g = gate[i0 + i1*sg1 + i2*sg2 + i3*sg3];
+    const float u = up  [i0 + i1*su1 + i2*su2 + i3*su3];
+
+    const float a = tanhf(g*(1.0f/beta))*beta*(1.0f/(1.0f + expf(-g)));
+    const float b = lb > 0.0f ? tanhf(u*(1.0f/lb))*lb : u;
+    dst[i] = a*b;
+}
+
+void ggml_cuda_op_inkling2_situ(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * gate = dst->src[0];
+    const ggml_tensor * up   = dst->src[1];
+
+    float beta;
+    float lb;
+    memcpy(&beta, (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&lb,   (const float *) dst->op_params + 1, sizeof(float));
+
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t ne = ggml_nelements(dst);
+    const int     n_threads = 256;
+
+    inkling2_situ_f32<<<(ne + n_threads - 1)/n_threads, n_threads, 0, ctx.stream()>>>((const float *) gate->data, (const float *) up->data,
+            (float *) dst->data, ne, gate->ne[0], gate->ne[1], gate->ne[2],
+            gate->nb[1]/sizeof(float), gate->nb[2]/sizeof(float), gate->nb[3]/sizeof(float),
+            up->nb[1]/sizeof(float), up->nb[2]/sizeof(float), up->nb[3]/sizeof(float), beta, lb);
+}
