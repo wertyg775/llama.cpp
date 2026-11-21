@@ -2145,6 +2145,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_inkling2_proj(params, tensor);
             } break;
+        case GGML_OP_INKLING2_ATTN:
+            {
+                ggml_compute_forward_inkling2_attn(params, tensor);
+            } break;
         case GGML_OP_TOP_K_MASK:
             {
                 ggml_compute_forward_top_k_mask(params, tensor);
@@ -2339,6 +2343,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_INKLING2_REL_BIAS:
         case GGML_OP_INKLING2_SITU:
         case GGML_OP_INKLING2_PROJ:
+        case GGML_OP_INKLING2_ATTN:
             {
                 n_tasks = n_threads;
             } break;
@@ -3081,6 +3086,11 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         GGML_ABORT("fatal error");
                     }
+                case GGML_OP_INKLING2_ATTN:
+                    {
+                        // per thread: the logits of one head
+                        cur = sizeof(float)*n_tasks*(node->src[6]->ne[0] + CACHE_LINE_SIZE_F32);
+                    } break;
                 case GGML_OP_INKLING2_PROJ:
                     {
                         // per thread: the normalized input and one weight row

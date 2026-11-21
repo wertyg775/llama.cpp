@@ -1112,7 +1112,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_INKLING2_MIX:
             case GGML_OP_INKLING2_REL_BIAS:
             case GGML_OP_INKLING2_SITU:
-            case GGML_OP_INKLING2_PROJ: {
+            case GGML_OP_INKLING2_PROJ:
+            case GGML_OP_INKLING2_ATTN: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_UNARY: {

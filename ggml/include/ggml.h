@@ -422,6 +422,7 @@ extern "C" {
         GGML_OP_INKLING2_REL_BIAS,
         GGML_OP_INKLING2_SITU,
         GGML_OP_INKLING2_PROJ,
+        GGML_OP_INKLING2_ATTN,
 
         GGML_OP_UNARY,
 
@@ -2613,6 +2614,30 @@ extern "C" {
             int                   n_w,
             struct ggml_tensor  * norm,
             float                 eps);
+
+    // inkling2 attention of one token: relative-position bias, per-query sink logit, zero sink, mask, and the output gate
+    //   q:       [d, n_head, 1] f32
+    //   k:       [d, n_head_kv, n_kv] f32, f16 or bf16 (a KV cache view)
+    //   v:       [d, n_head_kv, n_kv] or transposed [n_kv, n_head_kv, d], same type as k
+    //   table, r, sinks, rel_pos: as in ggml_inkling2_rel_bias, for 1 token
+    //   mask:    [n_kv, 1] f32 or f16
+    //   gate:    [d*n_head, 1] f32, the output is multiplied by sigmoid(gate)
+    //   logit[j] = scale*q.k[j] + table[:, rel_pos[j]].r - sinks + mask[j], softmax with an extra logit 0
+    //   result:  [d*n_head, 1] = sigmoid(gate)*sum_j softmax(logit)[j]*v[j]
+    //
+    GGML_API struct ggml_tensor * ggml_inkling2_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * sinks,
+            struct ggml_tensor  * rel_pos,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * gate,
+            bool                  v_trans,
+            float                 scale);
 
     // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
     //

@@ -1106,6 +1106,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "INKLING2_REL_BIAS",
     "INKLING2_SITU",
     "INKLING2_PROJ",
+    "INKLING2_ATTN",
 
     "UNARY",
 
@@ -1125,7 +1126,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1228,6 +1229,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "inkling2_rel_bias(table, r, sinks, rel_pos, mask)",
     "inkling2_situ(gate, up)",
     "inkling2_proj(x, ws, norm)",
+    "inkling2_attn(q, k, v, table, r, sinks, rel_pos, mask, gate)",
 
     "unary(x)",
 
@@ -1247,7 +1249,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6837,6 +6839,58 @@ struct ggml_tensor * ggml_inkling2_proj(
         result->src[1 + i] = ws[i];
     }
     result->src[1 + n_w] = norm;
+
+    return result;
+}
+
+// ggml_inkling2_attn
+
+struct ggml_tensor * ggml_inkling2_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * table,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * sinks,
+        struct ggml_tensor  * rel_pos,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * gate,
+        bool                  v_trans,
+        float                 scale) {
+    const int64_t d      = q->ne[0];
+    const int64_t n_head = q->ne[1];
+    const int64_t n_kv   = rel_pos->ne[0];
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && ggml_is_contiguous(q) && q->ne[2] == 1);
+    GGML_ASSERT(k->type == v->type && k->ne[0] == d && k->ne[2] == n_kv && n_head % k->ne[1] == 0 && k->nb[0] == ggml_type_size(k->type));
+    if (v_trans) {
+        GGML_ASSERT(v->ne[0] == n_kv && v->ne[1] == k->ne[1] && v->ne[2] == d && v->nb[0] == ggml_type_size(v->type));
+    } else {
+        GGML_ASSERT(v->ne[0] == d && v->ne[1] == k->ne[1] && v->ne[2] == n_kv && v->nb[0] == ggml_type_size(v->type));
+    }
+    GGML_ASSERT(r->type == GGML_TYPE_F32 && r->ne[0] == table->ne[0] && r->ne[1] == n_head && r->ne[2] == 1 && r->nb[0] == sizeof(float));
+    GGML_ASSERT(table->nb[0] == ggml_type_size(table->type));
+    GGML_ASSERT(sinks->type == GGML_TYPE_F32 && ggml_nelements(sinks) == n_head);
+    GGML_ASSERT(rel_pos->type == GGML_TYPE_I32 && ggml_nelements(rel_pos) == n_kv);
+    GGML_ASSERT((mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16) && mask->ne[0] == n_kv && ggml_nrows(mask) == 1);
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && ggml_nelements(gate) == d*n_head && ggml_is_contiguous(gate));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d*n_head, 1);
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, v_trans ? 1 : 0);
+
+    result->op     = GGML_OP_INKLING2_ATTN;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = table;
+    result->src[4] = r;
+    result->src[5] = sinks;
+    result->src[6] = rel_pos;
+    result->src[7] = mask;
+    result->src[8] = gate;
 
     return result;
 }

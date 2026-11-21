@@ -5256,6 +5256,101 @@ struct test_inkling2_proj : public test_case {
     }
 };
 
+// GGML_OP_INKLING2_ATTN
+struct test_inkling2_attn : public test_case {
+    const ggml_type type;      // of the KV cache
+    const int64_t   d;
+    const int64_t   n_head;
+    const int64_t   n_head_kv;
+    const int64_t   n_kv;
+    const bool      v_trans;
+    const ggml_type mask_type;
+    const int64_t   kv_size; // of the cache the views come from
+
+    std::string vars() override {
+        return VARS_TO_STR8(type, d, n_head, n_head_kv, n_kv, v_trans, mask_type, kv_size);
+    }
+
+    test_inkling2_attn(ggml_type type = GGML_TYPE_F16, int64_t d = 128, int64_t n_head = 24, int64_t n_head_kv = 4, int64_t n_kv = 256,
+            bool v_trans = true, ggml_type mask_type = GGML_TYPE_F32, int64_t kv_size = 0)
+        : type(type), d(d), n_head(n_head), n_head_kv(n_head_kv), n_kv(n_kv), v_trans(v_trans), mask_type(mask_type),
+          kv_size(kv_size ? kv_size : n_kv + 9) {}
+
+    static constexpr int64_t n_rel    = 16;
+    static constexpr int64_t n_extent = 100;
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_head, 1);
+        ggml_set_name(q, "q");
+
+        // views of the caches, as llama_kv_cache::get_k / get_v make them
+        ggml_tensor * kc = ggml_new_tensor_2d(ctx, type, d*n_head_kv, kv_size);
+        ggml_set_name(kc, "k_cache");
+        ggml_tensor * k = ggml_view_3d(ctx, kc, d, n_head_kv, n_kv, d*ggml_element_size(kc), kc->nb[1], 0);
+
+        ggml_tensor * v;
+        if (v_trans) {
+            ggml_tensor * vc = ggml_new_tensor_2d(ctx, type, kv_size, d*n_head_kv);
+            ggml_set_name(vc, "v_cache");
+            v = ggml_view_3d(ctx, vc, n_kv, n_head_kv, d, d*vc->nb[1], vc->nb[1], 0);
+        } else {
+            ggml_tensor * vc = ggml_new_tensor_2d(ctx, type, d*n_head_kv, kv_size);
+            ggml_set_name(vc, "v_cache");
+            v = ggml_view_3d(ctx, vc, d, n_head_kv, n_kv, d*ggml_element_size(vc), vc->nb[1], 0);
+        }
+
+        ggml_tensor * table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rel, n_extent);
+        ggml_set_name(table, "table");
+        ggml_tensor * r = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_rel, n_head, 1);
+        ggml_set_name(r, "r");
+        ggml_tensor * sinks = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, 1);
+        ggml_set_name(sinks, "sinks");
+        ggml_tensor * rel_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, 1);
+        ggml_set_name(rel_pos, "rel_pos");
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, mask_type, n_kv, 1, 1, 1);
+        ggml_set_name(mask, "mask");
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d*n_head, 1);
+        ggml_set_name(gate, "gate");
+
+        ggml_tensor * out = ggml_inkling2_attn(ctx, q, k, v, table, r, sinks, rel_pos, mask, gate, v_trans, 1.0f/sqrtf(d));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    // distances in [0, n_extent], every 5th cell masked out
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(7);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (t->type == GGML_TYPE_I32) {
+                std::uniform_int_distribution<int32_t> dist(0, n_extent);
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int32_t & x : data) {
+                    x = dist(rng);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (name == "mask") {
+                std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = i % 5 == 3 ? -INFINITY : dist(rng);
+                }
+                if (t->type == GGML_TYPE_F16) {
+                    std::vector<ggml_fp16_t> h(data.size());
+                    ggml_fp32_to_fp16_row(data.data(), h.data(), data.size());
+                    ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+                } else {
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+                }
+            } else if (name == "q") {
+                init_tensor_uniform(t, -3.0f, 3.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -11197,6 +11292,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true));
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32}) {
+        for (bool v_trans : {true, false}) {
+            test_cases.emplace_back(new test_inkling2_attn(type, 128, 24, 4, 256, v_trans));
+            test_cases.emplace_back(new test_inkling2_attn(type, 128, 24, 4, 1, v_trans));
+            test_cases.emplace_back(new test_inkling2_attn(type, 64, 6, 6, 1500, v_trans, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_inkling2_attn(type, 40, 4, 2, 77, v_trans));
+            test_cases.emplace_back(new test_inkling2_attn(type, 128, 24, 4, 300, v_trans, GGML_TYPE_F16, 512)); // aligned cache rows
+        }
+    }
     for (ggml_type type : {GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (bool norm : {true, false}) {
             test_cases.emplace_back(new test_inkling2_proj(type, 64, {32, 5}, 1, norm));
@@ -14271,6 +14375,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_dsv4_hc_post(7168, n_tokens));             // DeepSeek-V4-Pro
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n_tokens, true, true)); // Qwen4-Exp, with the post gate chain
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n_tokens, true));       // synthetic, Qwen4-Exp kernel without the gate chain
+    }
+
+    // INKLING2_ATTN: Inkling 2 Mini attention of one token
+    for (int64_t n_kv : {256, 1024, 4096}) {
+        test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16, 128, 24, 4, n_kv, true, GGML_TYPE_F16, 8192));
     }
 
     // INKLING2_PROJ: Inkling 2 Mini projections of a SWA layer input, decode

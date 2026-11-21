@@ -12224,6 +12224,104 @@ void ggml_compute_forward_inkling2_proj(
     }
 }
 
+// ggml_compute_forward_inkling2_attn
+
+static float inkling2_attn_get(const ggml_tensor * t, const char * p) {
+    switch (t->type) {
+        case GGML_TYPE_F16:  return GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) p);
+        case GGML_TYPE_BF16: return GGML_BF16_TO_FP32(*(const ggml_bf16_t *) p);
+        default:             return *(const float *) p;
+    }
+}
+
+static void ggml_compute_forward_inkling2_attn_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q       = dst->src[0];
+    const ggml_tensor * k       = dst->src[1];
+    const ggml_tensor * v       = dst->src[2];
+    const ggml_tensor * table   = dst->src[3];
+    const ggml_tensor * r       = dst->src[4];
+    const ggml_tensor * sinks   = dst->src[5];
+    const ggml_tensor * rel_pos = dst->src[6];
+    const ggml_tensor * mask    = dst->src[7];
+    const ggml_tensor * gate    = dst->src[8];
+
+    const float scale   = ggml_get_op_params_f32(dst, 0);
+    const bool  v_trans = ggml_get_op_params_i32(dst, 1) != 0;
+
+    const int64_t d        = q->ne[0];
+    const int64_t n_head   = q->ne[1];
+    const int64_t n_kv     = rel_pos->ne[0];
+    const int64_t n_rel    = table->ne[0];
+    const int64_t n_extent = table->ne[1];
+    const int64_t n_gqa    = n_head/k->ne[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    float * logit = (float *) params->wdata + ith*(n_kv + CACHE_LINE_SIZE_F32);
+
+    for (int64_t h = ith; h < n_head; h += nth) {
+        const int64_t hk = h/n_gqa;
+        const float * qh = (const float *) ((const char *) q->data + h*q->nb[1]);
+        const float * rh = (const float *) ((const char *) r->data + h*r->nb[1]);
+        const float   sh = ((const float *) sinks->data)[h];
+
+        float max = 0.0f; // the zero sink
+        for (int64_t j = 0; j < n_kv; ++j) {
+            float qk = 0.0f;
+            for (int64_t i = 0; i < d; ++i) {
+                qk += qh[i]*inkling2_attn_get(k, (const char *) k->data + i*k->nb[0] + hk*k->nb[1] + j*k->nb[2]);
+            }
+            const int32_t dist = ((const int32_t *) rel_pos->data)[j];
+            float b = 0.0f;
+            if (dist < n_extent) {
+                for (int64_t i = 0; i < n_rel; ++i) {
+                    b += inkling2_attn_get(table, (const char *) table->data + i*table->nb[0] + dist*table->nb[1])*rh[i];
+                }
+            }
+            b -= sh;
+            b += inkling2_attn_get(mask, (const char *) mask->data + j*mask->nb[0]);
+
+            logit[j] = qk*scale + b;
+            max = MAX(max, logit[j]);
+        }
+
+        ggml_float sum = expf(0.0f - max);
+        for (int64_t j = 0; j < n_kv; ++j) {
+            logit[j] = expf(logit[j] - max);
+            sum += logit[j];
+        }
+
+        for (int64_t i = 0; i < d; ++i) {
+            float acc = 0.0f;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                const char * vp = v_trans ? (const char *) v->data + j*v->nb[0] + hk*v->nb[1] + i*v->nb[2]
+                                          : (const char *) v->data + i*v->nb[0] + hk*v->nb[1] + j*v->nb[2];
+                acc += logit[j]*inkling2_attn_get(v, vp);
+            }
+            const float g = ((const float *) gate->data)[h*d + i];
+            ((float *) dst->data)[h*d + i] = (float) (acc/sum)*(1.0f/(1.0f + expf(-g)));
+        }
+    }
+}
+
+void ggml_compute_forward_inkling2_attn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_inkling2_attn_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_top_k_mask
 
 void ggml_compute_forward_top_k_mask(

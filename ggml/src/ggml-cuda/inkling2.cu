@@ -825,3 +825,189 @@ void ggml_cuda_op_inkling2_proj(ggml_backend_cuda_context & ctx, ggml_tensor * d
         default: GGML_ABORT("unsupported type %s", ggml_type_name(type));
     }
 }
+
+// the most kv cells of the fused attention: the logits stay in LDS
+static constexpr int INKLING2_ATTN_MAX_KV = 8192;
+
+// one block per query head: the logits (16 lanes per kv cell, a contiguous K row), the softmax with a zero sink,
+// then the V sum (one warp per output dim, the lanes walk the keys of a transposed V row)
+template <typename T, typename M, bool v_trans, bool vec, bool vec_v>
+static __global__ void inkling2_attn_f32(
+        const float * __restrict__ q, const T * __restrict__ k, const T * __restrict__ v, const float * __restrict__ table,
+        const float * __restrict__ r, const float * __restrict__ sinks, const int32_t * __restrict__ rel_pos, const M * __restrict__ mask,
+        const float * __restrict__ gate, float * __restrict__ dst, const int d, const int n_gqa, const int n_kv, const int n_rel, const int n_extent,
+        const int64_t s_q1, const int64_t s_k1, const int64_t s_k2, const int64_t s_v1, const int64_t s_v2, const int64_t s_t1, const int64_t s_r1,
+        const float scale) {
+    constexpr int vk    = vec   ? 16/sizeof(T) : 1;
+    constexpr int vv    = vec_v ? 16/sizeof(T) : 1;
+    constexpr int lanes = 16;
+
+    extern __shared__ float sm[];
+    float * lg = sm;
+    float * qs = lg + n_kv;
+    float * rs = qs + d;
+
+    const int h  = blockIdx.x;
+    const int hk = h/n_gqa;
+
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        qs[i] = q[h*s_q1 + i];
+    }
+    for (int i = threadIdx.x; i < n_rel; i += blockDim.x) {
+        rs[i] = r[h*s_r1 + i];
+    }
+    __syncthreads();
+
+    const float sh   = sinks[h];
+    const int   li   = threadIdx.x % lanes;
+    const int   ng   = blockDim.x / lanes;
+    const int   warp = threadIdx.x / WARP_SIZE;
+    const int   lane = threadIdx.x % WARP_SIZE;
+    const int   nw   = blockDim.x / WARP_SIZE;
+
+    // all lanes of a group take part in the shuffles, so the loop runs the same count in every group
+    float mx = 0.0f; // the zero sink
+    for (int j0 = 0; j0 < n_kv; j0 += ng) {
+        const int  j     = j0 + threadIdx.x / lanes;
+        const bool valid = j < n_kv;
+
+        float part = 0.0f;
+        int   dist = n_extent;
+        if (valid) {
+            const T * kj = k + hk*s_k1 + j*s_k2;
+            float qk = 0.0f;
+            for (int i = li*vk; i < d; i += lanes*vk) {
+                float kf[vk];
+                inkling2_load<vk>(kj + i, kf);
+#pragma unroll
+                for (int c = 0; c < vk; ++c) {
+                    qk += qs[i + c]*kf[c];
+                }
+            }
+            float b = 0.0f;
+            dist = rel_pos[j];
+            if (dist < n_extent) {
+                for (int i = li; i < n_rel; i += lanes) {
+                    b += table[dist*s_t1 + i]*rs[i];
+                }
+            }
+            part = qk*scale + b;
+        }
+        part = warp_reduce_sum<lanes>(part);
+        if (valid && li == 0) {
+            const float l = (part - sh) + ggml_cuda_cast<float>(mask[j]);
+            lg[j] = l;
+            mx = fmaxf(mx, l);
+        }
+    }
+
+    __shared__ float buf[32];
+    mx = block_reduce<block_reduce_method::MAX>(mx, buf);
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < n_kv; j += blockDim.x) {
+        const float e = expf(lg[j] - mx);
+        lg[j] = e;
+        sum  += e;
+    }
+    sum  = block_reduce<block_reduce_method::SUM>(sum, buf);
+    sum += expf(0.0f - mx);
+    __syncthreads();
+
+    for (int i = warp; i < d; i += nw) {
+        float acc = 0.0f;
+        if constexpr (v_trans) {
+            const T * vi = v + hk*s_v1 + i*s_v2;
+            int j = lane*vv;
+            for (; j + vv <= n_kv; j += WARP_SIZE*vv) {
+                float vf[vv];
+                inkling2_load<vv>(vi + j, vf);
+#pragma unroll
+                for (int c = 0; c < vv; ++c) {
+                    acc += lg[j + c]*vf[c];
+                }
+            }
+            // the last, partial chunk of this lane
+            for (const int jt = j; j < n_kv && j < jt + vv; ++j) {
+                acc += lg[j]*ggml_cuda_cast<float>(vi[j]);
+            }
+        } else {
+            for (int j = lane; j < n_kv; j += WARP_SIZE) {
+                acc += lg[j]*ggml_cuda_cast<float>(v[i + hk*s_v1 + j*s_v2]);
+            }
+        }
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) {
+            const float gt = gate[h*d + i];
+            dst[h*d + i] = (acc/sum)*(1.0f/(1.0f + expf(-gt)));
+        }
+    }
+}
+
+bool ggml_cuda_inkling2_attn_supported(const ggml_tensor * op) {
+    const ggml_type type = op->src[1]->type;
+    return (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16) && op->src[3]->type == GGML_TYPE_F32 &&
+        op->src[6]->ne[0] <= INKLING2_ATTN_MAX_KV && op->src[0]->ne[0] <= 512;
+}
+
+void ggml_cuda_op_inkling2_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * q       = dst->src[0];
+    const ggml_tensor * k       = dst->src[1];
+    const ggml_tensor * v       = dst->src[2];
+    const ggml_tensor * table   = dst->src[3];
+    const ggml_tensor * r       = dst->src[4];
+    const ggml_tensor * sinks   = dst->src[5];
+    const ggml_tensor * rel_pos = dst->src[6];
+    const ggml_tensor * mask    = dst->src[7];
+    const ggml_tensor * gate    = dst->src[8];
+
+    float scale;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    const bool v_trans = ggml_get_op_params_i32(dst, 1) != 0;
+
+    const int d      = q->ne[0];
+    const int n_head = q->ne[1];
+    const int n_kv   = rel_pos->ne[0];
+    const int n_rel  = table->ne[0];
+    const int n_gqa  = n_head/k->ne[1];
+
+    const int    n_threads = 512;
+    const size_t ts        = ggml_type_size(k->type);
+    const size_t smem      = (n_kv + d + n_rel)*sizeof(float);
+
+    // 16-byte loads need aligned K rows, and aligned V rows when V is transposed
+    const bool vec   = d % (16/ts) == 0 && inkling2_aligned(k->data, k->nb[2]) && k->nb[1] % 16 == 0;
+    const bool vec_v = v_trans && inkling2_aligned(v->data, v->nb[2]) && v->nb[1] % 16 == 0;
+
+    auto launch = [&](auto kernel, const auto * k_d, const auto * v_d, const auto * mask_d) {
+        kernel<<<n_head, n_threads, smem, ctx.stream()>>>((const float *) q->data, k_d, v_d, (const float *) table->data, (const float *) r->data,
+                (const float *) sinks->data, (const int32_t *) rel_pos->data, mask_d, (const float *) gate->data, (float *) dst->data,
+                d, n_gqa, n_kv, n_rel, (int) table->ne[1], q->nb[1]/sizeof(float), k->nb[1]/ts, k->nb[2]/ts, v->nb[1]/ts, v->nb[2]/ts,
+                table->nb[1]/sizeof(float), r->nb[1]/sizeof(float), scale);
+    };
+    auto launch_t = [&](auto tag) {
+        using T = decltype(tag);
+        const T * k_d = (const T *) k->data;
+        const T * v_d = (const T *) v->data;
+        auto launch_m = [&](auto mask_tag) {
+            using M = decltype(mask_tag);
+            const M * mask_d = (const M *) mask->data;
+            if (!v_trans) {
+                vec ? launch(inkling2_attn_f32<T, M, false, true, false>, k_d, v_d, mask_d) : launch(inkling2_attn_f32<T, M, false, false, false>, k_d, v_d, mask_d);
+            } else if (vec_v) {
+                vec ? launch(inkling2_attn_f32<T, M, true,  true, true>,  k_d, v_d, mask_d) : launch(inkling2_attn_f32<T, M, true,  false, true>,  k_d, v_d, mask_d);
+            } else {
+                vec ? launch(inkling2_attn_f32<T, M, true,  true, false>, k_d, v_d, mask_d) : launch(inkling2_attn_f32<T, M, true,  false, false>, k_d, v_d, mask_d);
+            }
+        };
+        mask->type == GGML_TYPE_F16 ? launch_m(half()) : launch_m(float());
+    };
+
+    switch (k->type) {
+        case GGML_TYPE_F32:  launch_t(float());       break;
+        case GGML_TYPE_F16:  launch_t(half());        break;
+        case GGML_TYPE_BF16: launch_t(nv_bfloat16()); break;
+        default: GGML_ABORT("unsupported type %s", ggml_type_name(k->type));
+    }
+}

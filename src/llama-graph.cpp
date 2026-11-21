@@ -4530,6 +4530,65 @@ ggml_tensor * llm_graph_context::build_attn(
     return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
 }
 
+ggml_tensor * llm_graph_context::build_attn_inkling2_fused(
+        llm_graph_input_mem_hybrid_iswa_rel * inp,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * table,
+        ggml_tensor * r,
+        ggml_tensor * sinks,
+        ggml_tensor * gate,
+            float     kq_scale,
+            int       il) const {
+    // the logits of the fused op stay in LDS
+    constexpr int64_t n_kv_max = 2048;
+
+    if (!cparams.fused_inkling2 || n_tokens != 1 || cparams.training) {
+        return nullptr;
+    }
+
+    const bool is_swa = hparams.is_swa(il);
+
+    auto * inp_attn = inp->get_attn();
+
+    const auto & attn_mask = is_swa ? inp_attn->self_attn_mask_swa : inp_attn->self_attn_mask;
+    ggml_tensor * rel_pos  = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+
+    const auto * mctx_cur = is_swa ? inp_attn->mctx->get_swa() : inp_attn->mctx->get_base();
+
+    if ((is_swa ? inp_attn->self_k_rot_swa[il] : inp_attn->self_k_rot[il]) || (is_swa ? inp_attn->self_v_rot_swa[il] : inp_attn->self_v_rot[il]) ||
+        mctx_cur->get_k_scale(il) || mctx_cur->get_v_scale(il) || attn_mask.rows || attn_mask.raw->ne[3] != 1 || rel_pos->ne[0] > n_kv_max) {
+        return nullptr;
+    }
+
+    // the views are only nodes when used, so they can be checked first
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    for (ggml_tensor * t : {k, v}) {
+        if ((t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16 && t->type != GGML_TYPE_F32) || t->ne[3] != 1) {
+            return nullptr;
+        }
+    }
+
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, k_cur);
+    ggml_build_forward_expand(gf, v_cur);
+
+    const auto & k_idxs = is_swa ? inp_attn->get_k_idxs_swa() : inp_attn->get_k_idxs();
+    const auto & v_idxs = is_swa ? inp_attn->get_v_idxs_swa() : inp_attn->get_v_idxs();
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+
+    // a transposed V view has v->nb[1] > v->nb[2], see llama_kv_cache::get_v
+    const bool v_trans = v->nb[1] > v->nb[2];
+
+    ggml_tensor * cur = ggml_inkling2_attn(ctx0, q_cur, k, v, table, r, sinks, rel_pos, attn_mask.raw, gate, v_trans, kq_scale);
+    cb(cur, "kqv_out", il);
+
+    return cur;
+}
+
 void llm_graph_context::build_dense_out(
     ggml_tensor * dense_2,
     ggml_tensor * dense_2_b,

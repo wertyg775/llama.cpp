@@ -1557,6 +1557,20 @@ struct llm_graph_context {
                     int   il,
                    bool   kq_b_masked = false) const; // kq_b already holds the attention mask
 
+    // inkling2: the attention of one token as one fused op, with the relative-position bias, the sink logits
+    // and the output gate; null when the fused op does not apply (then nothing is built)
+    ggml_tensor * build_attn_inkling2_fused(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * q_cur,  // [n_embd_head, n_head, 1]
+            ggml_tensor * k_cur,  // [n_embd_head, n_head_kv, 1]
+            ggml_tensor * v_cur,  // [n_embd_head, n_head_kv, 1]
+            ggml_tensor * table,  // [n_rel, n_extent]
+            ggml_tensor * r,      // [n_rel, n_head, 1]
+            ggml_tensor * sinks,  // [n_head, 1]
+            ggml_tensor * gate,   // [n_embd_head*n_head, 1]
+                  float   kq_scale,
+                    int   il) const;
+
     //
     // pooling
     //
