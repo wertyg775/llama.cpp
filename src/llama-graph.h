@@ -1554,7 +1554,8 @@ struct llm_graph_context {
             ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
             ggml_tensor * sinks, // [n_head_q]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+                   bool   kq_b_masked = false) const; // kq_b already holds the attention mask
 
     //
     // pooling

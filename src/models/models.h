@@ -2519,7 +2519,8 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * history,
                 llm_graph_input_rs * inp,
                 int64_t offset,
-                int il);
+                int il,
+                ggml_tensor * residual = nullptr);
         bool          fused_control(const loop_layer & loop) const;
         ggml_tensor * control(ggml_tensor * cur, ggml_tensor * cur_norm, ggml_tensor * message, ggml_tensor * message_norm,
                 const loop_layer & loop, int ctrl, int il);

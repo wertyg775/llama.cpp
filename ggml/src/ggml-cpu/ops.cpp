@@ -11842,7 +11842,8 @@ static void ggml_compute_forward_inkling2_conv_f32(
     const ggml_tensor * cur     = dst->src[0];
     const ggml_tensor * past    = dst->src[1];
     const ggml_tensor * weight  = dst->src[2];
-    const ggml_tensor * dynamic = dst->src[3];
+    const ggml_tensor * dynamic  = dst->src[3];
+    const ggml_tensor * residual = dst->src[4];
 
     const float scale = ggml_get_op_params_f32(dst, 0);
 
@@ -11887,7 +11888,8 @@ static void ggml_compute_forward_inkling2_conv_f32(
                 }
             }
 
-            y[t*C + c] = (sum + x(c, q, i + K - 1))*scale;
+            const float out = (sum + x(c, q, i + K - 1))*scale;
+            y[t*C + c] = residual ? *(const float *) ((const char *) residual->data + c*sizeof(float) + t*residual->nb[1]) + out : out;
         }
 
         for (int64_t k = 0; k < K - 1; ++k) {
@@ -12018,6 +12020,7 @@ static void ggml_compute_forward_inkling2_rel_bias_f32(
     const ggml_tensor * r       = dst->src[1];
     const ggml_tensor * sinks   = dst->src[2];
     const ggml_tensor * rel_pos = dst->src[3];
+    const ggml_tensor * mask    = dst->src[4];
 
     const int64_t n_rel    = table->ne[0];
     const int64_t n_extent = table->ne[1];
@@ -12047,12 +12050,21 @@ static void ggml_compute_forward_inkling2_rel_bias_f32(
             }
         }
 
+        float m = 0.0f;
+        if (mask) {
+            const char * mp = (const char *) mask->data + kv*mask->nb[0] + (t % n_ps)*mask->nb[1] + (t / n_ps)*mask->nb[3];
+            m = mask->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) mp) : *(const float *) mp;
+        }
+
         for (int64_t h = 0; h < n_head; ++h) {
             float v = 0.0f;
             if (d < n_extent) {
                 ggml_vec_dot_f32(n_rel, &v, 0, row, 0, (const float *) ((const char *) r->data + h*r->nb[1] + t*r->nb[2]), 0, 1);
             }
             v -= *(const float *) ((const char *) sinks->data + h*sizeof(float) + t*sinks->nb[1]);
+            if (mask) {
+                v += m;
+            }
 
             *(float *) ((char *) dst->data + kv*sizeof(float) + (t % n_ps)*dst->nb[1] + h*dst->nb[2] + (t / n_ps)*dst->nb[3]) = v;
         }

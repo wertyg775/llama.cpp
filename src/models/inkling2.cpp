@@ -224,7 +224,8 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         ggml_tensor * history,
         llm_graph_input_rs * inp,
         int64_t offset,
-        int il) {
+        int il,
+        ggml_tensor * residual) {
     const int64_t n_conv       = hparams.n_shortconv_l_cache;
     const int64_t n_channels   = cur->ne[0];
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
@@ -235,7 +236,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
     // the fused op also returns the last n_conv - 1 inputs, the new state
     if (cparams.fused_inkling2 && cparams.n_rs_seq == 0 && weight->type == GGML_TYPE_F32) {
-        ggml_tensor * res_conv = ggml_inkling2_conv(ctx0, cur, past, weight, dynamic, scale);
+        ggml_tensor * res_conv = ggml_inkling2_conv(ctx0, cur, past, weight, dynamic, residual, scale);
         res->add_fused_node({LLM_FUSED_OP_INKLING2, res_conv, il});
 
         ggml_tensor * x_new = ggml_view_3d(ctx0, res_conv, n_conv - 1, n_channels, n_seqs,
@@ -277,7 +278,9 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         }
     }
 
-    return ggml_scale(ctx0, ggml_add(ctx0, out, cur), scale);
+    out = ggml_scale(ctx0, ggml_add(ctx0, out, cur), scale);
+
+    return residual ? ggml_add(ctx0, residual, out) : out;
 }
 
 // the fused controller op reads the plain weights and normalizes its inputs itself
@@ -440,7 +443,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
         ggml_tensor * kq_b;
         if (cparams.fused_inkling2) {
-            kq_b = ggml_inkling2_rel_bias(ctx0, layer.attn_rel_bias, Rcur, sinks, rel_pos, n_stream);
+            const auto & attn_mask = is_swa ? attn->self_attn_mask_swa : attn->self_attn_mask;
+            GGML_ASSERT(attn_mask.rows == nullptr);
+
+            kq_b = ggml_inkling2_rel_bias(ctx0, layer.attn_rel_bias, Rcur, sinks, rel_pos, attn_mask.raw, n_stream);
             res->add_fused_node({LLM_FUSED_OP_INKLING2, kq_b, ip});
         } else {
             // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
@@ -461,19 +467,19 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, kq_b, sinks_zero, 1.0f/sqrtf(n_embd_head), il);
+                Qcur, Kcur, Vcur, kq_b, sinks_zero, 1.0f/sqrtf(n_embd_head), il, cparams.fused_inkling2);
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
-        cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa, ip);
+        // the first layer of each block starts a new residual stream, the earlier one joins the mixed blocks
+        const bool new_block = ip % hparams.attn_res_block_size == 0;
+
+        cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa, ip, new_block ? nullptr : inpSA);
         cb(cur, "attn_out", il);
     }
 
-    // the first layer of each block starts a new residual stream, the earlier one joins the mixed blocks
     if (ip % hparams.attn_res_block_size == 0) {
         inp_norm = ggml_reshape_3d(ctx0, inp_norm ? inp_norm : ggml_rms_norm(ctx0, inpSA, 1e-6f), n_embd, 1, n_tokens);
         blocks   = blocks ? ggml_concat(ctx0, inp_norm, blocks, 1) : inp_norm;
-    } else {
-        cur = ggml_add(ctx0, inpSA, cur);
     }
 
     ggml_tensor * ffn_inp = cur;
@@ -505,10 +511,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             layer.ffn_gate_exps_s,
             layer.ffn_down_exps_s);
 
-    cur = convolve(cur, layer.ffn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa + n_embd, ip);
-    cb(cur, "ffn_out", il);
-
-    cur = ggml_add(ctx0, ffn_inp, cur);
+    cur = convolve(cur, layer.ffn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa + n_embd, ip, ffn_inp);
     cb(cur, "l_out", il);
 
     return cur;

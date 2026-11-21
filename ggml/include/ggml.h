@@ -2541,7 +2541,8 @@ extern "C" {
     //   dynamic: [K*H, T] f32 or NULL, per-head input-dependent taps, channel c is in head c/(C/H)
     //   x = concat(past, cur) per sequence and channel
     //   y[c, t] = sum_k x[t + k]*weight[k, c] + sum_lag dynamic[lag, h, t]*x[t + K - 1 - lag]
-    //   result:  1D, [C, T] of (y + cur)*scale, then the new state [K - 1, C, n_seqs] = the last K - 1 x
+    //   residual: [C, T] f32 or NULL, added after the scale
+    //   result:  1D, [C, T] of residual + (y + cur)*scale, then the new state [K - 1, C, n_seqs] = the last K - 1 x
     //
     GGML_API struct ggml_tensor * ggml_inkling2_conv(
             struct ggml_context * ctx,
@@ -2549,6 +2550,7 @@ extern "C" {
             struct ggml_tensor  * past,
             struct ggml_tensor  * weight,
             struct ggml_tensor  * dynamic,
+            struct ggml_tensor  * residual,
             float                 scale);
 
     // inkling2 depth mix: attention over the states [blocks, rms_norm(x, eps)] with learned queries
@@ -2570,8 +2572,9 @@ extern "C" {
     //   r:       [n_rel, n_head, T] f32
     //   sinks:   [n_head, T] f32
     //   rel_pos: [n_kv, T] i32, distances in [0, n_extent], n_extent has no bias
+    //   mask:    [n_kv, T/n_stream, 1, n_stream] f32 or f16 or NULL, added last
     //   result:  [n_kv, T/n_stream, n_head, n_stream] f32, the kq_b of ggml_soft_max_ext / flash attention
-    //   result[kv, i, h, s] = table[:, d].r[:, h, t] - sinks[h, t], t = s*T/n_stream + i, d = rel_pos[kv, t]
+    //   result[kv, i, h, s] = table[:, d].r[:, h, t] - sinks[h, t] + mask[kv, i, 0, s], t = s*T/n_stream + i, d = rel_pos[kv, t]
     //
     GGML_API struct ggml_tensor * ggml_inkling2_rel_bias(
             struct ggml_context * ctx,
@@ -2579,6 +2582,7 @@ extern "C" {
             struct ggml_tensor  * r,
             struct ggml_tensor  * sinks,
             struct ggml_tensor  * rel_pos,
+            struct ggml_tensor  * mask,
             int64_t               n_stream);
 
     // inkling2 SiTU activation of the expert FFN

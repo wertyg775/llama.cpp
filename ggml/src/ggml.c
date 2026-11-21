@@ -1222,9 +1222,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "top_k_mask(mask, top_k, score, blocks, extra)",
     "inkling2_ctrl(cur, msg, down, gain, forget)",
     "inkling2_clip(x, scale, tau)",
-    "inkling2_conv(cur, past, weight, dynamic)",
+    "inkling2_conv(cur, past, weight, dynamic, residual)",
     "inkling2_mix(x, query, blocks)",
-    "inkling2_rel_bias(table, r, sinks, rel_pos)",
+    "inkling2_rel_bias(table, r, sinks, rel_pos, mask)",
     "inkling2_situ(gate, up)",
 
     "unary(x)",
@@ -6664,6 +6664,7 @@ struct ggml_tensor * ggml_inkling2_conv(
         struct ggml_tensor  * past,
         struct ggml_tensor  * weight,
         struct ggml_tensor  * dynamic,
+        struct ggml_tensor  * residual,
         float                 scale) {
     GGML_ASSERT(cur->type == GGML_TYPE_F32 && past->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32);
     GGML_ASSERT(cur->nb[0] == sizeof(float) && past->nb[0] == sizeof(float) && ggml_is_contiguous(weight));
@@ -6682,6 +6683,10 @@ struct ggml_tensor * ggml_inkling2_conv(
         GGML_ASSERT(dynamic->ne[0] % K == 0 && C % (dynamic->ne[0]/K) == 0 && dynamic->ne[1] == T && ggml_nrows(dynamic) == T);
     }
 
+    if (residual) {
+        GGML_ASSERT(residual->type == GGML_TYPE_F32 && ggml_are_same_shape(residual, cur) && residual->nb[0] == sizeof(float));
+    }
+
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C*T + (K - 1)*C*n_seqs);
 
     ggml_set_op_params_f32(result, 0, scale);
@@ -6691,6 +6696,7 @@ struct ggml_tensor * ggml_inkling2_conv(
     result->src[1] = past;
     result->src[2] = weight;
     result->src[3] = dynamic;
+    result->src[4] = residual;
 
     return result;
 }
@@ -6733,6 +6739,7 @@ struct ggml_tensor * ggml_inkling2_rel_bias(
         struct ggml_tensor  * r,
         struct ggml_tensor  * sinks,
         struct ggml_tensor  * rel_pos,
+        struct ggml_tensor  * mask,
         int64_t               n_stream) {
     const int64_t n_rel  = table->ne[0];
     const int64_t n_head = r->ne[1];
@@ -6745,6 +6752,11 @@ struct ggml_tensor * ggml_inkling2_rel_bias(
     GGML_ASSERT(rel_pos->type == GGML_TYPE_I32 && rel_pos->ne[1] == T && ggml_nrows(rel_pos) == T && rel_pos->nb[0] == sizeof(int32_t));
     GGML_ASSERT(n_stream > 0 && T % n_stream == 0);
 
+    if (mask) {
+        GGML_ASSERT((mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16) && mask->nb[0] == ggml_type_size(mask->type));
+        GGML_ASSERT(mask->ne[0] == n_kv && mask->ne[1] == T/n_stream && mask->ne[2] == 1 && mask->ne[3] == n_stream);
+    }
+
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, T/n_stream, n_head, n_stream);
 
     result->op     = GGML_OP_INKLING2_REL_BIAS;
@@ -6752,6 +6764,7 @@ struct ggml_tensor * ggml_inkling2_rel_bias(
     result->src[1] = r;
     result->src[2] = sinks;
     result->src[3] = rel_pos;
+    result->src[4] = mask;
 
     return result;
 }

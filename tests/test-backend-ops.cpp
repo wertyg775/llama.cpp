@@ -4976,13 +4976,14 @@ struct test_inkling2_conv : public test_case {
     const int64_t n_seqs;
     const int64_t n_seq_tokens;
     const int64_t n_heads; // 0: no dynamic taps
+    const bool    residual;
 
     std::string vars() override {
-        return VARS_TO_STR5(C, K, n_seqs, n_seq_tokens, n_heads);
+        return VARS_TO_STR6(C, K, n_seqs, n_seq_tokens, n_heads, residual);
     }
 
-    test_inkling2_conv(int64_t C = 64, int64_t K = 4, int64_t n_seqs = 1, int64_t n_seq_tokens = 1, int64_t n_heads = 0)
-        : C(C), K(K), n_seqs(n_seqs), n_seq_tokens(n_seq_tokens), n_heads(n_heads) {}
+    test_inkling2_conv(int64_t C = 64, int64_t K = 4, int64_t n_seqs = 1, int64_t n_seq_tokens = 1, int64_t n_heads = 0, bool residual = false)
+        : C(C), K(K), n_seqs(n_seqs), n_seq_tokens(n_seq_tokens), n_heads(n_heads), residual(residual) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t T = n_seqs*n_seq_tokens;
@@ -5004,7 +5005,13 @@ struct test_inkling2_conv : public test_case {
             ggml_set_name(dynamic, "dynamic");
         }
 
-        ggml_tensor * out = ggml_inkling2_conv(ctx, cur, past, weight, dynamic, 1.0f/sqrtf(2*K + 1));
+        ggml_tensor * res = nullptr;
+        if (residual) {
+            res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T);
+            ggml_set_name(res, "residual");
+        }
+
+        ggml_tensor * out = ggml_inkling2_conv(ctx, cur, past, weight, dynamic, res, 1.0f/sqrtf(2*K + 1));
         ggml_set_name(out, "out");
         return out;
     }
@@ -5069,14 +5076,15 @@ struct test_inkling2_rel_bias : public test_case {
     const int64_t   n_kv;
     const int64_t   n_tokens;
     const int64_t   n_stream;
+    const int       mask; // 0: none, 1: f32, 2: f16
 
     std::string vars() override {
-        return VARS_TO_STR7(type, n_rel, n_extent, n_head, n_kv, n_tokens, n_stream);
+        return VARS_TO_STR8(type, n_rel, n_extent, n_head, n_kv, n_tokens, n_stream, mask);
     }
 
     test_inkling2_rel_bias(ggml_type type = GGML_TYPE_F32, int64_t n_rel = 16, int64_t n_extent = 100, int64_t n_head = 4,
-            int64_t n_kv = 256, int64_t n_tokens = 1, int64_t n_stream = 1)
-        : type(type), n_rel(n_rel), n_extent(n_extent), n_head(n_head), n_kv(n_kv), n_tokens(n_tokens), n_stream(n_stream) {}
+            int64_t n_kv = 256, int64_t n_tokens = 1, int64_t n_stream = 1, int mask = 0)
+        : type(type), n_rel(n_rel), n_extent(n_extent), n_head(n_head), n_kv(n_kv), n_tokens(n_tokens), n_stream(n_stream), mask(mask) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * table = ggml_new_tensor_2d(ctx, type, n_rel, n_extent);
@@ -5091,7 +5099,13 @@ struct test_inkling2_rel_bias : public test_case {
         ggml_tensor * rel_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_tokens);
         ggml_set_name(rel_pos, "rel_pos");
 
-        ggml_tensor * out = ggml_inkling2_rel_bias(ctx, table, r, sinks, rel_pos, n_stream);
+        ggml_tensor * m = nullptr;
+        if (mask) {
+            m = ggml_new_tensor_4d(ctx, mask == 2 ? GGML_TYPE_F16 : GGML_TYPE_F32, n_kv, n_tokens/n_stream, 1, n_stream);
+            ggml_set_name(m, "mask");
+        }
+
+        ggml_tensor * out = ggml_inkling2_rel_bias(ctx, table, r, sinks, rel_pos, m, n_stream);
         ggml_set_name(out, "out");
         return out;
     }
@@ -11109,6 +11123,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_inkling2_rel_bias(type, 16, 100, 4, 300, 6, 2));
         test_cases.emplace_back(new test_inkling2_rel_bias(type, 5, 7, 3, 13, 4, 4));
     }
+    for (int mask : {1, 2}) {
+        test_cases.emplace_back(new test_inkling2_rel_bias(GGML_TYPE_F32, 16, 1024, 24, 1000, 3, 1, mask));
+        test_cases.emplace_back(new test_inkling2_rel_bias(GGML_TYPE_BF16, 16, 100, 4, 300, 6, 2, mask));
+    }
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int64_t n_blocks : {0, 1, 5, 15}) {
             test_cases.emplace_back(new test_inkling2_mix(type, 64, n_blocks, 1, 1));
@@ -11125,6 +11143,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_inkling2_conv(2304, 4, 1, 1, n_heads ? 8 : 0)); // Inkling 2 Mini decode
         test_cases.emplace_back(new test_inkling2_conv(300, 3, 2, 3, n_heads ? 3 : 0));  // channel count not a multiple of the block
     }
+    test_cases.emplace_back(new test_inkling2_conv(2304, 4, 1, 1, 0, true));
+    test_cases.emplace_back(new test_inkling2_conv(64, 4, 2, 70, 4, true));
     for (int scale : {0, 1, 2}) {
         for (int tau : {0, 1, 2}) {
             test_cases.emplace_back(new test_inkling2_clip({128, 4, 3}, scale, tau));

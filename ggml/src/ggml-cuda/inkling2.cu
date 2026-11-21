@@ -260,11 +260,12 @@ void ggml_cuda_op_inkling2_clip(ggml_backend_cuda_context & ctx, ggml_tensor * d
 static constexpr int INKLING2_CONV_CHUNK = 64;
 
 // one thread per channel c of sequence blockIdx.y, tokens of chunk blockIdx.z; the last chunk also writes the new state
-template <bool has_dynamic>
+template <bool has_dynamic, bool has_residual>
 static __global__ void inkling2_conv_f32(
         const float * __restrict__ cur, const float * __restrict__ past, const float * __restrict__ weight, const float * __restrict__ dynamic,
-        float * __restrict__ y, float * __restrict__ state, const int C, const int K, const int n_st, const int n_cph,
-        const int64_t s_cur1, const int64_t s_past0, const int64_t s_past1, const int64_t s_past2, const int64_t s_dyn1, const float scale) {
+        const float * __restrict__ residual, float * __restrict__ y, float * __restrict__ state, const int C, const int K, const int n_st, const int n_cph,
+        const int64_t s_cur1, const int64_t s_past0, const int64_t s_past1, const int64_t s_past2, const int64_t s_dyn1, const int64_t s_res1,
+        const float scale) {
     const int c = blockIdx.x*blockDim.x + threadIdx.x;
     if (c >= C) {
         return;
@@ -296,7 +297,9 @@ static __global__ void inkling2_conv_f32(
             }
         }
 
-        y[t*C + c] = (sum + x(i + K - 1))*scale;
+        // no fused multiply-add: the product rounds first, as in the scale and add ops
+        const float out = __fmul_rn(sum + x(i + K - 1), scale);
+        y[t*C + c] = has_residual ? residual[t*s_res1 + c] + out : out;
     }
 
     if (i1 == n_st) {
@@ -310,7 +313,8 @@ void ggml_cuda_op_inkling2_conv(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const ggml_tensor * cur     = dst->src[0];
     const ggml_tensor * past    = dst->src[1];
     const ggml_tensor * weight  = dst->src[2];
-    const ggml_tensor * dynamic = dst->src[3];
+    const ggml_tensor * dynamic  = dst->src[3];
+    const ggml_tensor * residual = dst->src[4];
 
     float scale;
     memcpy(&scale, dst->op_params, sizeof(float));
@@ -327,11 +331,12 @@ void ggml_cuda_op_inkling2_conv(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int  n_threads = 256;
     const dim3 blocks((C + n_threads - 1)/n_threads, n_seqs, (n_st + INKLING2_CONV_CHUNK - 1)/INKLING2_CONV_CHUNK);
 
-    auto kernel = dynamic ? inkling2_conv_f32<true> : inkling2_conv_f32<false>;
+    auto kernel = dynamic ? (residual ? inkling2_conv_f32<true,  true> : inkling2_conv_f32<true,  false>)
+                          : (residual ? inkling2_conv_f32<false, true> : inkling2_conv_f32<false, false>);
     kernel<<<blocks, n_threads, 0, ctx.stream()>>>((const float *) cur->data, (const float *) past->data, (const float *) weight->data,
-            dynamic ? (const float *) dynamic->data : nullptr, y, y + (int64_t) C*T, C, K, n_st, n_cph,
+            dynamic ? (const float *) dynamic->data : nullptr, residual ? (const float *) residual->data : nullptr, y, y + (int64_t) C*T, C, K, n_st, n_cph,
             cur->nb[1]/sizeof(float), past->nb[0]/sizeof(float), past->nb[1]/sizeof(float), past->nb[2]/sizeof(float),
-            dynamic ? dynamic->nb[1]/sizeof(float) : 0, scale);
+            dynamic ? dynamic->nb[1]/sizeof(float) : 0, residual ? residual->nb[1]/sizeof(float) : 0, scale);
 }
 
 // the most blocks a mix kernel keeps in registers
@@ -494,12 +499,12 @@ void ggml_cuda_op_inkling2_mix(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 }
 
 // one thread per kv cell, one block row per (head, token)
-template <typename T>
+template <typename T, typename M>
 static __global__ void inkling2_rel_bias_f32(
         const T * __restrict__ table, const float * __restrict__ r, const float * __restrict__ sinks, const int32_t * __restrict__ rel_pos,
-        float * __restrict__ dst, const int n_rel, const int n_extent, const int n_kv, const int n_ps,
+        const M * __restrict__ mask, float * __restrict__ dst, const int n_rel, const int n_extent, const int n_kv, const int n_ps,
         const int64_t s_table1, const int64_t s_r1, const int64_t s_r2, const int64_t s_sinks1, const int64_t s_pos1,
-        const int64_t s_dst1, const int64_t s_dst2, const int64_t s_dst3) {
+        const int64_t s_mask1, const int64_t s_mask3, const int64_t s_dst1, const int64_t s_dst2, const int64_t s_dst3) {
     extern __shared__ float r_s[];
 
     const int h = blockIdx.y;
@@ -525,6 +530,9 @@ static __global__ void inkling2_rel_bias_f32(
         }
     }
     v -= sinks[t*s_sinks1 + h];
+    if constexpr (!std::is_same_v<M, void>) {
+        v += ggml_cuda_cast<float>(mask[(t % n_ps)*s_mask1 + (t / n_ps)*s_mask3 + kv]);
+    }
 
     dst[(t % n_ps)*s_dst1 + h*s_dst2 + (t / n_ps)*s_dst3 + kv] = v;
 }
@@ -539,6 +547,7 @@ void ggml_cuda_op_inkling2_rel_bias(ggml_backend_cuda_context & ctx, ggml_tensor
     const ggml_tensor * r       = dst->src[1];
     const ggml_tensor * sinks   = dst->src[2];
     const ggml_tensor * rel_pos = dst->src[3];
+    const ggml_tensor * mask    = dst->src[4];
 
     const int n_rel    = table->ne[0];
     const int n_extent = table->ne[1];
@@ -553,17 +562,30 @@ void ggml_cuda_op_inkling2_rel_bias(ggml_backend_cuda_context & ctx, ggml_tensor
 
     const int64_t s_table1 = table->nb[1]/ggml_type_size(table->type);
 
-    auto launch = [&](auto kernel, const auto * table_d) {
+    const int64_t s_mask1 = mask ? mask->nb[1]/ggml_type_size(mask->type) : 0;
+    const int64_t s_mask3 = mask ? mask->nb[3]/ggml_type_size(mask->type) : 0;
+
+    auto launch = [&](auto kernel, const auto * table_d, const auto * mask_d) {
         kernel<<<grid, n_threads, smem, ctx.stream()>>>(table_d, (const float *) r->data, (const float *) sinks->data,
-                (const int32_t *) rel_pos->data, (float *) dst->data, n_rel, n_extent, n_kv, n_ps, s_table1,
+                (const int32_t *) rel_pos->data, mask_d, (float *) dst->data, n_rel, n_extent, n_kv, n_ps, s_table1,
                 r->nb[1]/sizeof(float), r->nb[2]/sizeof(float), sinks->nb[1]/sizeof(float), rel_pos->nb[1]/sizeof(int32_t),
-                dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), dst->nb[3]/sizeof(float));
+                s_mask1, s_mask3, dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), dst->nb[3]/sizeof(float));
+    };
+    auto launch_mask = [&](auto t_tag, const auto * table_d) {
+        using T = decltype(t_tag);
+        if (!mask) {
+            launch(inkling2_rel_bias_f32<T, void>, table_d, (const void *) nullptr);
+        } else if (mask->type == GGML_TYPE_F16) {
+            launch(inkling2_rel_bias_f32<T, half>, table_d, (const half *) mask->data);
+        } else {
+            launch(inkling2_rel_bias_f32<T, float>, table_d, (const float *) mask->data);
+        }
     };
 
     switch (table->type) {
-        case GGML_TYPE_F32:  launch(inkling2_rel_bias_f32<float>,       (const float *)       table->data); break;
-        case GGML_TYPE_F16:  launch(inkling2_rel_bias_f32<half>,        (const half *)        table->data); break;
-        case GGML_TYPE_BF16: launch(inkling2_rel_bias_f32<nv_bfloat16>, (const nv_bfloat16 *) table->data); break;
+        case GGML_TYPE_F32:  launch_mask(float(),       (const float *)       table->data); break;
+        case GGML_TYPE_F16:  launch_mask(half(),        (const half *)        table->data); break;
+        case GGML_TYPE_BF16: launch_mask(nv_bfloat16(), (const nv_bfloat16 *) table->data); break;
         default: GGML_ABORT("unsupported type %s", ggml_type_name(table->type));
     }
 }

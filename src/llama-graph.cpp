@@ -4501,7 +4501,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * kq_b,
         ggml_tensor * sinks,
             float     kq_scale,
-            int       il) const {
+            int       il,
+            bool      kq_b_masked) const {
     const bool is_swa = hparams.is_swa(il);
 
     auto * inp_attn = inp->get_attn();
@@ -4513,11 +4514,14 @@ ggml_tensor * llm_graph_context::build_attn(
     GGML_ASSERT(attn_mask.rows == nullptr);
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
-    ggml_tensor * kq_mask = attn_mask.raw;
-    if (kq_mask->type != GGML_TYPE_F32) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+    ggml_tensor * kq_mask = kq_b;
+    if (!kq_b_masked) {
+        kq_mask = attn_mask.raw;
+        if (kq_mask->type != GGML_TYPE_F32) {
+            kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        }
+        kq_mask = ggml_add(ctx0, kq_b, kq_mask);
     }
-    kq_mask = ggml_add(ctx0, kq_b, kq_mask);
     if (cparams.flash_attn) {
         kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
     }
