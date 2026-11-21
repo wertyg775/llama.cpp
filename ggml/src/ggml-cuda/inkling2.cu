@@ -892,6 +892,52 @@ void ggml_cuda_op_inkling2_proj(ggml_backend_cuda_context & ctx, ggml_tensor * d
 // the most kv cells of the fused attention: the logits stay in LDS
 static constexpr int INKLING2_ATTN_MAX_KV = 8192;
 
+// in-place normalized Walsh-Hadamard transform of block size n_rot over x[0..d-1] in LDS
+static __device__ __forceinline__ void inkling2_fwht_smem(float * x, const int d, const int n_rot) {
+    if (n_rot <= 0) {
+        return;
+    }
+    const int i = threadIdx.x;
+    if (n_rot == 2*WARP_SIZE) {
+        const int warp = i / WARP_SIZE;
+        const int lane = i % WARP_SIZE;
+        const int off  = warp*n_rot;
+        if (off < d) {
+            const float inv = rsqrtf((float) n_rot);
+            float a = x[off + lane]*inv;
+            float b = x[off + lane + WARP_SIZE]*inv;
+#pragma unroll
+            for (int h = 1; h < WARP_SIZE; h *= 2) {
+                const float a2 = ggml_cuda_shfl_xor(a, h, WARP_SIZE);
+                const float b2 = ggml_cuda_shfl_xor(b, h, WARP_SIZE);
+                a = (lane & h) == 0 ? a + a2 : a2 - a;
+                b = (lane & h) == 0 ? b + b2 : b2 - b;
+            }
+            x[off + lane]             = a + b;
+            x[off + lane + WARP_SIZE] = a - b;
+        }
+        __syncthreads();
+        return;
+    }
+    for (int h = 1; h < n_rot; h *= 2) {
+        float val = 0.0f;
+        if (i < d) {
+            const float a = x[i];
+            const float b = x[i ^ h];
+            val = (i & h) == 0 ? a + b : b - a;
+        }
+        __syncthreads();
+        if (i < d) {
+            x[i] = val;
+        }
+        __syncthreads();
+    }
+    if (i < d) {
+        x[i] *= rsqrtf((float) n_rot);
+    }
+    __syncthreads();
+}
+
 // one block per query head: the logits (16 lanes per kv cell, a contiguous K row), the softmax with a zero sink,
 // then the V sum (one warp per output dim, the lanes walk the keys of a transposed V row)
 template <typename T, typename M, bool v_trans, bool vec, bool vec_v>
@@ -900,7 +946,7 @@ static __global__ void inkling2_attn_f32(
         const float * __restrict__ r, const float * __restrict__ sinks, const int32_t * __restrict__ rel_pos, const M * __restrict__ mask,
         const float * __restrict__ gate, float * __restrict__ dst, const int d, const int n_gqa, const int n_kv, const int n_rel, const int n_extent,
         const int64_t s_q1, const int64_t s_k1, const int64_t s_k2, const int64_t s_v1, const int64_t s_v2, const int64_t s_t1, const int64_t s_r1,
-        const float scale) {
+        const float scale, const int n_rot_q, const int n_rot_v) {
     constexpr int vk    = vec   ? 16/sizeof(T) : 1;
     constexpr int vv    = vec_v ? 16/sizeof(T) : 1;
     constexpr int lanes = 16;
@@ -920,6 +966,7 @@ static __global__ void inkling2_attn_f32(
         rs[i] = r[h*s_r1 + i];
     }
     __syncthreads();
+    inkling2_fwht_smem(qs, d, n_rot_q);
 
     const float sh   = sinks[h];
     const int   li   = threadIdx.x % lanes;
@@ -1002,16 +1049,159 @@ static __global__ void inkling2_attn_f32(
         }
         acc = warp_reduce_sum(acc);
         if (lane == 0) {
-            const float gt = gate[h*d + i];
-            dst[h*d + i] = (acc/sum)*(1.0f/(1.0f + expf(-gt)));
+            if (n_rot_v > 0) {
+                qs[i] = acc/sum;
+            } else {
+                const float gt = gate[h*d + i];
+                dst[h*d + i] = (acc/sum)*(1.0f/(1.0f + expf(-gt)));
+            }
+        }
+    }
+    if (n_rot_v > 0) {
+        __syncthreads();
+        inkling2_fwht_smem(qs, d, n_rot_v);
+        if (threadIdx.x < d) {
+            const float gt = gate[h*d + threadIdx.x];
+            dst[h*d + threadIdx.x] = qs[threadIdx.x]*(1.0f/(1.0f + expf(-gt)));
         }
     }
 }
 
+// Q8_0 KV cache (non-transposed V): 16 lanes per kv cell for K, coalesced d/4 threads per V row
+template <typename M>
+static __global__ void inkling2_attn_q8_0_f32(
+        const float * __restrict__ q, const char * __restrict__ k, const char * __restrict__ v, const float * __restrict__ table,
+        const float * __restrict__ r, const float * __restrict__ sinks, const int32_t * __restrict__ rel_pos, const M * __restrict__ mask,
+        const float * __restrict__ gate, float * __restrict__ dst, const int d, const int n_gqa, const int n_kv, const int n_rel, const int n_extent,
+        const int64_t s_q1, const int64_t s_k1, const int64_t s_k2, const int64_t s_v1, const int64_t s_v2, const int64_t s_t1, const int64_t s_r1,
+        const float scale, const int n_rot_q, const int n_rot_v) {
+    constexpr int lanes = 16;
+
+    extern __shared__ float sm[];
+    float * lg = sm;
+    float * qs = lg + n_kv;
+    float * rs = qs + d;
+
+    const int h  = blockIdx.x;
+    const int hk = h/n_gqa;
+
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        qs[i] = q[h*s_q1 + i];
+    }
+    for (int i = threadIdx.x; i < n_rel; i += blockDim.x) {
+        rs[i] = r[h*s_r1 + i];
+    }
+    __syncthreads();
+    inkling2_fwht_smem(qs, d, n_rot_q);
+
+    const float sh = sinks[h];
+    const int   li = threadIdx.x % lanes;
+    const int   ng = blockDim.x / lanes;
+    const int   d4 = d / 4;
+
+    // all lanes of a group take part in the shuffles, so the loop runs the same count in every group
+    float mx = 0.0f; // the zero sink
+    for (int j0 = 0; j0 < n_kv; j0 += ng) {
+        const int  j     = j0 + threadIdx.x / lanes;
+        const bool valid = j < n_kv;
+
+        float part = 0.0f;
+        if (valid) {
+            const block_q8_0 * kj = (const block_q8_0 *) (k + hk*s_k1 + j*s_k2);
+            float qk = 0.0f;
+            for (int c = li; c < d4; c += lanes) {
+                const int ib  = c / QI8_0;
+                const int iqs = c % QI8_0;
+                int q4;
+                ggml_cuda_memcpy_1<sizeof(q4), 2>(&q4, kj[ib].qs + 4*iqs);
+                const float kd  = __half2float(kj[ib].d);
+                const float dot = qs[4*c + 0]*int8_t(q4 >>  0) + qs[4*c + 1]*int8_t(q4 >>  8) +
+                                  qs[4*c + 2]*int8_t(q4 >> 16) + qs[4*c + 3]*int8_t(q4 >> 24);
+                qk += dot*kd;
+            }
+            float b = 0.0f;
+            const int dist = rel_pos[j];
+            if (dist < n_extent) {
+                for (int i = li; i < n_rel; i += lanes) {
+                    b += table[dist*s_t1 + i]*rs[i];
+                }
+            }
+            part = qk*scale + b;
+        }
+        part = warp_reduce_sum<lanes>(part);
+        if (valid && li == 0) {
+            const float l = (part - sh) + ggml_cuda_cast<float>(mask[j]);
+            lg[j] = l;
+            mx = fmaxf(mx, l);
+        }
+    }
+
+    __shared__ float buf[32];
+    mx = block_reduce<block_reduce_method::MAX>(mx, buf);
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < n_kv; j += blockDim.x) {
+        const float e = expf(lg[j] - mx);
+        lg[j] = e;
+        sum  += e;
+    }
+    sum  = block_reduce<block_reduce_method::SUM>(sum, buf);
+    sum += expf(0.0f - mx);
+    __syncthreads();
+
+    const int ng_v = blockDim.x / d4;
+    const int vg   = threadIdx.x / d4;
+    const int c    = threadIdx.x % d4;
+    const int ib   = c / QI8_0;
+    const int iqs  = c % QI8_0;
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (vg < ng_v) {
+        for (int j = vg; j < n_kv; j += ng_v) {
+            const block_q8_0 * vj = (const block_q8_0 *) (v + hk*s_v1 + j*s_v2) + ib;
+            int q4;
+            ggml_cuda_memcpy_1<sizeof(q4), 2>(&q4, vj->qs + 4*iqs);
+            const float w = lg[j]*__half2float(vj->d);
+            acc[0] += w*int8_t(q4 >>  0);
+            acc[1] += w*int8_t(q4 >>  8);
+            acc[2] += w*int8_t(q4 >> 16);
+            acc[3] += w*int8_t(q4 >> 24);
+        }
+    }
+
+    __shared__ float vbuf[512];
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        if (vg < ng_v) {
+            vbuf[vg*d4 + c] = acc[p];
+        }
+        __syncthreads();
+        if (threadIdx.x < d4) {
+            float total = 0.0f;
+            for (int g = 0; g < ng_v; ++g) {
+                total += vbuf[g*d4 + threadIdx.x];
+            }
+            qs[4*threadIdx.x + p] = total/sum;
+        }
+        __syncthreads();
+    }
+
+    inkling2_fwht_smem(qs, d, n_rot_v);
+    if (threadIdx.x < d) {
+        const float gt = gate[h*d + threadIdx.x];
+        dst[h*d + threadIdx.x] = qs[threadIdx.x]*(1.0f/(1.0f + expf(-gt)));
+    }
+}
+
 bool ggml_cuda_inkling2_attn_supported(const ggml_tensor * op) {
-    const ggml_type type = op->src[1]->type;
-    return (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16) && op->src[3]->type == GGML_TYPE_F32 &&
-        op->src[6]->ne[0] <= INKLING2_ATTN_MAX_KV && op->src[0]->ne[0] <= 512;
+    const ggml_type type    = op->src[1]->type;
+    const int64_t   d       = op->src[0]->ne[0];
+    const bool      v_trans = ggml_get_op_params_i32(op, 1) != 0;
+    const bool      ok_type = type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 ||
+        (type == GGML_TYPE_Q8_0 && !v_trans && d % QK8_0 == 0);
+    return ok_type && op->src[3]->type == GGML_TYPE_F32 &&
+        op->src[6]->ne[0] <= INKLING2_ATTN_MAX_KV && d <= 512;
 }
 
 void ggml_cuda_op_inkling2_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -1028,6 +1218,8 @@ void ggml_cuda_op_inkling2_attn(ggml_backend_cuda_context & ctx, ggml_tensor * d
     float scale;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
     const bool v_trans = ggml_get_op_params_i32(dst, 1) != 0;
+    const int  n_rot_q = ggml_get_op_params_i32(dst, 2);
+    const int  n_rot_v = ggml_get_op_params_i32(dst, 3);
 
     const int d      = q->ne[0];
     const int n_head = q->ne[1];
@@ -1036,8 +1228,23 @@ void ggml_cuda_op_inkling2_attn(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int n_gqa  = n_head/k->ne[1];
 
     const int    n_threads = 512;
-    const size_t ts        = ggml_type_size(k->type);
     const size_t smem      = (n_kv + d + n_rel)*sizeof(float);
+
+    if (k->type == GGML_TYPE_Q8_0) {
+        auto launch_q8 = [&](auto mask_tag) {
+            using M = decltype(mask_tag);
+            inkling2_attn_q8_0_f32<M><<<n_head, n_threads, smem, ctx.stream()>>>(
+                (const float *) q->data, (const char *) k->data, (const char *) v->data, (const float *) table->data,
+                (const float *) r->data, (const float *) sinks->data, (const int32_t *) rel_pos->data, (const M *) mask->data,
+                (const float *) gate->data, (float *) dst->data,
+                d, n_gqa, n_kv, n_rel, (int) table->ne[1], q->nb[1]/sizeof(float), k->nb[1], k->nb[2], v->nb[1], v->nb[2],
+                table->nb[1]/sizeof(float), r->nb[1]/sizeof(float), scale, n_rot_q, n_rot_v);
+        };
+        mask->type == GGML_TYPE_F16 ? launch_q8(half()) : launch_q8(float());
+        return;
+    }
+
+    const size_t ts = ggml_type_size(k->type);
 
     // 16-byte loads need aligned K rows, and aligned V rows when V is transposed
     const bool vec   = d % (16/ts) == 0 && inkling2_aligned(k->data, k->nb[2]) && k->nb[1] % 16 == 0;
@@ -1047,7 +1254,7 @@ void ggml_cuda_op_inkling2_attn(ggml_backend_cuda_context & ctx, ggml_tensor * d
         kernel<<<n_head, n_threads, smem, ctx.stream()>>>((const float *) q->data, k_d, v_d, (const float *) table->data, (const float *) r->data,
                 (const float *) sinks->data, (const int32_t *) rel_pos->data, mask_d, (const float *) gate->data, (float *) dst->data,
                 d, n_gqa, n_kv, n_rel, (int) table->ne[1], q->nb[1]/sizeof(float), k->nb[1]/ts, k->nb[2]/ts, v->nb[1]/ts, v->nb[2]/ts,
-                table->nb[1]/sizeof(float), r->nb[1]/sizeof(float), scale);
+                table->nb[1]/sizeof(float), r->nb[1]/sizeof(float), scale, n_rot_q, n_rot_v);
     };
     auto launch_t = [&](auto tag) {
         using T = decltype(tag);

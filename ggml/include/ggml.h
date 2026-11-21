@@ -2662,7 +2662,9 @@ extern "C" {
             struct ggml_tensor  * mask,
             struct ggml_tensor  * gate,
             bool                  v_trans,
-            float                 scale);
+            float                 scale,
+            int32_t               n_rot_q,
+            int32_t               n_rot_v);
 
     // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
     //

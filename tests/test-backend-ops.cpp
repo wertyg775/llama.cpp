@@ -5284,15 +5284,17 @@ struct test_inkling2_attn : public test_case {
     const bool      v_trans;
     const ggml_type mask_type;
     const int64_t   kv_size; // of the cache the views come from
+    const int32_t   n_rot_q;
+    const int32_t   n_rot_v;
 
     std::string vars() override {
-        return VARS_TO_STR8(type, d, n_head, n_head_kv, n_kv, v_trans, mask_type, kv_size);
+        return VARS_TO_STR10(type, d, n_head, n_head_kv, n_kv, v_trans, mask_type, kv_size, n_rot_q, n_rot_v);
     }
 
     test_inkling2_attn(ggml_type type = GGML_TYPE_F16, int64_t d = 128, int64_t n_head = 24, int64_t n_head_kv = 4, int64_t n_kv = 256,
-            bool v_trans = true, ggml_type mask_type = GGML_TYPE_F32, int64_t kv_size = 0)
+            bool v_trans = true, ggml_type mask_type = GGML_TYPE_F32, int64_t kv_size = 0, int32_t n_rot_q = 0, int32_t n_rot_v = 0)
         : type(type), d(d), n_head(n_head), n_head_kv(n_head_kv), n_kv(n_kv), v_trans(v_trans), mask_type(mask_type),
-          kv_size(kv_size ? kv_size : n_kv + 9) {}
+          kv_size(kv_size ? kv_size : n_kv + 9), n_rot_q(n_rot_q), n_rot_v(n_rot_v) {}
 
     static constexpr int64_t n_rel    = 16;
     static constexpr int64_t n_extent = 100;
@@ -5304,7 +5306,7 @@ struct test_inkling2_attn : public test_case {
         // views of the caches, as llama_kv_cache::get_k / get_v make them
         ggml_tensor * kc = ggml_new_tensor_2d(ctx, type, d*n_head_kv, kv_size);
         ggml_set_name(kc, "k_cache");
-        ggml_tensor * k = ggml_view_3d(ctx, kc, d, n_head_kv, n_kv, d*ggml_element_size(kc), kc->nb[1], 0);
+        ggml_tensor * k = ggml_view_3d(ctx, kc, d, n_head_kv, n_kv, ggml_row_size(type, d), kc->nb[1], 0);
 
         ggml_tensor * v;
         if (v_trans) {
@@ -5314,7 +5316,7 @@ struct test_inkling2_attn : public test_case {
         } else {
             ggml_tensor * vc = ggml_new_tensor_2d(ctx, type, d*n_head_kv, kv_size);
             ggml_set_name(vc, "v_cache");
-            v = ggml_view_3d(ctx, vc, d, n_head_kv, n_kv, d*ggml_element_size(vc), vc->nb[1], 0);
+            v = ggml_view_3d(ctx, vc, d, n_head_kv, n_kv, ggml_row_size(type, d), vc->nb[1], 0);
         }
 
         ggml_tensor * table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rel, n_extent);
@@ -5330,7 +5332,7 @@ struct test_inkling2_attn : public test_case {
         ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d*n_head, 1);
         ggml_set_name(gate, "gate");
 
-        ggml_tensor * out = ggml_inkling2_attn(ctx, q, k, v, table, r, sinks, rel_pos, mask, gate, v_trans, 1.0f/sqrtf(d));
+        ggml_tensor * out = ggml_inkling2_attn(ctx, q, k, v, table, r, sinks, rel_pos, mask, gate, v_trans, 1.0f/sqrtf(d), n_rot_q, n_rot_v);
         ggml_set_name(out, "out");
         return out;
     }
@@ -11319,6 +11321,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_inkling2_attn(type, 128, 24, 4, 300, v_trans, GGML_TYPE_F16, 512)); // aligned cache rows
         }
     }
+    test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 4, 256, false));
+    test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 4, 1, false));
+    test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 64, 6, 6, 1500, false, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 32, 4, 2, 77, false));
+    test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 4, 300, false, GGML_TYPE_F16, 512));
+    test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 4, 256, false, GGML_TYPE_F16, 512, 128, 128));
+    test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 4, 64,  false, GGML_TYPE_F32, 0,    64,  64));
+    test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, 256, true,  GGML_TYPE_F16, 512, 128, 128));
     for (ggml_type type : {GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (bool norm : {true, false}) {
             test_cases.emplace_back(new test_inkling2_proj(type, 64, {32, 5}, 1, norm));
@@ -14407,7 +14417,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // INKLING2_ATTN: Inkling 2 Mini attention of one token
     for (int64_t n_kv : {256, 1024, 4096}) {
-        test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16, 128, 24, 4, n_kv, true, GGML_TYPE_F16, 8192));
+        test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, n_kv, true,  GGML_TYPE_F16, 8192));
+        test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 4, n_kv, false, GGML_TYPE_F16, 8192, 128, 128));
     }
 
     // INKLING2_PROJ: Inkling 2 Mini projections of a SWA layer input, decode

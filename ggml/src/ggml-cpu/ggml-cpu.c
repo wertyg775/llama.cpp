@@ -3088,8 +3088,8 @@ struct ggml_cplan ggml_graph_plan(
                     }
                 case GGML_OP_INKLING2_ATTN:
                     {
-                        // per thread: the logits of one head
-                        cur = sizeof(float)*n_tasks*(node->src[6]->ne[0] + CACHE_LINE_SIZE_F32);
+                        // per thread: the logits, one dequantized row, the output accumulator and rotated q
+                        cur = sizeof(float)*n_tasks*(node->src[6]->ne[0] + 3*node->src[0]->ne[0] + CACHE_LINE_SIZE_F32);
                     } break;
                 case GGML_OP_INKLING2_PROJ:
                     {

@@ -4557,18 +4557,37 @@ ggml_tensor * llm_graph_context::build_attn_inkling2_fused(
 
     const auto * mctx_cur = is_swa ? inp_attn->mctx->get_swa() : inp_attn->mctx->get_base();
 
-    if ((is_swa ? inp_attn->self_k_rot_swa[il] : inp_attn->self_k_rot[il]) || (is_swa ? inp_attn->self_v_rot_swa[il] : inp_attn->self_v_rot[il]) ||
-        mctx_cur->get_k_scale(il) || mctx_cur->get_v_scale(il) || attn_mask.rows || attn_mask.raw->ne[3] != 1 || rel_pos->ne[0] > n_kv_max) {
+    auto * k_rot = is_swa ? inp_attn->self_k_rot_swa[il] : inp_attn->self_k_rot[il];
+    auto * v_rot = is_swa ? inp_attn->self_v_rot_swa[il] : inp_attn->self_v_rot[il];
+
+    const int32_t n_rot_q = k_rot ? (int32_t) k_rot->ne[0] : 0;
+    const int32_t n_rot_v = v_rot ? (int32_t) v_rot->ne[0] : 0;
+
+    if (mctx_cur->get_k_scale(il) || mctx_cur->get_v_scale(il) || attn_mask.rows || attn_mask.raw->ne[3] != 1 || rel_pos->ne[0] > n_kv_max ||
+        (n_rot_q > 0 && ((n_rot_q & (n_rot_q - 1)) != 0 || q_cur->ne[0] % n_rot_q != 0)) ||
+        (n_rot_v > 0 && ((n_rot_v & (n_rot_v - 1)) != 0 || q_cur->ne[0] % n_rot_v != 0))) {
         return nullptr;
     }
 
     // the views are only nodes when used, so they can be checked first
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
-    for (ggml_tensor * t : {k, v}) {
-        if ((t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16 && t->type != GGML_TYPE_F32) || t->ne[3] != 1) {
-            return nullptr;
-        }
+    // a transposed V view has v->nb[1] > v->nb[2], see llama_kv_cache::get_v
+    const bool v_trans = v->nb[1] > v->nb[2];
+    if (k->type != v->type || k->ne[3] != 1 || v->ne[3] != 1) {
+        return nullptr;
+    }
+    const bool ok_type = k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_F32 ||
+        (k->type == GGML_TYPE_Q8_0 && !v_trans && q_cur->ne[0] % ggml_blck_size(k->type) == 0);
+    if (!ok_type) {
+        return nullptr;
+    }
+
+    if (k_rot) {
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
+    }
+    if (v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, v_rot);
     }
 
     ggml_build_forward_expand(gf, q_cur);
@@ -4580,10 +4599,7 @@ ggml_tensor * llm_graph_context::build_attn_inkling2_fused(
     ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
     ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
 
-    // a transposed V view has v->nb[1] > v->nb[2], see llama_kv_cache::get_v
-    const bool v_trans = v->nb[1] > v->nb[2];
-
-    ggml_tensor * cur = ggml_inkling2_attn(ctx0, q_cur, k, v, table, r, sinks, rel_pos, attn_mask.raw, gate, v_trans, kq_scale);
+    ggml_tensor * cur = ggml_inkling2_attn(ctx0, q_cur, k, v, table, r, sinks, rel_pos, attn_mask.raw, gate, v_trans, kq_scale, n_rot_q, n_rot_v);
     cb(cur, "kqv_out", il);
 
     return cur;

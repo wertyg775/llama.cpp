@@ -6904,14 +6904,18 @@ struct ggml_tensor * ggml_inkling2_attn(
         struct ggml_tensor  * mask,
         struct ggml_tensor  * gate,
         bool                  v_trans,
-        float                 scale) {
+        float                 scale,
+        int32_t               n_rot_q,
+        int32_t               n_rot_v) {
     const int64_t d      = q->ne[0];
     const int64_t n_head = q->ne[1];
     const int64_t n_kv   = rel_pos->ne[0];
 
     GGML_ASSERT(q->type == GGML_TYPE_F32 && ggml_is_contiguous(q) && q->ne[2] == 1);
     GGML_ASSERT(k->type == v->type && k->ne[0] == d && k->ne[2] == n_kv && n_head % k->ne[1] == 0 && k->nb[0] == ggml_type_size(k->type));
+    GGML_ASSERT(d % ggml_blck_size(k->type) == 0);
     if (v_trans) {
+        GGML_ASSERT(!ggml_is_quantized(v->type));
         GGML_ASSERT(v->ne[0] == n_kv && v->ne[1] == k->ne[1] && v->ne[2] == d && v->nb[0] == ggml_type_size(v->type));
     } else {
         GGML_ASSERT(v->ne[0] == d && v->ne[1] == k->ne[1] && v->ne[2] == n_kv && v->nb[0] == ggml_type_size(v->type));
@@ -6922,11 +6926,15 @@ struct ggml_tensor * ggml_inkling2_attn(
     GGML_ASSERT(rel_pos->type == GGML_TYPE_I32 && ggml_nelements(rel_pos) == n_kv);
     GGML_ASSERT((mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16) && mask->ne[0] == n_kv && ggml_nrows(mask) == 1);
     GGML_ASSERT(gate->type == GGML_TYPE_F32 && ggml_nelements(gate) == d*n_head && ggml_is_contiguous(gate));
+    GGML_ASSERT(n_rot_q == 0 || (n_rot_q > 0 && (n_rot_q & (n_rot_q - 1)) == 0 && d % n_rot_q == 0));
+    GGML_ASSERT(n_rot_v == 0 || (n_rot_v > 0 && (n_rot_v & (n_rot_v - 1)) == 0 && d % n_rot_v == 0));
 
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d*n_head, 1);
 
     ggml_set_op_params_f32(result, 0, scale);
     ggml_set_op_params_i32(result, 1, v_trans ? 1 : 0);
+    ggml_set_op_params_i32(result, 2, n_rot_q);
+    ggml_set_op_params_i32(result, 3, n_rot_v);
 
     result->op     = GGML_OP_INKLING2_ATTN;
     result->src[0] = q;
