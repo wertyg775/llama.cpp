@@ -415,6 +415,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_INKLING2_CTRL,
 
         GGML_OP_UNARY,
 
@@ -2497,6 +2498,21 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // inkling2 loop controller: mix a message into a looped layer input
+    //   cur, msg: [n, n_tokens] f32, contiguous rows
+    //   down: [2n, r], gain and forget: [r, n], f32, f16 or bf16
+    //   g      = down @ concat(rms_norm(cur, eps), rms_norm(msg, eps))
+    //   result = cur - cur*tanh(forget @ g) + msg*tanh(gain @ g), [n, n_tokens] f32
+    //
+    GGML_API struct ggml_tensor * ggml_inkling2_ctrl(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * msg,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * gain,
+            struct ggml_tensor  * forget,
+            float                 eps);
 
     // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
     //

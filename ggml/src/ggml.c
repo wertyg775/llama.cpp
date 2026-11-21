@@ -1099,6 +1099,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "INKLING2_CTRL",
 
     "UNARY",
 
@@ -1118,7 +1119,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,6 +1215,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "inkling2_ctrl(cur, msg, down, gain, forget)",
 
     "unary(x)",
 
@@ -1233,7 +1235,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6568,6 +6570,43 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_inkling2_ctrl
+
+struct ggml_tensor * ggml_inkling2_ctrl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * msg,
+        struct ggml_tensor  * down,
+        struct ggml_tensor  * gain,
+        struct ggml_tensor  * forget,
+        float                 eps) {
+    GGML_ASSERT(cur->type == GGML_TYPE_F32);
+    GGML_ASSERT(msg->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(cur, msg));
+    GGML_ASSERT(cur->ne[2] == 1 && cur->ne[3] == 1);
+    GGML_ASSERT(cur->nb[0] == sizeof(float) && msg->nb[0] == sizeof(float));
+
+    const int64_t n = cur->ne[0];
+    const int64_t r = down->ne[1];
+
+    GGML_ASSERT(down->ne[0] == 2*n && ggml_nrows(down) == r);
+    GGML_ASSERT(gain->ne[0] == r && gain->ne[1] == n && ggml_nrows(gain) == n);
+    GGML_ASSERT(ggml_are_same_shape(gain, forget));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, cur->ne[1]);
+
+    ggml_set_op_params_f32(result, 0, eps);
+
+    result->op     = GGML_OP_INKLING2_CTRL;
+    result->src[0] = cur;
+    result->src[1] = msg;
+    result->src[2] = down;
+    result->src[3] = gain;
+    result->src[4] = forget;
 
     return result;
 }

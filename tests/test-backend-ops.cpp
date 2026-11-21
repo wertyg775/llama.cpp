@@ -4864,6 +4864,67 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 };
 
 
+// GGML_OP_INKLING2_CTRL
+struct test_inkling2_ctrl : public test_case {
+    const ggml_type type;
+    const int64_t n;
+    const int64_t r;
+    const int64_t n_tokens;
+    const bool    view; // cur and msg are rows of [n, 4, n_tokens] tensors
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, n, r, n_tokens, view);
+    }
+
+    test_inkling2_ctrl(ggml_type type = GGML_TYPE_BF16, int64_t n = 64, int64_t r = 16, int64_t n_tokens = 3, bool view = false)
+        : type(type), n(n), r(r), n_tokens(n_tokens), view(view) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur;
+        ggml_tensor * msg;
+        if (view) {
+            ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, 4, n_tokens);
+            ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, 4, n_tokens);
+            ggml_set_name(a, "a");
+            ggml_set_name(b, "b");
+            cur = ggml_view_2d(ctx, a, n, n_tokens, a->nb[2], 1*a->nb[1]);
+            msg = ggml_view_2d(ctx, b, n, n_tokens, b->nb[2], 3*b->nb[1]);
+        } else {
+            cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+            msg = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        }
+        ggml_set_name(cur, "cur");
+        ggml_set_name(msg, "msg");
+
+        ggml_tensor * down   = ggml_new_tensor_2d(ctx, type, 2*n, r);
+        ggml_tensor * gain   = ggml_new_tensor_2d(ctx, type, r, n);
+        ggml_tensor * forget = ggml_new_tensor_2d(ctx, type, r, n);
+        ggml_set_name(down,   "down");
+        ggml_set_name(gain,   "gain");
+        ggml_set_name(forget, "forget");
+
+        ggml_tensor * out = ggml_inkling2_ctrl(ctx, cur, msg, down, gain, forget, 1e-6f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    // keep the gate and the tanh inputs near unit size, so that tanh does not saturate
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "down") {
+                const float a = sqrtf(3.0f/(2*n));
+                init_tensor_uniform(t, -a, a);
+            } else if (name == "gain" || name == "forget") {
+                const float a = sqrtf(3.0f/r);
+                init_tensor_uniform(t, -a, a);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -10805,6 +10866,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true));
+    for (ggml_type type : {GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int64_t n_tokens : {1, 3, 8, 17}) {
+            test_cases.emplace_back(new test_inkling2_ctrl(type, 64, 16, n_tokens));
+            test_cases.emplace_back(new test_inkling2_ctrl(type, 2304, 64, n_tokens));          // Inkling 2 Mini
+            test_cases.emplace_back(new test_inkling2_ctrl(type, 2304, 64, n_tokens, true));
+        }
+        test_cases.emplace_back(new test_inkling2_ctrl(type, 37, 5, 3));                        // odd sizes, unaligned rows
+        test_cases.emplace_back(new test_inkling2_ctrl(type, 37, 5, 3, true));
+        test_cases.emplace_back(new test_inkling2_ctrl(type, 520, 72, 2, true));
+    }
     for (int64_t n_hc : {1, 2, 3, 5, 8, 65}) {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17));
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
@@ -13804,6 +13875,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_dsv4_hc_post(7168, n_tokens));             // DeepSeek-V4-Pro
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n_tokens, true, true)); // Qwen4-Exp, with the post gate chain
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n_tokens, true));       // synthetic, Qwen4-Exp kernel without the gate chain
+    }
+
+    // INKLING2_CTRL: Inkling 2 Mini loop controller, decode and small batches
+    for (int64_t n_tokens : {1, 4, 8}) {
+        test_cases.emplace_back(new test_inkling2_ctrl(GGML_TYPE_BF16, 2304, 64, n_tokens, true));
     }
 
     // Qwen3.8-Flash-Next pooled indexer prefill.

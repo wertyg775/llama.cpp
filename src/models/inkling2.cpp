@@ -244,10 +244,42 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     return ggml_scale(ctx0, ggml_add(ctx0, out, cur), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
 }
 
+// the fused controller op reads the plain weights and normalizes its inputs itself
+// it is a mat-vec per token, so large batches keep the mul_mat graph
+bool llama_model_inkling2::graph::fused_control(const loop_layer & loop) const {
+    if (!cparams.fused_inkling2_ctrl || n_tokens > std::max<int64_t>(8, ubatch.n_seqs)) {
+        return false;
+    }
+
+    for (int ctrl = 0; ctrl < LOOP_CTRL_COUNT; ++ctrl) {
+        for (ggml_tensor * w : {loop.ctrl_down[ctrl], loop.ctrl_gain[ctrl], loop.ctrl_forget[ctrl]}) {
+            if (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_F16 && w->type != GGML_TYPE_BF16) {
+                return false;
+            }
+            if (hdmd && hdmd->rot.count(w)) {
+                return false;
+            }
+            for (const auto & lora : *loras) {
+                if (lora.first->get_weight(w)) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
-// cur_norm and message_norm are cur and message after an RMS norm
+// cur_norm and message_norm are cur and message after an RMS norm, or null for the fused op of layer il
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * cur_norm, ggml_tensor * message, ggml_tensor * message_norm,
-        const loop_layer & loop, int ctrl) {
+        const loop_layer & loop, int ctrl, int il) {
+    if (!cur_norm) {
+        ggml_tensor * out = ggml_inkling2_ctrl(ctx0, cur, message, loop.ctrl_down[ctrl], loop.ctrl_gain[ctrl], loop.ctrl_forget[ctrl], 1e-6f);
+        res->add_fused_node({LLM_FUSED_OP_INKLING2_CTRL, out, il});
+        return out;
+    }
+
     ggml_tensor * gate = ggml_concat(ctx0, cur_norm, message_norm, 0);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
@@ -312,14 +344,18 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         inputs[j] = row(mixed, std::min<int64_t>(j, mixed->ne[1] - 1));
     }
 
-    ggml_tensor * messages_norm = messages ? ggml_rms_norm(ctx0, messages, 1e-6f) : nullptr;
+    // the fused controllers need no normalized inputs
+    const bool fused = messages && fused_control(*loop);
+
+    ggml_tensor * messages_norm = messages && !fused ? ggml_rms_norm(ctx0, messages, 1e-6f) : nullptr;
     if (messages) {
-        ggml_tensor * mixed_norm = ggml_rms_norm(ctx0, mixed, 1e-6f);
+        ggml_tensor * mixed_norm = fused ? nullptr : ggml_rms_norm(ctx0, mixed, 1e-6f);
 
         // the messages make the Q, K and V inputs of a SWA layer differ
         for (int j = 0; j < 3; ++j) {
-            const int ctrl = LOOP_CTRL_Q + j;
-            inputs[j] = control(inputs[j], row(mixed_norm, std::min<int64_t>(j, mixed->ne[1] - 1)), row(messages, ctrl), row(messages_norm, ctrl), *loop, ctrl);
+            const int     ctrl = LOOP_CTRL_Q + j;
+            const int64_t k    = std::min<int64_t>(j, mixed->ne[1] - 1);
+            inputs[j] = control(inputs[j], fused ? nullptr : row(mixed_norm, k), row(messages, ctrl), fused ? nullptr : row(messages_norm, ctrl), *loop, ctrl, ip);
         }
     }
 
@@ -406,7 +442,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     // MoE
     cur = ggml_reshape_2d(ctx0, mix(stack(blocks, ggml_rms_norm(ctx0, cur, 1e-6f)), layer.ffn_res_query), n_embd, n_tokens);
     if (messages) {
-        cur = control(cur, ggml_rms_norm(ctx0, cur, 1e-6f), row(messages, LOOP_CTRL_FFN), row(messages_norm, LOOP_CTRL_FFN), *loop, LOOP_CTRL_FFN);
+        cur = control(cur, fused ? nullptr : ggml_rms_norm(ctx0, cur, 1e-6f), row(messages, LOOP_CTRL_FFN),
+                fused ? nullptr : row(messages_norm, LOOP_CTRL_FFN), *loop, LOOP_CTRL_FFN, ip);
     }
     cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
 

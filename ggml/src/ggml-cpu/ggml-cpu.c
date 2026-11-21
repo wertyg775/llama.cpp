@@ -2117,6 +2117,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_INKLING2_CTRL:
+            {
+                ggml_compute_forward_inkling2_ctrl(params, tensor);
+            } break;
         case GGML_OP_TOP_K_MASK:
             {
                 ggml_compute_forward_top_k_mask(params, tensor);
@@ -2304,6 +2308,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
         case GGML_OP_TOP_K_MASK:
+        case GGML_OP_INKLING2_CTRL:
             {
                 n_tasks = n_threads;
             } break;
@@ -3046,6 +3051,13 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         GGML_ABORT("fatal error");
                     }
+                case GGML_OP_INKLING2_CTRL:
+                    {
+                        // the gates [r, n_tokens], then per thread one weight row and the normalized inputs
+                        const int64_t n = node->src[0]->ne[0];
+                        const int64_t r = node->src[2]->ne[1];
+                        cur = sizeof(float)*(r*node->src[0]->ne[1] + n_tasks*(4*n + CACHE_LINE_SIZE_F32));
+                    } break;
                 case GGML_OP_LIGHTNING_INDEXER:
                     {
                         // temp buffer for dequantizing lightning indexer keys
