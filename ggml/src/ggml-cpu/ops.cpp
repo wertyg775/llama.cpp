@@ -11834,6 +11834,83 @@ void ggml_compute_forward_inkling2_clip(
     }
 }
 
+// ggml_compute_forward_inkling2_conv
+
+static void ggml_compute_forward_inkling2_conv_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * cur     = dst->src[0];
+    const ggml_tensor * past    = dst->src[1];
+    const ggml_tensor * weight  = dst->src[2];
+    const ggml_tensor * dynamic = dst->src[3];
+
+    const float scale = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t C      = cur->ne[0];
+    const int64_t T      = cur->ne[1];
+    const int64_t K      = weight->ne[0];
+    const int64_t n_seqs = past->ne[2];
+    const int64_t n_st   = T/n_seqs;
+    const int64_t n_cph  = dynamic ? C/(dynamic->ne[0]/K) : 1; // channels per head
+
+    const float * w = (const float *) weight->data;
+    float       * y = (float *) dst->data;
+    float       * s = y + C*T;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // input k of channel c of sequence q: the past for k < K - 1, else token k - (K - 1) of the sequence
+    auto x = [&](int64_t c, int64_t q, int64_t k) {
+        if (k < K - 1) {
+            return *(const float *) ((const char *) past->data + k*past->nb[0] + c*past->nb[1] + q*past->nb[2]);
+        }
+        return *(const float *) ((const char *) cur->data + c*sizeof(float) + (q*n_st + k - (K - 1))*cur->nb[1]);
+    };
+
+    for (int64_t ir = ith; ir < C*n_seqs; ir += nth) {
+        const int64_t c = ir % C;
+        const int64_t q = ir / C;
+
+        for (int64_t i = 0; i < n_st; ++i) {
+            const int64_t t = q*n_st + i;
+
+            float sum = 0.0f;
+            for (int64_t k = 0; k < K; ++k) {
+                sum += x(c, q, i + k)*w[c*K + k];
+            }
+
+            if (dynamic) {
+                const float * taps = (const float *) ((const char *) dynamic->data + t*dynamic->nb[1]) + (c/n_cph)*K;
+                for (int64_t lag = 0; lag < K; ++lag) {
+                    sum += x(c, q, i + K - 1 - lag)*taps[lag];
+                }
+            }
+
+            y[t*C + c] = (sum + x(c, q, i + K - 1))*scale;
+        }
+
+        for (int64_t k = 0; k < K - 1; ++k) {
+            s[(q*C + c)*(K - 1) + k] = x(c, q, n_st + k);
+        }
+    }
+}
+
+void ggml_compute_forward_inkling2_conv(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_inkling2_conv_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_top_k_mask
 
 void ggml_compute_forward_top_k_mask(

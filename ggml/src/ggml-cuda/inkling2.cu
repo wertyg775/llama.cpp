@@ -255,3 +255,81 @@ void ggml_cuda_op_inkling2_clip(ggml_backend_cuda_context & ctx, ggml_tensor * d
             tau ? (const float *) tau->data : nullptr, (float *) dst->data, x->ne[0], x->ne[1], x->ne[2], nr,
             x->nb[1]/sizeof(float), x->nb[2]/sizeof(float), x->nb[3]/sizeof(float), s_scale1, s_tau2, 1.0f/threshold, eps/threshold);
 }
+
+// tokens of one sequence per block in the conv kernel
+static constexpr int INKLING2_CONV_CHUNK = 64;
+
+// one thread per channel c of sequence blockIdx.y, tokens of chunk blockIdx.z; the last chunk also writes the new state
+template <bool has_dynamic>
+static __global__ void inkling2_conv_f32(
+        const float * __restrict__ cur, const float * __restrict__ past, const float * __restrict__ weight, const float * __restrict__ dynamic,
+        float * __restrict__ y, float * __restrict__ state, const int C, const int K, const int n_st, const int n_cph,
+        const int64_t s_cur1, const int64_t s_past0, const int64_t s_past1, const int64_t s_past2, const int64_t s_dyn1, const float scale) {
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= C) {
+        return;
+    }
+    const int q  = blockIdx.y;
+    const int i0 = blockIdx.z*INKLING2_CONV_CHUNK;
+    const int i1 = min(i0 + INKLING2_CONV_CHUNK, n_st);
+
+    const float * xp = past + c*s_past1 + q*s_past2;
+    const float * xc = cur  + c + (int64_t) q*n_st*s_cur1;
+    const float * w  = weight + (int64_t) c*K;
+
+    auto x = [&](int k) {
+        return k < K - 1 ? xp[k*s_past0] : xc[(k - (K - 1))*s_cur1];
+    };
+
+    for (int i = i0; i < i1; ++i) {
+        const int64_t t = (int64_t) q*n_st + i;
+
+        float sum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            sum += x(i + k)*w[k];
+        }
+
+        if constexpr (has_dynamic) {
+            const float * taps = dynamic + t*s_dyn1 + (c/n_cph)*K;
+            for (int lag = 0; lag < K; ++lag) {
+                sum += x(i + K - 1 - lag)*taps[lag];
+            }
+        }
+
+        y[t*C + c] = (sum + x(i + K - 1))*scale;
+    }
+
+    if (i1 == n_st) {
+        for (int k = 0; k < K - 1; ++k) {
+            state[((int64_t) q*C + c)*(K - 1) + k] = x(n_st + k);
+        }
+    }
+}
+
+void ggml_cuda_op_inkling2_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * cur     = dst->src[0];
+    const ggml_tensor * past    = dst->src[1];
+    const ggml_tensor * weight  = dst->src[2];
+    const ggml_tensor * dynamic = dst->src[3];
+
+    float scale;
+    memcpy(&scale, dst->op_params, sizeof(float));
+
+    const int C      = cur->ne[0];
+    const int T      = cur->ne[1];
+    const int K      = weight->ne[0];
+    const int n_seqs = past->ne[2];
+    const int n_st   = T/n_seqs;
+    const int n_cph  = dynamic ? C/(dynamic->ne[0]/K) : 1;
+
+    float * y = (float *) dst->data;
+
+    const int  n_threads = 256;
+    const dim3 blocks((C + n_threads - 1)/n_threads, n_seqs, (n_st + INKLING2_CONV_CHUNK - 1)/INKLING2_CONV_CHUNK);
+
+    auto kernel = dynamic ? inkling2_conv_f32<true> : inkling2_conv_f32<false>;
+    kernel<<<blocks, n_threads, 0, ctx.stream()>>>((const float *) cur->data, (const float *) past->data, (const float *) weight->data,
+            dynamic ? (const float *) dynamic->data : nullptr, y, y + (int64_t) C*T, C, K, n_st, n_cph,
+            cur->nb[1]/sizeof(float), past->nb[0]/sizeof(float), past->nb[1]/sizeof(float), past->nb[2]/sizeof(float),
+            dynamic ? dynamic->nb[1]/sizeof(float) : 0, scale);
+}

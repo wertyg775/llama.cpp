@@ -1101,6 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "TOP_K_MASK",
     "INKLING2_CTRL",
     "INKLING2_CLIP",
+    "INKLING2_CONV",
 
     "UNARY",
 
@@ -1120,7 +1121,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1218,6 +1219,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "top_k_mask(mask, top_k, score, blocks, extra)",
     "inkling2_ctrl(cur, msg, down, gain, forget)",
     "inkling2_clip(x, scale, tau)",
+    "inkling2_conv(cur, past, weight, dynamic)",
 
     "unary(x)",
 
@@ -1237,7 +1239,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6644,6 +6646,45 @@ struct ggml_tensor * ggml_inkling2_clip(
     result->src[0] = x;
     result->src[1] = scale;
     result->src[2] = tau;
+
+    return result;
+}
+
+// ggml_inkling2_conv
+
+struct ggml_tensor * ggml_inkling2_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * past,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * dynamic,
+        float                 scale) {
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && past->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(cur->nb[0] == sizeof(float) && past->nb[0] == sizeof(float) && ggml_is_contiguous(weight));
+
+    const int64_t C      = cur->ne[0];
+    const int64_t T      = cur->ne[1];
+    const int64_t K      = weight->ne[0];
+    const int64_t n_seqs = past->ne[2];
+
+    GGML_ASSERT(K >= 2 && weight->ne[1] == C && ggml_nrows(weight) == C);
+    GGML_ASSERT(ggml_nrows(cur) == T && ggml_nrows(past) == C*n_seqs);
+    GGML_ASSERT(past->ne[0] == K - 1 && past->ne[1] == C && T % n_seqs == 0);
+
+    if (dynamic) {
+        GGML_ASSERT(dynamic->type == GGML_TYPE_F32 && dynamic->nb[0] == sizeof(float));
+        GGML_ASSERT(dynamic->ne[0] % K == 0 && C % (dynamic->ne[0]/K) == 0 && dynamic->ne[1] == T && ggml_nrows(dynamic) == T);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C*T + (K - 1)*C*n_seqs);
+
+    ggml_set_op_params_f32(result, 0, scale);
+
+    result->op     = GGML_OP_INKLING2_CONV;
+    result->src[0] = cur;
+    result->src[1] = past;
+    result->src[2] = weight;
+    result->src[3] = dynamic;
 
     return result;
 }

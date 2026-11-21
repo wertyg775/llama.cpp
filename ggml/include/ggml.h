@@ -417,6 +417,7 @@ extern "C" {
         GGML_OP_TOP_K_MASK,
         GGML_OP_INKLING2_CTRL,
         GGML_OP_INKLING2_CLIP,
+        GGML_OP_INKLING2_CONV,
 
         GGML_OP_UNARY,
 
@@ -2529,6 +2530,23 @@ extern "C" {
             struct ggml_tensor  * tau,
             float                 threshold,
             float                 eps);
+
+    // inkling2 causal short convolution with a residual and the new conv state
+    //   cur:     [C, T] f32, T = n_seqs*n_seq_tokens, the tokens of a sequence are adjacent
+    //   past:    [K - 1, C, n_seqs] f32, the last K - 1 inputs of each sequence
+    //   weight:  [K, C] f32
+    //   dynamic: [K*H, T] f32 or NULL, per-head input-dependent taps, channel c is in head c/(C/H)
+    //   x = concat(past, cur) per sequence and channel
+    //   y[c, t] = sum_k x[t + k]*weight[k, c] + sum_lag dynamic[lag, h, t]*x[t + K - 1 - lag]
+    //   result:  1D, [C, T] of (y + cur)*scale, then the new state [K - 1, C, n_seqs] = the last K - 1 x
+    //
+    GGML_API struct ggml_tensor * ggml_inkling2_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * past,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * dynamic,
+            float                 scale);
 
     // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
     //

@@ -4969,6 +4969,47 @@ struct test_inkling2_clip : public test_case {
     }
 };
 
+// GGML_OP_INKLING2_CONV
+struct test_inkling2_conv : public test_case {
+    const int64_t C;
+    const int64_t K;
+    const int64_t n_seqs;
+    const int64_t n_seq_tokens;
+    const int64_t n_heads; // 0: no dynamic taps
+
+    std::string vars() override {
+        return VARS_TO_STR5(C, K, n_seqs, n_seq_tokens, n_heads);
+    }
+
+    test_inkling2_conv(int64_t C = 64, int64_t K = 4, int64_t n_seqs = 1, int64_t n_seq_tokens = 1, int64_t n_heads = 0)
+        : C(C), K(K), n_seqs(n_seqs), n_seq_tokens(n_seq_tokens), n_heads(n_heads) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t T = n_seqs*n_seq_tokens;
+
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T);
+        ggml_set_name(cur, "cur");
+
+        // the past is a channel range of a wider history, as in the model
+        ggml_tensor * history = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K - 1, C + 7, n_seqs);
+        ggml_set_name(history, "history");
+        ggml_tensor * past = ggml_view_3d(ctx, history, K - 1, C, n_seqs, history->nb[1], history->nb[2], 5*history->nb[1]);
+
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, C);
+        ggml_set_name(weight, "weight");
+
+        ggml_tensor * dynamic = nullptr;
+        if (n_heads) {
+            dynamic = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K*n_heads, T);
+            ggml_set_name(dynamic, "dynamic");
+        }
+
+        ggml_tensor * out = ggml_inkling2_conv(ctx, cur, past, weight, dynamic, 1.0f/sqrtf(2*K + 1));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -10910,6 +10951,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true));
+    for (int64_t n_heads : {0, 4}) {
+        for (auto [n_seqs, n_seq_tokens] : std::vector<std::pair<int64_t, int64_t>>{{1, 1}, {3, 1}, {1, 2}, {1, 5}, {2, 70}, {1, 200}}) {
+            test_cases.emplace_back(new test_inkling2_conv(64, 4, n_seqs, n_seq_tokens, n_heads));
+        }
+        test_cases.emplace_back(new test_inkling2_conv(2304, 4, 1, 1, n_heads ? 8 : 0)); // Inkling 2 Mini decode
+        test_cases.emplace_back(new test_inkling2_conv(300, 3, 2, 3, n_heads ? 3 : 0));  // channel count not a multiple of the block
+    }
     for (int scale : {0, 1, 2}) {
         for (int tau : {0, 1, 2}) {
             test_cases.emplace_back(new test_inkling2_clip({128, 4, 3}, scale, tau));

@@ -209,13 +209,27 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         ggml_tensor * state,
         ggml_tensor * history,
         llm_graph_input_rs * inp,
-        int64_t offset) {
+        int64_t offset,
+        int il) {
     const int64_t n_conv       = hparams.n_shortconv_l_cache;
     const int64_t n_channels   = cur->ne[0];
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
     const int64_t n_seqs       = ubatch.n_seqs;
+    const float   scale        = 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1);
 
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
+
+    // the fused op also returns the last n_conv - 1 inputs, the new state
+    if (cparams.fused_inkling2 && cparams.n_rs_seq == 0 && weight->type == GGML_TYPE_F32) {
+        ggml_tensor * res_conv = ggml_inkling2_conv(ctx0, cur, past, weight, dynamic, scale);
+        res->add_fused_node({LLM_FUSED_OP_INKLING2, res_conv, il});
+
+        ggml_tensor * x_new = ggml_view_3d(ctx0, res_conv, n_conv - 1, n_channels, n_seqs,
+                (n_conv - 1)*sizeof(float), (n_conv - 1)*n_channels*sizeof(float), n_channels*n_tokens*sizeof(float));
+        build_conv_state_store(inp, state, x_new, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
+
+        return ggml_view_2d(ctx0, res_conv, n_channels, n_tokens, n_channels*sizeof(float), 0);
+    }
 
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
     x = ggml_concat(ctx0, past, x, 0);
@@ -249,7 +263,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         }
     }
 
-    return ggml_scale(ctx0, ggml_add(ctx0, out, cur), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+    return ggml_scale(ctx0, ggml_add(ctx0, out, cur), scale);
 }
 
 // the fused controller op reads the plain weights and normalizes its inputs itself
@@ -384,9 +398,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     {
         ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
         ggml_tensor * Kcur = convolve(build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
-                is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
+                is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0, ip);
         ggml_tensor * Vcur = convolve(build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
-                is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
+                is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa, ip);
         ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
 
         // full-attention layers scale q and r by the log-scaled positions
@@ -430,7 +444,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 Qcur, Kcur, Vcur, kq_b, sinks_zero, 1.0f/sqrtf(n_embd_head), il);
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
-        cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
+        cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa, ip);
         cb(cur, "attn_out", il);
     }
 
@@ -471,7 +485,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             layer.ffn_gate_exps_s,
             layer.ffn_down_exps_s);
 
-    cur = convolve(cur, layer.ffn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa + n_embd);
+    cur = convolve(cur, layer.ffn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa + n_embd, ip);
     cb(cur, "ffn_out", il);
 
     cur = ggml_add(ctx0, ffn_inp, cur);
