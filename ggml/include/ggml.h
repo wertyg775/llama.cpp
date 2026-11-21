@@ -2536,7 +2536,8 @@ extern "C" {
 
     // inkling2 causal short convolution with a residual and the new conv state
     //   cur:     [C, T] f32, T = n_seqs*n_seq_tokens, the tokens of a sequence are adjacent
-    //   past:    [K - 1, C, n_seqs] f32, the last K - 1 inputs of each sequence
+    //   past:    [K - 1, C, n_seqs] f32, the last K - 1 inputs of each sequence,
+    //            or with ids: the states [n_state, n_cells], the past of sequence q at channel offset `offset` of cell ids[q]
     //   weight:  [K, C] f32
     //   dynamic: [K*H, T] f32 or NULL, per-head input-dependent taps, channel c is in head c/(C/H)
     //   x = concat(past, cur) per sequence and channel
@@ -2551,6 +2552,8 @@ extern "C" {
             struct ggml_tensor  * weight,
             struct ggml_tensor  * dynamic,
             struct ggml_tensor  * residual,
+            struct ggml_tensor  * ids,
+            int64_t               offset,
             float                 scale);
 
     // inkling2 depth mix: attention over the states [blocks, rms_norm(x, eps)] with learned queries

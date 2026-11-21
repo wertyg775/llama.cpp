@@ -232,11 +232,15 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     const int64_t n_seqs       = ubatch.n_seqs;
     const float   scale        = 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1);
 
-    ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
+    // history is either the gathered states [n_conv - 1, n_channels_all, n_seqs], or all cache cells [n_embd_r, n_cells]
+    const bool cells = history->ne[0] == (int64_t) hparams.n_embd_r();
 
     // the fused op also returns the last n_conv - 1 inputs, the new state
     if (cparams.fused_inkling2 && cparams.n_rs_seq == 0 && weight->type == GGML_TYPE_F32) {
-        ggml_tensor * res_conv = ggml_inkling2_conv(ctx0, cur, past, weight, dynamic, residual, scale);
+        ggml_tensor * past = cells ? history :
+            ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
+
+        ggml_tensor * res_conv = ggml_inkling2_conv(ctx0, cur, past, weight, dynamic, residual, cells ? inp->s_copy_main : nullptr, cells ? offset : 0, scale);
         res->add_fused_node({LLM_FUSED_OP_INKLING2, res_conv, il});
 
         ggml_tensor * x_new = ggml_view_3d(ctx0, res_conv, n_conv - 1, n_channels, n_seqs,
@@ -245,6 +249,9 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
         return ggml_view_2d(ctx0, res_conv, n_channels, n_tokens, n_channels*sizeof(float), 0);
     }
+    GGML_ASSERT(!cells);
+
+    ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
     x = ggml_concat(ctx0, past, x, 0);
@@ -369,9 +376,21 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         return ggml_view_2d(ctx0, t, n_embd, n_tokens, t->nb[2], j*t->nb[1]);
     };
 
-    ggml_tensor * state   = recr->mctx->get_r_l(il);
-    ggml_tensor * history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
-    history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
+    ggml_tensor * state = recr->mctx->get_r_l(il);
+
+    // the fused convolutions of a single sequence read the past straight from its cache cell, so nothing is gathered
+    bool conv_cells = cparams.fused_inkling2 && cparams.n_rs_seq == 0 && ubatch.n_seqs == 1;
+    for (ggml_tensor * w : {layer.attn_k_conv, layer.attn_v_conv, layer.attn_post_conv, layer.ffn_post_conv}) {
+        conv_cells = conv_cells && w->type == GGML_TYPE_F32;
+    }
+
+    ggml_tensor * history;
+    if (conv_cells) {
+        history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs, [](ggml_context *, ggml_tensor * states, ggml_tensor *) { return states; });
+    } else {
+        history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
+        history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
+    }
 
     ggml_tensor * inpSA    = cur;
     ggml_tensor * inp_norm = cparams.fused_inkling2 ? nullptr : ggml_rms_norm(ctx0, cur, 1e-6f);

@@ -11844,13 +11844,15 @@ static void ggml_compute_forward_inkling2_conv_f32(
     const ggml_tensor * weight  = dst->src[2];
     const ggml_tensor * dynamic  = dst->src[3];
     const ggml_tensor * residual = dst->src[4];
+    const ggml_tensor * ids      = dst->src[5];
 
-    const float scale = ggml_get_op_params_f32(dst, 0);
+    const float   scale  = ggml_get_op_params_f32(dst, 0);
+    const int64_t offset = ggml_get_op_params_i32(dst, 1);
 
     const int64_t C      = cur->ne[0];
     const int64_t T      = cur->ne[1];
     const int64_t K      = weight->ne[0];
-    const int64_t n_seqs = past->ne[2];
+    const int64_t n_seqs = ids ? ids->ne[0] : past->ne[2];
     const int64_t n_st   = T/n_seqs;
     const int64_t n_cph  = dynamic ? C/(dynamic->ne[0]/K) : 1; // channels per head
 
@@ -11863,6 +11865,10 @@ static void ggml_compute_forward_inkling2_conv_f32(
 
     // input k of channel c of sequence q: the past for k < K - 1, else token k - (K - 1) of the sequence
     auto x = [&](int64_t c, int64_t q, int64_t k) {
+        if (k < K - 1 && ids) {
+            const int32_t cell = ((const int32_t *) ids->data)[q];
+            return ((const float *) ((const char *) past->data + cell*past->nb[1]))[(offset + c)*(K - 1) + k];
+        }
         if (k < K - 1) {
             return *(const float *) ((const char *) past->data + k*past->nb[0] + c*past->nb[1] + q*past->nb[2]);
         }

@@ -4977,13 +4977,23 @@ struct test_inkling2_conv : public test_case {
     const int64_t n_seq_tokens;
     const int64_t n_heads; // 0: no dynamic taps
     const bool    residual;
+    const bool    cells;   // read the past from cache cells by id
+    const bool    store;   // copy the new state into a cache, as the model does (a backend can fuse the copy)
 
     std::string vars() override {
-        return VARS_TO_STR6(C, K, n_seqs, n_seq_tokens, n_heads, residual);
+        return VARS_TO_STR8(C, K, n_seqs, n_seq_tokens, n_heads, residual, cells, store);
     }
 
-    test_inkling2_conv(int64_t C = 64, int64_t K = 4, int64_t n_seqs = 1, int64_t n_seq_tokens = 1, int64_t n_heads = 0, bool residual = false)
-        : C(C), K(K), n_seqs(n_seqs), n_seq_tokens(n_seq_tokens), n_heads(n_heads), residual(residual) {}
+    bool run_whole_graph() override { return store; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INKLING2_CONV";
+    }
+
+    test_inkling2_conv(int64_t C = 64, int64_t K = 4, int64_t n_seqs = 1, int64_t n_seq_tokens = 1, int64_t n_heads = 0, bool residual = false,
+            bool cells = false, bool store = false)
+        : C(C), K(K), n_seqs(n_seqs), n_seq_tokens(n_seq_tokens), n_heads(n_heads), residual(residual), cells(cells), store(store) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t T = n_seqs*n_seq_tokens;
@@ -4991,10 +5001,19 @@ struct test_inkling2_conv : public test_case {
         ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T);
         ggml_set_name(cur, "cur");
 
-        // the past is a channel range of a wider history, as in the model
-        ggml_tensor * history = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K - 1, C + 7, n_seqs);
-        ggml_set_name(history, "history");
-        ggml_tensor * past = ggml_view_3d(ctx, history, K - 1, C, n_seqs, history->nb[1], history->nb[2], 5*history->nb[1]);
+        // the past is a channel range of a wider history, as in the model, or of the cache cells
+        ggml_tensor * past;
+        ggml_tensor * ids = nullptr;
+        if (cells) {
+            past = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (K - 1)*(C + 7), n_seqs + 3);
+            ggml_set_name(past, "states");
+            ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+            ggml_set_name(ids, "ids");
+        } else {
+            ggml_tensor * history = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K - 1, C + 7, n_seqs);
+            ggml_set_name(history, "history");
+            past = ggml_view_3d(ctx, history, K - 1, C, n_seqs, history->nb[1], history->nb[2], 5*history->nb[1]);
+        }
 
         ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, C);
         ggml_set_name(weight, "weight");
@@ -5011,9 +5030,33 @@ struct test_inkling2_conv : public test_case {
             ggml_set_name(res, "residual");
         }
 
-        ggml_tensor * out = ggml_inkling2_conv(ctx, cur, past, weight, dynamic, res, 1.0f/sqrtf(2*K + 1));
+        ggml_tensor * out = ggml_inkling2_conv(ctx, cur, past, weight, dynamic, res, ids, cells ? 5 : 0, 1.0f/sqrtf(2*K + 1));
+
+        if (store) {
+            ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (K - 1)*(C + 9), n_seqs + 2);
+            ggml_set_name(cache, "cache");
+            ggml_tensor * state = ggml_view_2d(ctx, out, (K - 1)*C, n_seqs, (K - 1)*C*sizeof(float), C*T*sizeof(float));
+            ggml_tensor * cell  = ggml_view_2d(ctx, cache, (K - 1)*C, n_seqs, cache->nb[1], 2*(K - 1)*sizeof(float) + cache->nb[1]);
+            out = ggml_scale(ctx, ggml_cpy(ctx, state, cell), 1.0f);
+        }
+
         ggml_set_name(out, "out");
         return out;
+    }
+
+    // distinct cells, in a shuffled order
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(42);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> cell(n_seqs + 3);
+                std::iota(cell.begin(), cell.end(), 0);
+                std::shuffle(cell.begin(), cell.end(), rng);
+                ggml_backend_tensor_set(t, cell.data(), 0, n_seqs*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -11145,6 +11188,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_inkling2_conv(2304, 4, 1, 1, 0, true));
     test_cases.emplace_back(new test_inkling2_conv(64, 4, 2, 70, 4, true));
+    for (int64_t n_heads : {0, 4}) {
+        for (auto [n_seqs, n_seq_tokens] : std::vector<std::pair<int64_t, int64_t>>{{1, 1}, {3, 1}, {1, 5}, {1, 200}, {2, 70}}) {
+            test_cases.emplace_back(new test_inkling2_conv(64, 4, n_seqs, n_seq_tokens, n_heads, n_heads > 0, true));
+            test_cases.emplace_back(new test_inkling2_conv(64, 4, n_seqs, n_seq_tokens, n_heads, n_heads > 0, true, true));
+            test_cases.emplace_back(new test_inkling2_conv(64, 4, n_seqs, n_seq_tokens, n_heads, n_heads > 0, false, true));
+        }
+    }
+    test_cases.emplace_back(new test_inkling2_conv(2304, 4, 1, 1, 0, true, true, true)); // Inkling 2 Mini decode
     for (int scale : {0, 1, 2}) {
         for (int tau : {0, 1, 2}) {
             test_cases.emplace_back(new test_inkling2_clip({128, 4, 3}, scale, tau));

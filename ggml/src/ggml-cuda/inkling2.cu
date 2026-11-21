@@ -263,9 +263,10 @@ static constexpr int INKLING2_CONV_CHUNK = 64;
 template <bool has_dynamic, bool has_residual>
 static __global__ void inkling2_conv_f32(
         const float * __restrict__ cur, const float * __restrict__ past, const float * __restrict__ weight, const float * __restrict__ dynamic,
-        const float * __restrict__ residual, float * __restrict__ y, float * __restrict__ state, const int C, const int K, const int n_st, const int n_cph,
+        const float * __restrict__ residual, const int32_t * __restrict__ ids, float * __restrict__ y, float * state,
+        const int C, const int K, const int n_st, const int n_cph, const int offset,
         const int64_t s_cur1, const int64_t s_past0, const int64_t s_past1, const int64_t s_past2, const int64_t s_dyn1, const int64_t s_res1,
-        const float scale) {
+        const int64_t s_state_q, const float scale) {
     const int c = blockIdx.x*blockDim.x + threadIdx.x;
     if (c >= C) {
         return;
@@ -274,7 +275,8 @@ static __global__ void inkling2_conv_f32(
     const int i0 = blockIdx.z*INKLING2_CONV_CHUNK;
     const int i1 = min(i0 + INKLING2_CONV_CHUNK, n_st);
 
-    const float * xp = past + c*s_past1 + q*s_past2;
+    // with ids the past is read from cell ids[q] of the states, at channel offset `offset`
+    const float * xp = ids ? past + ids[q]*s_past1 + (int64_t) (offset + c)*(K - 1) : past + c*s_past1 + q*s_past2;
     const float * xc = cur  + c + (int64_t) q*n_st*s_cur1;
     const float * w  = weight + (int64_t) c*K;
 
@@ -304,25 +306,27 @@ static __global__ void inkling2_conv_f32(
 
     if (i1 == n_st) {
         for (int k = 0; k < K - 1; ++k) {
-            state[((int64_t) q*C + c)*(K - 1) + k] = x(n_st + k);
+            state[q*s_state_q + (int64_t) c*(K - 1) + k] = x(n_st + k);
         }
     }
 }
 
-void ggml_cuda_op_inkling2_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_op_inkling2_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_dst, int64_t s_state_q) {
     const ggml_tensor * cur     = dst->src[0];
     const ggml_tensor * past    = dst->src[1];
     const ggml_tensor * weight  = dst->src[2];
     const ggml_tensor * dynamic  = dst->src[3];
     const ggml_tensor * residual = dst->src[4];
+    const ggml_tensor * ids      = dst->src[5];
 
     float scale;
     memcpy(&scale, dst->op_params, sizeof(float));
+    const int offset = ggml_get_op_params_i32(dst, 1);
 
     const int C      = cur->ne[0];
     const int T      = cur->ne[1];
     const int K      = weight->ne[0];
-    const int n_seqs = past->ne[2];
+    const int n_seqs = ids ? ids->ne[0] : past->ne[2];
     const int n_st   = T/n_seqs;
     const int n_cph  = dynamic ? C/(dynamic->ne[0]/K) : 1;
 
@@ -333,10 +337,68 @@ void ggml_cuda_op_inkling2_conv(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     auto kernel = dynamic ? (residual ? inkling2_conv_f32<true,  true> : inkling2_conv_f32<true,  false>)
                           : (residual ? inkling2_conv_f32<false, true> : inkling2_conv_f32<false, false>);
+    float * state = state_dst ? state_dst : y + (int64_t) C*T;
+    if (!state_dst) {
+        s_state_q = (int64_t) C*(K - 1);
+    }
+
     kernel<<<blocks, n_threads, 0, ctx.stream()>>>((const float *) cur->data, (const float *) past->data, (const float *) weight->data,
-            dynamic ? (const float *) dynamic->data : nullptr, residual ? (const float *) residual->data : nullptr, y, y + (int64_t) C*T, C, K, n_st, n_cph,
-            cur->nb[1]/sizeof(float), past->nb[0]/sizeof(float), past->nb[1]/sizeof(float), past->nb[2]/sizeof(float),
-            dynamic ? dynamic->nb[1]/sizeof(float) : 0, residual ? residual->nb[1]/sizeof(float) : 0, scale);
+            dynamic ? (const float *) dynamic->data : nullptr, residual ? (const float *) residual->data : nullptr,
+            ids ? (const int32_t *) ids->data : nullptr, y, state, C, K, n_st, n_cph, offset,
+            cur->nb[1]/sizeof(float), past->nb[0]/sizeof(float), past->nb[1]/sizeof(float), ids ? 0 : past->nb[2]/sizeof(float),
+            dynamic ? dynamic->nb[1]/sizeof(float) : 0, residual ? residual->nb[1]/sizeof(float) : 0, s_state_q, scale);
+}
+
+// a conv followed by the copy of its new state into the cache can write the state there directly, when one block reads
+// the past and writes the state of a sequence (one token chunk), or the past is not read from the cache
+int ggml_cuda_inkling2_conv_state_fusion(const ggml_cgraph * cgraph, int node_idx, float ** state_dst, int64_t * s_state_q) {
+    const ggml_tensor * conv = cgraph->nodes[node_idx];
+    if (conv->op != GGML_OP_INKLING2_CONV || (conv->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    const ggml_tensor * ids    = conv->src[5];
+    const int64_t       C      = conv->src[0]->ne[0];
+    const int64_t       T      = conv->src[0]->ne[1];
+    const int64_t       K      = conv->src[2]->ne[0];
+    const int64_t       n_seqs = ids ? ids->ne[0] : conv->src[1]->ne[2];
+
+    if (ids && T/n_seqs > INKLING2_CONV_CHUNK) {
+        return 0;
+    }
+
+    const ggml_tensor * cpy  = nullptr;
+    int                 skip = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && cpy == nullptr; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_is_empty(n) || n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE || n->op == GGML_OP_NONE) {
+            continue;
+        }
+        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        cpy  = n;
+        skip = j - node_idx;
+    }
+    if (cpy == nullptr) {
+        return 0;
+    }
+
+    // src: the state tail of this conv; dst: [(K - 1)*C, n_seqs] cache rows
+    const ggml_tensor * src = cpy->src[0];
+    const ggml_tensor * dst = cpy->src[1];
+    if (src->view_src != conv || src->view_offs != (size_t) (C*T*sizeof(float)) || !ggml_is_contiguous(src) ||
+        ggml_nelements(src) != (K - 1)*C*n_seqs) {
+        return 0;
+    }
+    if (dst->type != GGML_TYPE_F32 || dst->data == nullptr || dst->ne[0] != (K - 1)*C || dst->ne[1] != n_seqs ||
+        dst->ne[2] != 1 || dst->ne[3] != 1 || dst->nb[0] != sizeof(float) || dst->nb[1] % sizeof(float) != 0) {
+        return 0;
+    }
+
+    *state_dst = (float *) dst->data;
+    *s_state_q = dst->nb[1]/sizeof(float);
+    return skip;
 }
 
 // the most blocks a mix kernel keeps in registers
