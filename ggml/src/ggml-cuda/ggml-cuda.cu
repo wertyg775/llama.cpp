@@ -1766,6 +1766,9 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
 }
 
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+#if defined(GGML_USE_HIP)
+    ggml_hip_unregister_host_alloc(buffer->context);
+#endif
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
@@ -1794,6 +1797,10 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
         // fallback to cpu buffer
         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
     }
+
+#if defined(GGML_USE_HIP)
+    ggml_hip_register_host_alloc(ptr, size);
+#endif
 
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
     buffer->buft = buft;
@@ -3223,6 +3230,12 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+#if defined(GGML_USE_HIP)
+    if (ggml_hip_copy_pinned_async(cuda_ctx->device, (char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream())) {
+        return;
+    }
+#endif
+
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -3231,6 +3244,12 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+#if defined(GGML_USE_HIP)
+    if (ggml_hip_copy_pinned_async(cuda_ctx->device, data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream())) {
+        return;
+    }
+#endif
 
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }

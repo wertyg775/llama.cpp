@@ -3,6 +3,118 @@
 #include "ggml-cpp.h"
 
 #include <climits>
+#include <mutex>
+#include <vector>
+
+#if defined(GGML_USE_HIP)
+struct ggml_hip_host_alloc_entry {
+    uintptr_t host;
+    uintptr_t dev;
+    size_t    size;
+};
+
+static std::mutex                              ggml_hip_host_allocs_mutex;
+static std::vector<ggml_hip_host_alloc_entry>  ggml_hip_host_allocs;
+
+void ggml_hip_register_host_alloc(void * host_ptr, size_t size) {
+    if (host_ptr == nullptr || size == 0) {
+        return;
+    }
+    void * dev_ptr = nullptr;
+    if (cudaHostGetDevicePointer(&dev_ptr, host_ptr, 0) != cudaSuccess || dev_ptr == nullptr) {
+        (void) cudaGetLastError();
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ggml_hip_host_allocs_mutex);
+    ggml_hip_host_allocs.push_back({ (uintptr_t) host_ptr, (uintptr_t) dev_ptr, size });
+}
+
+void ggml_hip_unregister_host_alloc(void * host_ptr) {
+    if (host_ptr == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ggml_hip_host_allocs_mutex);
+    const uintptr_t addr = (uintptr_t) host_ptr;
+    for (size_t i = 0; i < ggml_hip_host_allocs.size(); ++i) {
+        if (ggml_hip_host_allocs[i].host == addr) {
+            ggml_hip_host_allocs.erase(ggml_hip_host_allocs.begin() + i);
+            return;
+        }
+    }
+}
+
+static __global__ void ggml_hip_copy_bytes_kernel(unsigned char * __restrict__ dst, const unsigned char * __restrict__ src, size_t size) {
+    const size_t tid    = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t) gridDim.x * blockDim.x;
+    const uintptr_t align = (uintptr_t) dst | (uintptr_t) src;
+
+    size_t tail = 0;
+    if ((align & 15) == 0) {
+        const size_t n16 = size >> 4;
+        uint4 * __restrict__ d16 = (uint4 *) dst;
+        const uint4 * __restrict__ s16 = (const uint4 *) src;
+        for (size_t i = tid; i < n16; i += stride) {
+            d16[i] = s16[i];
+        }
+        tail = n16 << 4;
+    } else if ((align & 3) == 0) {
+        const size_t n4 = size >> 2;
+        uint32_t * __restrict__ d4 = (uint32_t *) dst;
+        const uint32_t * __restrict__ s4 = (const uint32_t *) src;
+        for (size_t i = tid; i < n4; i += stride) {
+            d4[i] = s4[i];
+        }
+        tail = n4 << 2;
+    }
+
+    for (size_t i = tail + tid; i < size; i += stride) {
+        dst[i] = src[i];
+    }
+}
+
+bool ggml_hip_copy_pinned_async(int device, void * dst, const void * src, size_t size, cudaMemcpyKind kind, cudaStream_t stream) {
+    // keep large transfers (such as prefill weight uploads) on SDMA
+    constexpr size_t max_kernel_copy_bytes = 2 * 1024 * 1024;
+    if (size == 0) {
+        return true;
+    }
+    if (size > max_kernel_copy_bytes) {
+        return false;
+    }
+    if (kind != cudaMemcpyHostToDevice && kind != cudaMemcpyDeviceToHost) {
+        return false;
+    }
+
+    const uintptr_t host_addr = kind == cudaMemcpyHostToDevice ? (uintptr_t) src : (uintptr_t) dst;
+    uintptr_t host_dev_addr = 0;
+    {
+        std::lock_guard<std::mutex> lock(ggml_hip_host_allocs_mutex);
+        for (const auto & e : ggml_hip_host_allocs) {
+            if (host_addr >= e.host && host_addr - e.host <= e.size && size <= e.size - (host_addr - e.host)) {
+                host_dev_addr = e.dev + (host_addr - e.host);
+                break;
+            }
+        }
+    }
+    if (host_dev_addr == 0) {
+        return false;
+    }
+
+    unsigned char * k_dst = kind == cudaMemcpyHostToDevice ? (unsigned char *) dst : (unsigned char *) host_dev_addr;
+    const unsigned char * k_src = kind == cudaMemcpyHostToDevice ? (const unsigned char *) host_dev_addr : (const unsigned char *) src;
+
+    const uintptr_t align = (uintptr_t) k_dst | (uintptr_t) k_src;
+    const size_t elem_size = (align & 15) == 0 ? 16 : ((align & 3) == 0 ? 4 : 1);
+    const size_t n_elems = (size + elem_size - 1) / elem_size;
+    constexpr int threads = 256;
+    const unsigned int blocks = (unsigned int) std::min<size_t>(256, std::max<size_t>(1, (n_elems + threads - 1) / threads));
+
+    ggml_cuda_set_device(device);
+    ggml_hip_copy_bytes_kernel<<<blocks, threads, 0, stream>>>(k_dst, k_src, size);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+#endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 struct ggml_cuda_batch_copy_descriptor {
