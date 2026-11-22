@@ -1091,24 +1091,25 @@ static __device__ __forceinline__ void inkling2_fwht_smem(float * x, const int d
     if (n_rot <= 0) {
         return;
     }
+    constexpr int pws = ggml_cuda_get_physical_warp_size();
     const int i = threadIdx.x;
-    if (n_rot == 2*WARP_SIZE) {
-        const int warp = i / WARP_SIZE;
-        const int lane = i % WARP_SIZE;
+    if (n_rot == 2*pws) {
+        const int warp = i / pws;
+        const int lane = i % pws;
         const int off  = warp*n_rot;
         if (off < d) {
             const float inv = rsqrtf((float) n_rot);
             float a = x[off + lane]*inv;
-            float b = x[off + lane + WARP_SIZE]*inv;
+            float b = x[off + lane + pws]*inv;
 #pragma unroll
-            for (int h = 1; h < WARP_SIZE; h *= 2) {
-                const float a2 = ggml_cuda_shfl_xor(a, h, WARP_SIZE);
-                const float b2 = ggml_cuda_shfl_xor(b, h, WARP_SIZE);
+            for (int h = 1; h < pws; h *= 2) {
+                const float a2 = ggml_cuda_shfl_xor(a, h, pws);
+                const float b2 = ggml_cuda_shfl_xor(b, h, pws);
                 a = (lane & h) == 0 ? a + a2 : a2 - a;
                 b = (lane & h) == 0 ? b + b2 : b2 - b;
             }
-            x[off + lane]             = a + b;
-            x[off + lane + WARP_SIZE] = a - b;
+            x[off + lane]       = a + b;
+            x[off + lane + pws] = a - b;
         }
         __syncthreads();
         return;
@@ -1219,9 +1220,9 @@ static __global__ void inkling2_attn_f32(
     sum += expf(0.0f - mx);
     __syncthreads();
 
-    for (int i = warp; i < d; i += nw) {
-        float acc = 0.0f;
-        if constexpr (v_trans) {
+    if constexpr (v_trans) {
+        for (int i = warp; i < d; i += nw) {
+            float acc = 0.0f;
             const T * vi = v + hk*s_v1 + i*s_v2;
             int j = lane*vv;
             for (; j + vv <= n_kv; j += WARP_SIZE*vv) {
@@ -1236,22 +1237,47 @@ static __global__ void inkling2_attn_f32(
             for (const int jt = j; j < n_kv && j < jt + vv; ++j) {
                 acc += lg[j]*ggml_cuda_cast<float>(vi[j]);
             }
-        } else {
-            for (int j = lane; j < n_kv; j += WARP_SIZE) {
-                acc += lg[j]*ggml_cuda_cast<float>(v[i + hk*s_v1 + j*s_v2]);
+            acc = warp_reduce_sum(acc);
+            if (lane == 0) {
+                if (n_rot_v > 0) {
+                    qs[i] = acc/sum;
+                } else {
+                    const float gt = gate[h*d + i];
+                    dst[h*d + i] = (acc/sum)*(1.0f/(1.0f + expf(-gt)));
+                }
             }
         }
-        acc = warp_reduce_sum(acc);
-        if (lane == 0) {
-            if (n_rot_v > 0) {
-                qs[i] = acc/sum;
-            } else {
-                const float gt = gate[h*d + i];
-                dst[h*d + i] = (acc/sum)*(1.0f/(1.0f + expf(-gt)));
+        if (n_rot_v > 0) {
+            __syncthreads();
+            inkling2_fwht_smem(qs, d, n_rot_v);
+            if (threadIdx.x < d) {
+                const float gt = gate[h*d + threadIdx.x];
+                dst[h*d + threadIdx.x] = qs[threadIdx.x]*(1.0f/(1.0f + expf(-gt)));
             }
         }
-    }
-    if (n_rot_v > 0) {
+    } else {
+        // coalesced V sum: d consecutive threads cover one V row, ng_v groups walk the keys in parallel
+        const int ng_v = blockDim.x / d;
+        const int vg   = threadIdx.x / d;
+        const int vi_i = threadIdx.x % d;
+        float acc = 0.0f;
+        if (vg < ng_v) {
+            for (int j = vg; j < n_kv; j += ng_v) {
+                acc += lg[j]*ggml_cuda_cast<float>(v[vi_i + hk*s_v1 + j*s_v2]);
+            }
+        }
+        __shared__ float vbuf[512];
+        if (vg < ng_v) {
+            vbuf[vg*d + vi_i] = acc;
+        }
+        __syncthreads();
+        if (threadIdx.x < d) {
+            float total = 0.0f;
+            for (int g = 0; g < ng_v; ++g) {
+                total += vbuf[g*d + threadIdx.x];
+            }
+            qs[threadIdx.x] = total/sum;
+        }
         __syncthreads();
         inkling2_fwht_smem(qs, d, n_rot_v);
         if (threadIdx.x < d) {
@@ -1364,22 +1390,23 @@ static __global__ void inkling2_attn_q8_0_f32(
         }
     }
 
-    __shared__ float vbuf[512];
-#pragma unroll
-    for (int p = 0; p < 4; ++p) {
-        if (vg < ng_v) {
-            vbuf[vg*d4 + c] = acc[p];
-        }
-        __syncthreads();
-        if (threadIdx.x < d4) {
-            float total = 0.0f;
-            for (int g = 0; g < ng_v; ++g) {
-                total += vbuf[g*d4 + threadIdx.x];
-            }
-            qs[4*threadIdx.x + p] = total/sum;
-        }
-        __syncthreads();
+    __shared__ float vbuf[2048];
+    if (vg < ng_v) {
+        float * vp = vbuf + vg*d + 4*c;
+        vp[0] = acc[0];
+        vp[1] = acc[1];
+        vp[2] = acc[2];
+        vp[3] = acc[3];
     }
+    __syncthreads();
+    if (threadIdx.x < d) {
+        float total = 0.0f;
+        for (int g = 0; g < ng_v; ++g) {
+            total += vbuf[g*d + threadIdx.x];
+        }
+        qs[threadIdx.x] = total/sum;
+    }
+    __syncthreads();
 
     inkling2_fwht_smem(qs, d, n_rot_v);
     if (threadIdx.x < d) {
