@@ -662,6 +662,57 @@ static bool inkling2_ranges_overlap(const void * a, size_t na, const void * b, s
     return a0 < b1 && b0 < a1;
 }
 
+// before allocation: the last node of a conv, conv, (clip) group that ggml_cuda_inkling2_conv_batch_fusion may run as one
+// launch, or -1. The caller keeps the inputs of the group alive until that node, so that they do not alias its outputs.
+int ggml_cuda_inkling2_conv_batch_group(const ggml_cgraph * cgraph, int node_idx) {
+    auto single_chunk = [](const ggml_tensor * conv) {
+        const ggml_tensor * ids    = conv->src[5];
+        const int64_t       T      = conv->src[0]->ne[1];
+        const int64_t       n_seqs = ids ? ids->ne[0] : conv->src[1]->ne[2];
+        return n_seqs == 1 && T <= INKLING2_CONV_CHUNK;
+    };
+    auto next = [&](int start) {
+        for (int j = start; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (ggml_is_empty(n) || n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_PERMUTE ||
+                n->op == GGML_OP_TRANSPOSE || n->op == GGML_OP_NONE || n->op == GGML_OP_CPY) {
+                continue;
+            }
+            return j;
+        }
+        return -1;
+    };
+    // no data pointers yet: compare the root tensors only
+    auto depends = [](const ggml_tensor * consumer, const ggml_tensor * producer) {
+        const ggml_tensor * prod_root = producer->view_src ? producer->view_src : producer;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = consumer->src[s];
+            if (src && (src->view_src ? src->view_src : src) == prod_root) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const ggml_tensor * conv0 = cgraph->nodes[node_idx];
+    if (conv0->op != GGML_OP_INKLING2_CONV || !single_chunk(conv0)) {
+        return -1;
+    }
+    const int idx1 = next(node_idx + 1);
+    if (idx1 < 0 || cgraph->nodes[idx1]->op != GGML_OP_INKLING2_CONV) {
+        return -1;
+    }
+    const ggml_tensor * conv1 = cgraph->nodes[idx1];
+    if (!single_chunk(conv1) || depends(conv1, conv0)) {
+        return -1;
+    }
+    const int idx2 = next(idx1 + 1);
+    if (idx2 >= 0 && cgraph->nodes[idx2]->op == GGML_OP_INKLING2_CLIP &&
+        !depends(cgraph->nodes[idx2], conv0) && !depends(cgraph->nodes[idx2], conv1)) {
+        return idx2;
+    }
+    return idx1;
+}
+
 int ggml_cuda_inkling2_conv_batch_fusion(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * conv0 = cgraph->nodes[node_idx];
     if (conv0->op != GGML_OP_INKLING2_CONV) {

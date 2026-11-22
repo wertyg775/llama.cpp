@@ -5818,6 +5818,31 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
             }
 
+            // inkling2 conv batch fusion runs two convs and a clip concurrently: keep all their inputs alive to the end
+            if (cgraph->nodes[i]->op == GGML_OP_INKLING2_CONV) {
+                const int last = ggml_cuda_inkling2_conv_batch_group(cgraph, i);
+                if (last > i) {
+                    // the conv inputs are often views (of the fused projection output): keep their parents alive too
+                    for (int j = i; j <= last; ++j) {
+                        ggml_tensor * n = cgraph->nodes[j];
+                        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                            ggml_tensor * src = n->src[s];
+                            if (src) {
+                                params->add_alloc_dep(params->user_data, src, cgraph->nodes[last]);
+                                if (src->view_src) {
+                                    params->add_alloc_dep(params->user_data, src->view_src, cgraph->nodes[last]);
+                                }
+                            }
+                        }
+                        if (j < last) {
+                            params->add_alloc_dep(params->user_data, n, cgraph->nodes[last]);
+                        }
+                    }
+                    i = last;
+                    continue;
+                }
+            }
+
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
