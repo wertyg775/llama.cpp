@@ -4,6 +4,12 @@ bool ggml_cuda_inkling2_ctrl_supported(const ggml_tensor * op);
 
 void ggml_cuda_op_inkling2_ctrl(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// before allocation: the last node of a run of independent ctrl ops starting at node_idx, or -1
+int ggml_cuda_inkling2_ctrl_batch_group(const ggml_cgraph * cgraph, int node_idx);
+
+// run such a run of ctrl ops in one down and one up launch; returns nodes to skip or 0
+int ggml_cuda_inkling2_ctrl_batch_fusion(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
+
 void ggml_cuda_op_inkling2_clip(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // state_dst: write the new state there (a cache view, s_state_q floats per sequence) instead of the tail of dst

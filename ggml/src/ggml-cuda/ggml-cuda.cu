@@ -4580,6 +4580,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // inkling2 ctrl ops of independent inputs: one launch each for the down and up halves
+    if (node->op == GGML_OP_INKLING2_CTRL) {
+        const int ctrl_skip = ggml_cuda_inkling2_ctrl_batch_fusion(*cuda_ctx, cgraph, i);
+        if (ctrl_skip > 0) {
+            return ctrl_skip;
+        }
+    }
+
     // inkling2 proj ops of independent inputs: one launch
     if (node->op == GGML_OP_INKLING2_PROJ) {
         const int proj_skip = ggml_cuda_inkling2_proj_batch_fusion(*cuda_ctx, cgraph, i);
@@ -5846,9 +5854,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 continue;
             }
 
-            // inkling2 proj batch: the proj ops run concurrently, keep all their inputs alive to the end
-            if (cgraph->nodes[i]->op == GGML_OP_INKLING2_PROJ) {
-                const int last = ggml_cuda_inkling2_proj_batch_group(cgraph, i);
+            // inkling2 proj and ctrl batches: the ops run concurrently, keep all their inputs alive to the end
+            if (cgraph->nodes[i]->op == GGML_OP_INKLING2_PROJ || cgraph->nodes[i]->op == GGML_OP_INKLING2_CTRL) {
+                const int last = cgraph->nodes[i]->op == GGML_OP_INKLING2_PROJ ? ggml_cuda_inkling2_proj_batch_group(cgraph, i)
+                                                                               : ggml_cuda_inkling2_ctrl_batch_group(cgraph, i);
                 if (last > i) {
                     for (int j = i; j <= last; ++j) {
                         ggml_tensor * n = cgraph->nodes[j];

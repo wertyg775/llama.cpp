@@ -23,19 +23,41 @@ static __device__ __forceinline__ void inkling2_load(const T * p, float * dst) {
     }
 }
 
-// g[i, t] = down[i, :n].cur[t]/rms(cur[t]) + down[i, n:].msg[t]/rms(msg[t]), one block per (i, t)
+// one loop control op; up to INKLING2_CTRL_MAX of them run in one launch (blockIdx.z)
+static constexpr int INKLING2_CTRL_MAX = 4;
+
+struct inkling2_ctrl_args {
+    const float * cur;
+    const float * msg;
+    const void  * down;
+    const void  * gain;
+    const void  * forget;
+    float       * g;
+    float       * dst;
+    int64_t       s_cur, s_msg, s_down, s_gain, s_forget, s_dst;
+};
+
+struct inkling2_ctrl_batch {
+    inkling2_ctrl_args a[INKLING2_CTRL_MAX];
+};
+
+static bool inkling2_aligned(const void * p, size_t stride) {
+    return (uintptr_t) p % 16 == 0 && stride % 16 == 0;
+}
+
+// g[i, t] = down[i, :n].cur[t]/rms(cur[t]) + down[i, n:].msg[t]/rms(msg[t]), one block per (i, t, op)
 template <typename T, bool vec>
-static __global__ void inkling2_ctrl_down(
-        const float * __restrict__ cur, const float * __restrict__ msg, const T * __restrict__ down, float * __restrict__ g,
-        const int n, const int r, const int64_t s_cur, const int64_t s_msg, const int64_t s_down, const float eps) {
+static __global__ void inkling2_ctrl_down(const inkling2_ctrl_batch bt, const int n, const int r, const float eps) {
     constexpr int v = vec ? 16/sizeof(T) : 1;
+
+    const inkling2_ctrl_args & p = bt.a[blockIdx.z];
 
     const int i = blockIdx.x;
     const int t = blockIdx.y;
 
-    const float * c = cur  + t*s_cur;
-    const float * m = msg  + t*s_msg;
-    const T     * w = down + i*s_down;
+    const float * c = p.cur + t*p.s_cur;
+    const float * m = p.msg + t*p.s_msg;
+    const T     * w = (const T *) p.down + i*p.s_down;
 
     float2 ss  = make_float2(0.0f, 0.0f);
     float2 dot = make_float2(0.0f, 0.0f);
@@ -64,24 +86,25 @@ static __global__ void inkling2_ctrl_down(
     dot = block_reduce<block_reduce_method::SUM>(dot, buf_dot);
 
     if (threadIdx.x == 0) {
-        g[t*r + i] = dot.x*rsqrtf(ss.x/n + eps) + dot.y*rsqrtf(ss.y/n + eps);
+        p.g[t*r + i] = dot.x*rsqrtf(ss.x/n + eps) + dot.y*rsqrtf(ss.y/n + eps);
     }
 }
 
-// dst[j, t] = cur - cur*tanh(forget[j].g[t]) + msg*tanh(gain[j].g[t]), INKLING2_CTRL_UP_LANES lanes per (j, t)
+// dst[j, t] = cur - cur*tanh(forget[j].g[t]) + msg*tanh(gain[j].g[t]), INKLING2_CTRL_UP_LANES lanes per (j, t, op)
 template <typename T, bool vec>
-static __global__ void inkling2_ctrl_up(
-        const float * __restrict__ cur, const float * __restrict__ msg, const T * __restrict__ gain, const T * __restrict__ forget,
-        const float * __restrict__ g, float * __restrict__ dst, const int n, const int r,
-        const int64_t s_cur, const int64_t s_msg, const int64_t s_gain, const int64_t s_forget, const int64_t s_dst) {
+static __global__ void inkling2_ctrl_up(const inkling2_ctrl_batch bt, const int n, const int r) {
     constexpr int v     = vec ? 16/sizeof(T) : 1;
     constexpr int lanes = INKLING2_CTRL_UP_LANES;
+
+    const inkling2_ctrl_args & p = bt.a[blockIdx.z];
+    const T * gain   = (const T *) p.gain;
+    const T * forget = (const T *) p.forget;
 
     extern __shared__ float g_s[];
 
     const int t = blockIdx.y;
     for (int k = threadIdx.x; k < r; k += blockDim.x) {
-        g_s[k] = g[t*r + k];
+        g_s[k] = p.g[t*r + k];
     }
     __syncthreads();
 
@@ -95,8 +118,8 @@ static __global__ void inkling2_ctrl_up(
         for (int k = lane*v; k < r; k += lanes*v) {
             float wf[v];
             float wa[v];
-            inkling2_load<v>(forget + j*s_forget + k, wf);
-            inkling2_load<v>(gain   + j*s_gain   + k, wa);
+            inkling2_load<v>(forget + j*p.s_forget + k, wf);
+            inkling2_load<v>(gain   + j*p.s_gain   + k, wa);
 #pragma unroll
             for (int q = 0; q < v; ++q) {
                 f += wf[q]*g_s[k + q];
@@ -108,47 +131,10 @@ static __global__ void inkling2_ctrl_up(
     a = warp_reduce_sum<lanes>(a);
 
     if (valid && lane == 0) {
-        const float c = cur[t*s_cur + j];
-        const float m = msg[t*s_msg + j];
-        dst[t*s_dst + j] = (c - c*tanhf(f)) + m*tanhf(a);
+        const float c = p.cur[t*p.s_cur + j];
+        const float m = p.msg[t*p.s_msg + j];
+        p.dst[t*p.s_dst + j] = (c - c*tanhf(f)) + m*tanhf(a);
     }
-}
-
-static bool inkling2_aligned(const void * p, size_t stride) {
-    return (uintptr_t) p % 16 == 0 && stride % 16 == 0;
-}
-
-template <typename T>
-static void inkling2_ctrl_down_cuda(const ggml_tensor * cur, const ggml_tensor * msg, const ggml_tensor * down, float * g, float eps, cudaStream_t stream) {
-    const int     n  = cur->ne[0];
-    const int     r  = down->ne[1];
-    const int64_t nt = cur->ne[1];
-
-    const bool vec = n % (16/sizeof(T)) == 0 &&
-        inkling2_aligned(cur->data, cur->nb[1]) && inkling2_aligned(msg->data, msg->nb[1]) && inkling2_aligned(down->data, down->nb[1]);
-
-    const dim3 blocks(r, nt);
-    const dim3 threads(256);
-    auto kernel = vec ? inkling2_ctrl_down<T, true> : inkling2_ctrl_down<T, false>;
-    kernel<<<blocks, threads, 0, stream>>>((const float *) cur->data, (const float *) msg->data, (const T *) down->data, g,
-            n, r, cur->nb[1]/sizeof(float), msg->nb[1]/sizeof(float), down->nb[1]/sizeof(T), eps);
-}
-
-template <typename T>
-static void inkling2_ctrl_up_cuda(const ggml_tensor * cur, const ggml_tensor * msg, const ggml_tensor * gain, const ggml_tensor * forget,
-        const float * g, ggml_tensor * dst, cudaStream_t stream) {
-    const int     n  = cur->ne[0];
-    const int     r  = gain->ne[0];
-    const int64_t nt = cur->ne[1];
-
-    const bool vec = r % (16/sizeof(T)) == 0 && inkling2_aligned(gain->data, gain->nb[1]) && inkling2_aligned(forget->data, forget->nb[1]);
-
-    const int  n_threads = 256;
-    const dim3 blocks((n + n_threads/INKLING2_CTRL_UP_LANES - 1)/(n_threads/INKLING2_CTRL_UP_LANES), nt);
-    auto kernel = vec ? inkling2_ctrl_up<T, true> : inkling2_ctrl_up<T, false>;
-    kernel<<<blocks, n_threads, r*sizeof(float), stream>>>((const float *) cur->data, (const float *) msg->data,
-            (const T *) gain->data, (const T *) forget->data, g, (float *) dst->data, n, r,
-            cur->nb[1]/sizeof(float), msg->nb[1]/sizeof(float), gain->nb[1]/sizeof(T), forget->nb[1]/sizeof(T), dst->nb[1]/sizeof(float));
 }
 
 bool ggml_cuda_inkling2_ctrl_supported(const ggml_tensor * op) {
@@ -163,33 +149,162 @@ bool ggml_cuda_inkling2_ctrl_supported(const ggml_tensor * op) {
         type_ok(down) && type_ok(gain) && op->src[4]->type == gain->type && op->src[4]->nb[0] == gain->nb[0];
 }
 
-void ggml_cuda_op_inkling2_ctrl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * cur    = dst->src[0];
-    const ggml_tensor * msg    = dst->src[1];
-    const ggml_tensor * down   = dst->src[2];
-    const ggml_tensor * gain   = dst->src[3];
-    const ggml_tensor * forget = dst->src[4];
+// run n_ops ctrl ops of the same shape and weight types in one down and one up launch
+static void inkling2_ctrl_run(ggml_backend_cuda_context & ctx, ggml_tensor * const * ops, const int n_ops) {
+    const ggml_tensor * op0   = ops[0];
+    const ggml_type     tdown = op0->src[2]->type;
+    const ggml_type     tup   = op0->src[3]->type;
+    const int           n     = op0->src[0]->ne[0];
+    const int           r     = op0->src[2]->ne[1];
+    const int64_t       nt    = op0->src[0]->ne[1];
 
     float eps;
-    memcpy(&eps, dst->op_params, sizeof(float));
+    memcpy(&eps, op0->op_params, sizeof(float));
+
+    ggml_cuda_pool_alloc<float> g(ctx.pool(), (size_t) n_ops*r*nt);
+
+    inkling2_ctrl_batch bt = {};
+    bool vec_down = n % (16/ggml_type_size(tdown)) == 0;
+    bool vec_up   = r % (16/ggml_type_size(tup)) == 0;
+    for (int o = 0; o < n_ops; ++o) {
+        const ggml_tensor * cur    = ops[o]->src[0];
+        const ggml_tensor * msg    = ops[o]->src[1];
+        const ggml_tensor * down   = ops[o]->src[2];
+        const ggml_tensor * gain   = ops[o]->src[3];
+        const ggml_tensor * forget = ops[o]->src[4];
+        inkling2_ctrl_args & p = bt.a[o];
+        p.cur      = (const float *) cur->data;
+        p.msg      = (const float *) msg->data;
+        p.down     = down->data;
+        p.gain     = gain->data;
+        p.forget   = forget->data;
+        p.g        = g.get() + (size_t) o*r*nt;
+        p.dst      = (float *) ops[o]->data;
+        p.s_cur    = cur->nb[1]/sizeof(float);
+        p.s_msg    = msg->nb[1]/sizeof(float);
+        p.s_down   = down->nb[1]/ggml_type_size(tdown);
+        p.s_gain   = gain->nb[1]/ggml_type_size(tup);
+        p.s_forget = forget->nb[1]/ggml_type_size(tup);
+        p.s_dst    = ops[o]->nb[1]/sizeof(float);
+        vec_down   = vec_down && inkling2_aligned(cur->data, cur->nb[1]) && inkling2_aligned(msg->data, msg->nb[1]) &&
+            inkling2_aligned(down->data, down->nb[1]);
+        vec_up     = vec_up && inkling2_aligned(gain->data, gain->nb[1]) && inkling2_aligned(forget->data, forget->nb[1]);
+    }
 
     cudaStream_t stream = ctx.stream();
 
-    ggml_cuda_pool_alloc<float> g(ctx.pool(), down->ne[1]*cur->ne[1]);
-
-    switch (down->type) {
-        case GGML_TYPE_F32:  inkling2_ctrl_down_cuda<float>      (cur, msg, down, g.get(), eps, stream); break;
-        case GGML_TYPE_F16:  inkling2_ctrl_down_cuda<half>       (cur, msg, down, g.get(), eps, stream); break;
-        case GGML_TYPE_BF16: inkling2_ctrl_down_cuda<nv_bfloat16>(cur, msg, down, g.get(), eps, stream); break;
-        default: GGML_ABORT("unsupported type %s", ggml_type_name(down->type));
+    auto down_t = [&](auto tag) {
+        using T = decltype(tag);
+        auto kernel = vec_down ? inkling2_ctrl_down<T, true> : inkling2_ctrl_down<T, false>;
+        kernel<<<dim3(r, nt, n_ops), 256, 0, stream>>>(bt, n, r, eps);
+    };
+    switch (tdown) {
+        case GGML_TYPE_F32:  down_t(float());       break;
+        case GGML_TYPE_F16:  down_t(half());        break;
+        case GGML_TYPE_BF16: down_t(nv_bfloat16()); break;
+        default: GGML_ABORT("unsupported type %s", ggml_type_name(tdown));
     }
 
-    switch (gain->type) {
-        case GGML_TYPE_F32:  inkling2_ctrl_up_cuda<float>      (cur, msg, gain, forget, g.get(), dst, stream); break;
-        case GGML_TYPE_F16:  inkling2_ctrl_up_cuda<half>       (cur, msg, gain, forget, g.get(), dst, stream); break;
-        case GGML_TYPE_BF16: inkling2_ctrl_up_cuda<nv_bfloat16>(cur, msg, gain, forget, g.get(), dst, stream); break;
-        default: GGML_ABORT("unsupported type %s", ggml_type_name(gain->type));
+    const int n_threads = 256;
+    auto up_t = [&](auto tag) {
+        using T = decltype(tag);
+        auto kernel = vec_up ? inkling2_ctrl_up<T, true> : inkling2_ctrl_up<T, false>;
+        const dim3 blocks((n + n_threads/INKLING2_CTRL_UP_LANES - 1)/(n_threads/INKLING2_CTRL_UP_LANES), nt, n_ops);
+        kernel<<<blocks, n_threads, r*sizeof(float), stream>>>(bt, n, r);
+    };
+    switch (tup) {
+        case GGML_TYPE_F32:  up_t(float());       break;
+        case GGML_TYPE_F16:  up_t(half());        break;
+        case GGML_TYPE_BF16: up_t(nv_bfloat16()); break;
+        default: GGML_ABORT("unsupported type %s", ggml_type_name(tup));
     }
+}
+
+void ggml_cuda_op_inkling2_ctrl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    inkling2_ctrl_run(ctx, &dst, 1);
+}
+
+static bool inkling2_ctrl_batchable(const ggml_tensor * a, const ggml_tensor * b) {
+    if (b->op != GGML_OP_INKLING2_CTRL || !ggml_are_same_shape(a, b) || a->src[2]->type != b->src[2]->type ||
+        a->src[3]->type != b->src[3]->type || a->src[2]->ne[1] != b->src[2]->ne[1] || a->src[3]->ne[0] != b->src[3]->ne[0] ||
+        ggml_get_op_params_f32(a, 0) != ggml_get_op_params_f32(b, 0)) {
+        return false;
+    }
+    const ggml_tensor * root_a = a->view_src ? a->view_src : a;
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        const ggml_tensor * src = b->src[s];
+        if (src && (src->view_src ? src->view_src : src) == root_a) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool inkling2_noop_node(const ggml_tensor * n) {
+    return ggml_is_empty(n) || n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_PERMUTE ||
+        n->op == GGML_OP_TRANSPOSE || n->op == GGML_OP_NONE;
+}
+
+// before allocation: the last node of a run of independent ctrl ops starting at node_idx, or -1
+int ggml_cuda_inkling2_ctrl_batch_group(const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * first = cgraph->nodes[node_idx];
+    if (first->op != GGML_OP_INKLING2_CTRL) {
+        return -1;
+    }
+    std::vector<const ggml_tensor *> ops = { first };
+    int last = -1;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && (int) ops.size() < INKLING2_CTRL_MAX; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (inkling2_noop_node(n)) {
+            continue;
+        }
+        bool ok = true;
+        for (const ggml_tensor * o : ops) {
+            ok = ok && inkling2_ctrl_batchable(o, n);
+        }
+        if (!ok) {
+            break;
+        }
+        ops.push_back(n);
+        last = j;
+    }
+    return last;
+}
+
+int ggml_cuda_inkling2_ctrl_batch_fusion(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    const int last = ggml_cuda_inkling2_ctrl_batch_group(cgraph, node_idx);
+    if (last < 0) {
+        return 0;
+    }
+    std::vector<ggml_tensor *> ops;
+    for (int j = node_idx; j <= last; ++j) {
+        if (!inkling2_noop_node(cgraph->nodes[j])) {
+            ops.push_back(cgraph->nodes[j]);
+        }
+    }
+    // the ops run concurrently: no output may overlap an input or output of another op
+    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t a0 = (uintptr_t) a->data, a1 = a0 + ggml_nbytes(a);
+        const uintptr_t b0 = (uintptr_t) b->data, b1 = b0 + ggml_nbytes(b);
+        return a->data && b->data && a0 < b1 && b0 < a1;
+    };
+    for (size_t a = 0; a < ops.size(); ++a) {
+        for (size_t b = 0; b < ops.size(); ++b) {
+            if (a == b) {
+                continue;
+            }
+            if (overlap(ops[a], ops[b])) {
+                return 0;
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (ops[b]->src[s] && overlap(ops[a], ops[b]->src[s])) {
+                    return 0;
+                }
+            }
+        }
+    }
+    inkling2_ctrl_run(ctx, ops.data(), (int) ops.size());
+    return last - node_idx;
 }
 
 // one input of the clip kernel
