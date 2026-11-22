@@ -776,6 +776,54 @@ int ggml_cuda_inkling2_conv_batch_fusion(ggml_backend_cuda_context & ctx, const 
         }
     }
 
+    // the fused ops run concurrently, but the allocator assumed graph order: it may have placed the output of
+    // a later op over an input of an earlier op whose last use was that op. Every write range of one op must be
+    // disjoint from every read and write range of the others (the shared conv state cache is checked above).
+    {
+        struct range { const void * p; size_t n; };
+        auto reads = [](const ggml_tensor * t, range * r) {
+            int n = 0;
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (t->src[s] && t->src[s]->data) {
+                    r[n++] = { t->src[s]->data, ggml_nbytes(t->src[s]) };
+                }
+            }
+            return n;
+        };
+        const ggml_tensor * clip = b2 > 0 ? cgraph->nodes[idx2] : nullptr;
+        const ggml_tensor * ops[3] = { conv0, conv1, clip };
+        range wr[3][2] = {
+            { { conv0->data, ggml_nbytes(conv0) }, { state_dst0, state_dst0 ? (size_t) (K0 - 1)*C0*sizeof(float) : 0 } },
+            { { conv1->data, ggml_nbytes(conv1) }, { state_dst1, state_dst1 ? (size_t) (K1 - 1)*C1*sizeof(float) : 0 } },
+            { { clip ? clip->data : nullptr, clip ? ggml_nbytes(clip) : 0 }, { nullptr, 0 } },
+        };
+        for (int x = 0; x < 3; ++x) {
+            for (int y = 0; y < 3; ++y) {
+                if (x == y || !ops[x] || !ops[y]) {
+                    continue;
+                }
+                range rd[GGML_MAX_SRC + 2];
+                int nr = reads(ops[y], rd);
+                rd[nr++] = wr[y][0];
+                rd[nr++] = wr[y][1];
+                for (int w = 0; w < 2; ++w) {
+                    for (int k = 0; k < nr; ++k) {
+                        if (!inkling2_ranges_overlap(wr[x][w].p, wr[x][w].n, rd[k].p, rd[k].n)) {
+                            continue;
+                        }
+                        // the conv state stores into the shared cache, already checked for disjoint channels
+                        const bool state_vs_past = x < 2 && y < 2 && w == 1 &&
+                            (k == nr - 1 || rd[k].p == ops[y]->src[1]->data) &&
+                            conv0->src[5] && conv1->src[5] && (off0 + C0 <= off1 || off1 + C1 <= off0);
+                        if (!state_vs_past) {
+                            return 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     const inkling2_conv_args a0 = inkling2_conv_make_args(conv0, state_dst0, s_state_q0);
     const inkling2_conv_args a1 = inkling2_conv_make_args(conv1, state_dst1, s_state_q1);
     const int n_threads = 256;
