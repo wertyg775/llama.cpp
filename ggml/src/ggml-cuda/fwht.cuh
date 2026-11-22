@@ -7,3 +7,7 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
 
 bool ggml_cuda_op_fwht_set_rows_supported(const ggml_tensor * mm, const ggml_tensor * reshape, const ggml_tensor * view, const ggml_tensor * set_rows);
 void ggml_cuda_op_fwht_set_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, ggml_tensor * set_rows);
+
+// two FWHT + set_rows (Q8_0) stores in one launch; false when they cannot be batched
+bool ggml_cuda_op_fwht_set_rows2(ggml_backend_cuda_context & ctx, const ggml_tensor * mm0, ggml_tensor * set_rows0,
+        const ggml_tensor * mm1, ggml_tensor * set_rows1);

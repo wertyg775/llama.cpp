@@ -243,14 +243,13 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
 
 // fused warp-level FWHT + Q8_0 quantization + row scatter for quantized KV cache writes
 template <int N, typename T>
-__launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
-static __global__ void fwht_set_rows_q8_0_cuda(
+static __device__ __forceinline__ void fwht_set_rows_q8_0_row(
         const T * __restrict__ src, const int64_t * __restrict__ idxs, char * __restrict__ dst,
-        const int64_t n_rows, const int rows_per_tok, const int64_t s_idx, const size_t nb1, const float scale) {
+        const int64_t n_rows, const int rows_per_tok, const int64_t s_idx, const size_t nb1, const float scale, const int bx) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     static constexpr int el_w = N / warp_size;
 
-    const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
+    const int64_t r = (int64_t) bx * blockDim.y + threadIdx.y;
     if (r >= n_rows) {
         return;
     }
@@ -259,7 +258,6 @@ static __global__ void fwht_set_rows_q8_0_cuda(
     const int lane = threadIdx.x;
     float reg[el_w];
 
-    ggml_cuda_pdl_sync();
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
         reg[i] = ggml_cuda_cast<float>(src[i * warp_size + lane]) * scale;
@@ -314,6 +312,38 @@ static __global__ void fwht_set_rows_q8_0_cuda(
             blk->d = d;
         }
         blk->qs[sub] = q;
+    }
+}
+
+template <int N, typename T>
+__launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void fwht_set_rows_q8_0_cuda(
+        const T * __restrict__ src, const int64_t * __restrict__ idxs, char * __restrict__ dst,
+        const int64_t n_rows, const int rows_per_tok, const int64_t s_idx, const size_t nb1, const float scale) {
+    ggml_cuda_pdl_sync();
+    fwht_set_rows_q8_0_row<N, T>(src, idxs, dst, n_rows, rows_per_tok, s_idx, nb1, scale, blockIdx.x);
+}
+
+struct fwht_set_rows_args {
+    const void    * src;
+    const int64_t * idxs;
+    char          * dst;
+    int64_t         n_rows;
+    int             rows_per_tok;
+    int64_t         s_idx;
+    size_t          nb1;
+    int             n_blocks;
+};
+
+// two fused FWHT + set_rows (K and V) in one launch: blocks [0, a.n_blocks) take a, the rest take b
+template <int NA, int NB, typename T>
+__launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void fwht_set_rows2_q8_0_cuda(const fwht_set_rows_args a, const fwht_set_rows_args b) {
+    ggml_cuda_pdl_sync();
+    if ((int) blockIdx.x < a.n_blocks) {
+        fwht_set_rows_q8_0_row<NA, T>((const T *) a.src, a.idxs, a.dst, a.n_rows, a.rows_per_tok, a.s_idx, a.nb1, 1.0f/sqrtf((float) NA), blockIdx.x);
+    } else {
+        fwht_set_rows_q8_0_row<NB, T>((const T *) b.src, b.idxs, b.dst, b.n_rows, b.rows_per_tok, b.s_idx, b.nb1, 1.0f/sqrtf((float) NB), blockIdx.x - a.n_blocks);
     }
 }
 
@@ -380,4 +410,53 @@ void ggml_cuda_op_fwht_set_rows(ggml_backend_cuda_context & ctx, const ggml_tens
         case GGML_TYPE_F16: ggml_cuda_op_fwht_set_rows_impl<half>(ctx, src, set_rows);  break;
         default: GGML_ABORT("unsupported fwht_set_rows src type %s", ggml_type_name(src->type));
     }
+}
+
+static fwht_set_rows_args fwht_set_rows_make_args(const ggml_tensor * mm, const ggml_tensor * set_rows) {
+    const ggml_tensor * src = mm->src[1];
+    fwht_set_rows_args a = {};
+    a.src          = src->data;
+    a.idxs         = (const int64_t *) set_rows->src[1]->data;
+    a.dst          = (char *) set_rows->data;
+    a.n_rows       = ggml_nrows(src);
+    a.rows_per_tok = (int) (set_rows->ne[0] / src->ne[0]);
+    a.s_idx        = set_rows->src[1]->nb[0] / sizeof(int64_t);
+    a.nb1          = set_rows->nb[1];
+    a.n_blocks     = (int) ((a.n_rows + 3) / 4);
+    return a;
+}
+
+bool ggml_cuda_op_fwht_set_rows2(ggml_backend_cuda_context & ctx, const ggml_tensor * mm0, ggml_tensor * set_rows0,
+        const ggml_tensor * mm1, ggml_tensor * set_rows1) {
+    const ggml_tensor * s0 = mm0->src[1];
+    const ggml_tensor * s1 = mm1->src[1];
+    const int na = (int) s0->ne[0];
+    const int nb = (int) s1->ne[0];
+    if (s0->type != s1->type || (s0->type != GGML_TYPE_F32 && s0->type != GGML_TYPE_F16) ||
+        (na != 64 && na != 128) || (nb != 64 && nb != 128)) {
+        return false;
+    }
+    // the second store must not read what the first one writes
+    if (s1->data >= set_rows0->data && (const char *) s1->data < (const char *) set_rows0->data + ggml_nbytes(set_rows0)) {
+        return false;
+    }
+    const fwht_set_rows_args a = fwht_set_rows_make_args(mm0, set_rows0);
+    const fwht_set_rows_args b = fwht_set_rows_make_args(mm1, set_rows1);
+
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const dim3 grid(a.n_blocks + b.n_blocks, 1, 1);
+    const dim3 block(warp_size, 4, 1);
+
+    auto go = [&](auto tag) {
+        using T = decltype(tag);
+        if (na == 128) {
+            nb == 128 ? fwht_set_rows2_q8_0_cuda<128, 128, T><<<grid, block, 0, ctx.stream()>>>(a, b)
+                      : fwht_set_rows2_q8_0_cuda<128,  64, T><<<grid, block, 0, ctx.stream()>>>(a, b);
+        } else {
+            nb == 128 ? fwht_set_rows2_q8_0_cuda< 64, 128, T><<<grid, block, 0, ctx.stream()>>>(a, b)
+                      : fwht_set_rows2_q8_0_cuda< 64,  64, T><<<grid, block, 0, ctx.stream()>>>(a, b);
+        }
+    };
+    s0->type == GGML_TYPE_F32 ? go(float()) : go(half());
+    return true;
 }

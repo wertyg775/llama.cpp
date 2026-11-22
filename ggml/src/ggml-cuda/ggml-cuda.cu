@@ -4705,6 +4705,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_tensor * mm       = cgraph->nodes[i];
         ggml_tensor * set_rows = cgraph->nodes[i + 3];
 
+        // K and V stores, only no-op nodes apart: one launch
+        int j = i + 4;
+        while (j < cgraph->n_nodes && (cgraph->nodes[j]->op == GGML_OP_VIEW || cgraph->nodes[j]->op == GGML_OP_RESHAPE ||
+                                       cgraph->nodes[j]->op == GGML_OP_PERMUTE || cgraph->nodes[j]->op == GGML_OP_TRANSPOSE)) {
+            ++j;
+        }
+        if (ggml_cuda_can_fuse(cgraph, j, { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {}) &&
+            ggml_cuda_op_fwht_set_rows2(*cuda_ctx, mm, set_rows, cgraph->nodes[j], cgraph->nodes[j + 3])) {
+            return j + 3 - i;
+        }
+
         ggml_cuda_op_fwht_set_rows(*cuda_ctx, mm, set_rows);
         return 3;
     }
