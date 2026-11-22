@@ -11410,6 +11410,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 4, 4096, false, GGML_TYPE_F16, 4096, 128, 128));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 4, 18000, false, GGML_TYPE_F16, 18000, 128, 128));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, 256, true,  GGML_TYPE_F16, 512, 128, 128));
+    test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, 4096, true,  GGML_TYPE_F16, 4096));
+    test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, 4096, false, GGML_TYPE_F16, 4096));
     for (ggml_type src_type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         for (int64_t d : {64, 128, 256, 512}) {
             test_cases.emplace_back(new test_fwht_set_rows(src_type, d, 4, 1, 32));

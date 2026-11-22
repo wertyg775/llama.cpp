@@ -4541,9 +4541,6 @@ ggml_tensor * llm_graph_context::build_attn_inkling2_fused(
         ggml_tensor * gate,
             float     kq_scale,
             int       il) const {
-    // the logits of the fused op stay in LDS
-    constexpr int64_t n_kv_max = 2048;
-
     if (!cparams.fused_inkling2 || n_tokens != 1 || cparams.training) {
         return nullptr;
     }
@@ -4579,7 +4576,7 @@ ggml_tensor * llm_graph_context::build_attn_inkling2_fused(
     }
     const bool ok_type = k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_F32 ||
         (k->type == GGML_TYPE_Q8_0 && !v_trans && q_cur->ne[0] % ggml_blck_size(k->type) == 0);
-    if (!ok_type || (k->type != GGML_TYPE_Q8_0 && rel_pos->ne[0] > n_kv_max)) {
+    if (!ok_type) {
         return nullptr;
     }
 
