@@ -5287,15 +5287,17 @@ struct test_inkling2_attn : public test_case {
     const int64_t   kv_size; // of the cache the views come from
     const int32_t   n_rot_q;
     const int32_t   n_rot_v;
+    const bool      decode; // like a decoded token: distance n_kv - 1 - cell (only the last n_extent cells get a bias), no mask
 
     std::string vars() override {
-        return VARS_TO_STR10(type, d, n_head, n_head_kv, n_kv, v_trans, mask_type, kv_size, n_rot_q, n_rot_v);
+        return VARS_TO_STR11(type, d, n_head, n_head_kv, n_kv, v_trans, mask_type, kv_size, n_rot_q, n_rot_v, decode);
     }
 
     test_inkling2_attn(ggml_type type = GGML_TYPE_F16, int64_t d = 128, int64_t n_head = 24, int64_t n_head_kv = 4, int64_t n_kv = 256,
-            bool v_trans = true, ggml_type mask_type = GGML_TYPE_F32, int64_t kv_size = 0, int32_t n_rot_q = 0, int32_t n_rot_v = 0)
+            bool v_trans = true, ggml_type mask_type = GGML_TYPE_F32, int64_t kv_size = 0, int32_t n_rot_q = 0, int32_t n_rot_v = 0,
+            bool decode = false)
         : type(type), d(d), n_head(n_head), n_head_kv(n_head_kv), n_kv(n_kv), v_trans(v_trans), mask_type(mask_type),
-          kv_size(kv_size ? kv_size : n_kv + 9), n_rot_q(n_rot_q), n_rot_v(n_rot_v) {}
+          kv_size(kv_size ? kv_size : n_kv + 9), n_rot_q(n_rot_q), n_rot_v(n_rot_v), decode(decode) {}
 
     static constexpr int64_t n_rel    = 16;
     static constexpr int64_t n_extent = 100;
@@ -5346,15 +5348,15 @@ struct test_inkling2_attn : public test_case {
             if (t->type == GGML_TYPE_I32) {
                 std::uniform_int_distribution<int32_t> dist(0, n_extent);
                 std::vector<int32_t> data(ggml_nelements(t));
-                for (int32_t & x : data) {
-                    x = dist(rng);
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = decode ? (int32_t) (n_kv - 1 - (int64_t) i) : dist(rng);
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
             } else if (name == "mask") {
                 std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
                 std::vector<float> data(ggml_nelements(t));
                 for (size_t i = 0; i < data.size(); ++i) {
-                    data[i] = i % 5 == 3 ? -INFINITY : dist(rng);
+                    data[i] = decode ? 0.0f : i % 5 == 3 ? -INFINITY : dist(rng);
                 }
                 if (t->type == GGML_TYPE_F16) {
                     std::vector<ggml_fp16_t> h(data.size());
@@ -11409,6 +11411,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 4, 64,  false, GGML_TYPE_F32, 0,    64,  64));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 4, 4096, false, GGML_TYPE_F16, 4096, 128, 128));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 4, 18000, false, GGML_TYPE_F16, 18000, 128, 128));
+    // GQA 2-4 (the Inkling 2 layout is 24 query / 8 KV heads): one block per KV head in the split-KV kernel
+    test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 8, 1000, false, GGML_TYPE_F16, 1000, 128, 128));
+    test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 8, 70000, false, GGML_TYPE_F16, 70000, 128, 128));
+    test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 8, 9000, false, GGML_TYPE_F16, 9000, 128, 128, true));
+    test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 12, 3000, false, GGML_TYPE_F32, 3000, 128, 128));
+    test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 6, 300, false, GGML_TYPE_F16, 512));
+    test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 64, 8, 4, 2000, false, GGML_TYPE_F16, 2000, 64, 64));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, 256, true,  GGML_TYPE_F16, 512, 128, 128));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, 4096, true,  GGML_TYPE_F16, 4096));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, 4096, false, GGML_TYPE_F16, 4096));
@@ -14510,6 +14519,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t n_kv : {256, 1024, 4096}) {
         test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, n_kv, true,  GGML_TYPE_F16, 8192));
         test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 4, n_kv, false, GGML_TYPE_F16, 8192, 128, 128));
+        test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 8, n_kv, false, GGML_TYPE_F16, 8192, 128, 128));
+    }
+    // long context (Q8_0 KV, 24/8 heads), and the stock flash attention decode of the same shape for reference
+    for (int64_t n_kv : {32768, 131072, 262144}) {
+        test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 8, n_kv, false, GGML_TYPE_F16, n_kv, 128, 128));
+        test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 8, n_kv, false, GGML_TYPE_F16, n_kv, 128, 128, true));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, n_kv, 1, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     }
 
     // INKLING2_PROJ: Inkling 2 Mini projections of a SWA layer input, decode

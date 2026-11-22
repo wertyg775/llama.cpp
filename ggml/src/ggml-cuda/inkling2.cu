@@ -2374,6 +2374,7 @@ static __global__ void inkling2_attn_q8_0_f32(
 }
 
 static constexpr int INKLING2_ATTN_SPLIT_TILE = 256;
+static constexpr int INKLING2_ATTN_MAX_SPLITS = 256;
 
 // split-KV online-softmax stage 1 for Q8_0 KV cache (unlimited n_kv, mask-skipping)
 template <typename M>
@@ -2556,14 +2557,292 @@ static __global__ void inkling2_attn_q8_0_split(
     }
 }
 
+// reductions over 16 lanes (and 64) with GCN DPP row ops instead of ds_bpermute: xor 1, xor 2 (quad_perm), then
+// row_half_mirror (8 lanes) and row_mirror (16 lanes); every lane of the group gets the result
+#if defined(GGML_USE_HIP)
+template <int ctrl>
+static __device__ __forceinline__ float inkling2_dpp(const float x) {
+    return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), ctrl, 0xF, 0xF, false));
+}
+#endif
+
+static __device__ __forceinline__ float inkling2_sum16(float x) {
+#if defined(GGML_USE_HIP)
+    x += inkling2_dpp<0xB1>(x);
+    x += inkling2_dpp<0x4E>(x);
+    x += inkling2_dpp<0x141>(x);
+    x += inkling2_dpp<0x140>(x);
+    return x;
+#else
+    return warp_reduce_sum<16>(x);
+#endif
+}
+
+static __device__ __forceinline__ float inkling2_max16(float x) {
+#if defined(GGML_USE_HIP)
+    x = fmaxf(x, inkling2_dpp<0xB1>(x));
+    x = fmaxf(x, inkling2_dpp<0x4E>(x));
+    x = fmaxf(x, inkling2_dpp<0x141>(x));
+    x = fmaxf(x, inkling2_dpp<0x140>(x));
+    return x;
+#else
+    return warp_reduce_max<16>(x);
+#endif
+}
+
+// over a 64-lane wave: 16 lanes with DPP, then two shuffles
+static __device__ __forceinline__ float inkling2_sum64(float x) {
+    x = inkling2_sum16(x);
+    x += __shfl_xor(x, 16, 64);
+    x += __shfl_xor(x, 32, 64);
+    return x;
+}
+
+static __device__ __forceinline__ float inkling2_max64(float x) {
+    x = inkling2_max16(x);
+    x = fmaxf(x, __shfl_xor(x, 16, 64));
+    x = fmaxf(x, __shfl_xor(x, 32, 64));
+    return x;
+}
+
+// wave-level LDS ordering: the lanes of one wave exchange values through LDS without a block barrier
+static __device__ __forceinline__ void inkling2_wave_sync() {
+#if defined(GGML_USE_HIP)
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+#else
+    __syncwarp();
+#endif
+}
+
+// split-KV decode attention for a Q8_0 KV cache with d = 128 and 64-lane waves (flash decoding):
+// every wave owns one split (a contiguous range of cells) of KV head blockIdx.x and all G query heads of that KV head,
+// with its own online softmax, so the loop has no block barriers. Each K/V cell is read once for the G heads.
+// K: 16 lanes per cell (8 dims each, plus one of the n_rel <= 16 bias terms), 4 cells per step.
+// softmax: per chunk of 64 cells, one cell per lane. V: 2 dims per lane.
+static constexpr int INKLING2_ATTN_WAVES = 4;
+
+
+template <typename M, int G>
+static __global__ void __launch_bounds__(64*INKLING2_ATTN_WAVES) inkling2_attn_q8_0_split_gqa(
+        const float * __restrict__ q, const char * __restrict__ k, const char * __restrict__ v, const float * __restrict__ table,
+        const float * __restrict__ r, const float * __restrict__ sinks, const int32_t * __restrict__ rel_pos, const M * __restrict__ mask,
+        float * __restrict__ partial, const int n_kv, const int n_rel, const int n_extent,
+        const int64_t s_q1, const int64_t s_k1, const int64_t s_k2, const int64_t s_v1, const int64_t s_v2, const int64_t s_t1, const int64_t s_r1,
+        const float scale, const int n_rot_q, const int n_splits) {
+    constexpr int D     = 128;
+    constexpr int CHUNK = 64;
+
+    const int hk   = blockIdx.x;
+    const int wave = threadIdx.x / 64;
+    const int lane = threadIdx.x % 64;
+    const int sp   = blockIdx.y*INKLING2_ATTN_WAVES + wave;
+
+    __shared__ float qs[G][D];
+    __shared__ float rs[G][16];
+    __shared__ float lgs[INKLING2_ATTN_WAVES][G][CHUNK];
+    __shared__ float mvs[INKLING2_ATTN_WAVES][CHUNK];
+    __shared__ int   dss[INKLING2_ATTN_WAVES][CHUNK];
+
+    for (int i = threadIdx.x; i < G*D; i += blockDim.x) {
+        qs[i / D][i % D] = q[(hk*G + i / D)*s_q1 + i % D];
+    }
+    for (int i = threadIdx.x; i < G*16; i += blockDim.x) {
+        rs[i / 16][i % 16] = i % 16 < n_rel ? r[(hk*G + i / 16)*s_r1 + i % 16] : 0.0f;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        inkling2_fwht_smem(qs[g], D, n_rot_q);
+    }
+    __syncthreads();
+
+    if (sp >= n_splits) {
+        return;
+    }
+    const int j_beg = (int) (((int64_t) sp * n_kv) / n_splits);
+    const int j_end = (int) (((int64_t) (sp + 1) * n_kv) / n_splits);
+
+    // K lanes: cell sub = lane/16 of each step, dims 8*l16 .. 8*l16 + 7 (Q8_0 block l16/4, bytes 8*(l16%4))
+    const int l16  = lane % 16;
+    const int sub  = lane / 16;
+    const int kib  = l16 / 4;
+    const int kofs = 8*(l16 % 4);
+    float qk_reg[G][8];
+    float rb[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            qk_reg[g][i] = qs[g][8*l16 + i];
+        }
+        rb[g] = rs[g][l16];
+    }
+    float sh[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        sh[g] = sinks[hk*G + g];
+    }
+
+    float m_run[G];
+    float l_run[G];
+    float acc[G][8]; // dims 8*l16 .. 8*l16 + 7 of the cells sub, sub + 4, ...
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        m_run[g]  = -INFINITY;
+        l_run[g]  = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            acc[g][i] = 0.0f;
+        }
+    }
+
+    const char * kh = k + hk*s_k1;
+    const char * vh = v + hk*s_v1;
+
+    for (int c0 = j_beg; c0 < j_end; c0 += CHUNK) {
+        const int cn = min(CHUNK, j_end - c0);
+
+        // mask and distances of the chunk: one coalesced load per lane instead of a dependent chain per step
+        {
+            const bool valid = lane < cn;
+            mvs[wave][lane] = valid ? ggml_cuda_cast<float>(mask[c0 + lane]) : -INFINITY;
+            dss[wave][lane] = valid ? rel_pos[c0 + lane] : n_extent;
+        }
+        inkling2_wave_sync();
+
+        // logits of the chunk, 4 cells per step
+#pragma unroll 4
+        for (int st = 0; st < CHUNK/4; ++st) {
+            const int  cc     = 4*st + sub;
+            const bool valid  = cc < cn;
+            const int  j      = c0 + (valid ? cc : 0);
+            const float mv    = mvs[wave][cc];
+            const bool active = mv > -1e30f;
+
+            const block_q8_0 * kb = (const block_q8_0 *) (kh + j*s_k2) + kib;
+            // unaligned dword loads (Q8_0 blocks are 34 bytes): gfx906 serves them, and they halve the load count
+            int q2[2];
+            q2[0] = ((const int *) (kb->qs + kofs))[0];
+            q2[1] = ((const int *) (kb->qs + kofs + 4))[0];
+            const float kd = __half2float(kb->d);
+            const int   dist = dss[wave][cc];
+            const float tv   = dist < n_extent && l16 < n_rel ? table[dist*s_t1 + l16] : 0.0f;
+
+            float part[G];
+#pragma unroll
+            for (int g = 0; g < G; ++g) {
+                float dot = 0.0f;
+#pragma unroll
+                for (int w = 0; w < 2; ++w) {
+                    dot += qk_reg[g][4*w + 0]*int8_t(q2[w] >>  0) + qk_reg[g][4*w + 1]*int8_t(q2[w] >>  8) +
+                           qk_reg[g][4*w + 2]*int8_t(q2[w] >> 16) + qk_reg[g][4*w + 3]*int8_t(q2[w] >> 24);
+                }
+                part[g] = (dot*kd)*scale + tv*rb[g];
+                part[g] = inkling2_sum16(part[g]);
+            }
+            if (l16 == 0) {
+#pragma unroll
+                for (int g = 0; g < G; ++g) {
+                    lgs[wave][g][cc] = valid && active ? ((part[g] - sh[g]) + mv) : -INFINITY;
+                }
+            }
+        }
+        inkling2_wave_sync();
+
+        // online softmax over the chunk, one cell per lane
+        float alpha[G];
+        bool  any = false;
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            const float l     = lgs[wave][g][lane];
+            const float m_c   = inkling2_max64(l);
+            const float m_new = fmaxf(m_run[g], m_c);
+            alpha[g]          = m_run[g] > -1e30f ? expf(m_run[g] - m_new) : 0.0f;
+            const float p     = l > -1e30f ? expf(l - m_new) : 0.0f;
+            const float sum   = inkling2_sum64(p);
+            lgs[wave][g][lane] = p;
+            if (m_c > -1e30f) {
+                any      = true;
+                l_run[g] = l_run[g]*alpha[g] + sum;
+                m_run[g] = m_new;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    acc[g][i] *= alpha[g];
+                }
+            }
+        }
+        inkling2_wave_sync();
+        if (!any) {
+            continue;
+        }
+
+        // V: 16 lanes per cell (8 dims each, as for K), 4 cells per step
+#pragma unroll 4
+        for (int st = 0; st < CHUNK/4; ++st) {
+            const int cc = 4*st + sub;
+            if (cc < cn) {
+                const block_q8_0 * vb = (const block_q8_0 *) (vh + (c0 + cc)*s_v2) + kib;
+                int q2[2];
+                q2[0] = ((const int *) (vb->qs + kofs))[0];
+                q2[1] = ((const int *) (vb->qs + kofs + 4))[0];
+                const float vd = __half2float(vb->d);
+                float vv[8];
+#pragma unroll
+                for (int w = 0; w < 2; ++w) {
+                    vv[4*w + 0] = vd*int8_t(q2[w] >>  0);
+                    vv[4*w + 1] = vd*int8_t(q2[w] >>  8);
+                    vv[4*w + 2] = vd*int8_t(q2[w] >> 16);
+                    vv[4*w + 3] = vd*int8_t(q2[w] >> 24);
+                }
+#pragma unroll
+                for (int g = 0; g < G; ++g) {
+                    const float p = lgs[wave][g][cc];
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        acc[g][i] += p*vv[i];
+                    }
+                }
+            }
+        }
+        inkling2_wave_sync();
+    }
+
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        float * out_s = partial + ((size_t) (hk*G + g) * n_splits + sp) * (D + 2);
+        if (l_run[g] == 0.0f) {
+            if (lane == 0) {
+                out_s[D]     = -INFINITY;
+                out_s[D + 1] = 0.0f;
+            }
+            continue;
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            float a = acc[g][i];
+            a += __shfl_xor(a, 16, 64);
+            a += __shfl_xor(a, 32, 64);
+            if (sub == 0) {
+                out_s[8*l16 + i] = a;
+            }
+        }
+        if (lane == 0) {
+            out_s[D]     = m_run[g];
+            out_s[D + 1] = l_run[g];
+        }
+    }
+}
+
 // stage 2 combine: merge split-KV partial sums with the zero sink, apply V FWHT and output gate
 static __global__ void inkling2_attn_combine(
         const float * __restrict__ partial, const float * __restrict__ gate, float * __restrict__ dst,
         const int d, const int n_splits, const int n_rot_v) {
     extern __shared__ float qs[];
-    __shared__ float sm_m[64];
-    __shared__ float sm_l[64];
-    __shared__ float sm_w[64];
+    __shared__ float sm_m[INKLING2_ATTN_MAX_SPLITS];
+    __shared__ float sm_l[INKLING2_ATTN_MAX_SPLITS];
+    __shared__ float sm_w[INKLING2_ATTN_MAX_SPLITS];
     __shared__ float sm_l_global;
 
     constexpr int pws = ggml_cuda_get_physical_warp_size();
@@ -2572,10 +2851,10 @@ static __global__ void inkling2_attn_combine(
     const float * p_head = partial + (size_t) h * n_splits * (d + 2);
 
     // load all split (m, l) pairs in parallel and compute normalized weights in warp 0
-    if (i < n_splits) {
-        const float * ps = p_head + (size_t) i * (d + 2);
-        sm_m[i] = ps[d];
-        sm_l[i] = ps[d + 1];
+    for (int s = i; s < n_splits; s += blockDim.x) {
+        const float * ps = p_head + (size_t) s * (d + 2);
+        sm_m[s] = ps[d];
+        sm_l[s] = ps[d + 1];
     }
     __syncthreads();
 
@@ -2845,6 +3124,40 @@ void ggml_cuda_op_inkling2_attn(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int n_gqa  = n_head/k->ne[1];
 
     if (k->type == GGML_TYPE_Q8_0) {
+        if (n_kv > 256 && n_gqa >= 2 && n_gqa <= 4 && d == 128 && table->ne[0] <= 16 &&
+                ggml_cuda_info().devices[ctx.device].warp_size == 64) {
+            // one wave per split of >= 64 cells (and up to 1024 at long context), enough waves for the CUs
+            const int n_head_kv = k->ne[1];
+            const int n_sm      = ggml_cuda_info().devices[ctx.device].nsm;
+            int n_splits = std::max((n_kv + 1023) / 1024, std::min((n_kv + 63) / 64, (16*n_sm + n_head_kv - 1) / n_head_kv));
+            n_splits = std::min(n_splits, INKLING2_ATTN_MAX_SPLITS);
+            const int n_blocks_y = (n_splits + INKLING2_ATTN_WAVES - 1) / INKLING2_ATTN_WAVES;
+            ggml_cuda_pool_alloc<float> partial(ctx.pool(), (size_t) n_head * n_splits * (d + 2));
+
+            auto launch_gqa = [&](auto mask_tag, auto g_tag) {
+                using M = decltype(mask_tag);
+                constexpr int G = decltype(g_tag)::value;
+                inkling2_attn_q8_0_split_gqa<M, G><<<dim3(n_head_kv, n_blocks_y), 64*INKLING2_ATTN_WAVES, 0, ctx.stream()>>>(
+                    (const float *) q->data, (const char *) k->data, (const char *) v->data, (const float *) table->data,
+                    (const float *) r->data, (const float *) sinks->data, (const int32_t *) rel_pos->data, (const M *) mask->data,
+                    partial.get(), n_kv, n_rel, (int) table->ne[1], q->nb[1]/sizeof(float), k->nb[1], k->nb[2], v->nb[1], v->nb[2],
+                    table->nb[1]/sizeof(float), r->nb[1]/sizeof(float), scale, n_rot_q, n_splits);
+            };
+            auto launch_m = [&](auto mask_tag) {
+                switch (n_gqa) {
+                    case 2: launch_gqa(mask_tag, std::integral_constant<int, 2>()); break;
+                    case 3: launch_gqa(mask_tag, std::integral_constant<int, 3>()); break;
+                    case 4: launch_gqa(mask_tag, std::integral_constant<int, 4>()); break;
+                    default: GGML_ABORT("unexpected n_gqa %d", n_gqa);
+                }
+            };
+            mask->type == GGML_TYPE_F16 ? launch_m(half()) : launch_m(float());
+
+            const int n_threads_c = std::max(64, ((d + 63) / 64) * 64);
+            inkling2_attn_combine<<<n_head, n_threads_c, d * sizeof(float), ctx.stream()>>>(
+                partial.get(), (const float *) gate->data, (float *) dst->data, d, n_splits, n_rot_v);
+            return;
+        }
         if (n_kv > 256) {
             const int n_splits   = std::min(64, std::max(4, (n_kv + 127) / 128));
             const int n_threads  = d > 256 ? 512 : 256;
