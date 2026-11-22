@@ -12121,7 +12121,12 @@ static void ggml_compute_forward_inkling2_rel_bias_f32(
                 v += m;
             }
 
-            *(float *) ((char *) dst->data + kv*sizeof(float) + (t % n_ps)*dst->nb[1] + h*dst->nb[2] + (t / n_ps)*dst->nb[3]) = v;
+            char * dp = (char *) dst->data + kv*dst->nb[0] + (t % n_ps)*dst->nb[1] + h*dst->nb[2] + (t / n_ps)*dst->nb[3];
+            if (dst->type == GGML_TYPE_F16) {
+                *(ggml_fp16_t *) dp = GGML_CPU_FP32_TO_FP16(v);
+            } else {
+                *(float *) dp = v;
+            }
         }
     }
 }

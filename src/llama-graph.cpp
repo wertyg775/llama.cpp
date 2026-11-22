@@ -4522,7 +4522,7 @@ ggml_tensor * llm_graph_context::build_attn(
         }
         kq_mask = ggml_add(ctx0, kq_b, kq_mask);
     }
-    if (cparams.flash_attn) {
+    if (cparams.flash_attn && kq_mask->type != GGML_TYPE_F16) {
         kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
     }
     cb(kq_mask, "kq_mask_rel_pos", il);

@@ -568,7 +568,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 const auto & attn_mask = is_swa ? attn->self_attn_mask_swa : attn->self_attn_mask;
                 GGML_ASSERT(attn_mask.rows == nullptr);
 
-                kq_b = ggml_inkling2_rel_bias(ctx0, layer.attn_rel_bias, Rcur, sinks, rel_pos, attn_mask.raw, n_stream);
+                kq_b = ggml_inkling2_rel_bias(ctx0, layer.attn_rel_bias, Rcur, sinks, rel_pos, attn_mask.raw, n_stream,
+                        cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32);
                 res->add_fused_node({LLM_FUSED_OP_INKLING2, kq_b, ip});
             } else {
                 // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head

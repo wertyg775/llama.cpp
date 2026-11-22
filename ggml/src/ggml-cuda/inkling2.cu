@@ -1094,10 +1094,10 @@ void ggml_cuda_op_inkling2_mix(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 }
 
 // one thread per kv cell, one block row per (head, token)
-template <typename T, typename M>
+template <typename T, typename M, typename D>
 static __global__ void inkling2_rel_bias_f32(
         const T * __restrict__ table, const float * __restrict__ r, const float * __restrict__ sinks, const int32_t * __restrict__ rel_pos,
-        const M * __restrict__ mask, float * __restrict__ dst, const int n_rel, const int n_extent, const int n_kv, const int n_ps,
+        const M * __restrict__ mask, D * __restrict__ dst, const int n_rel, const int n_extent, const int n_kv, const int n_ps,
         const int64_t s_table1, const int64_t s_r1, const int64_t s_r2, const int64_t s_sinks1, const int64_t s_pos1,
         const int64_t s_mask1, const int64_t s_mask3, const int64_t s_dst1, const int64_t s_dst2, const int64_t s_dst3) {
     extern __shared__ float r_s[];
@@ -1115,6 +1115,17 @@ static __global__ void inkling2_rel_bias_f32(
         return;
     }
 
+    const int64_t dst_idx = (t % n_ps)*s_dst1 + h*s_dst2 + (t / n_ps)*s_dst3 + kv;
+
+    float mv = 0.0f;
+    if constexpr (!std::is_same_v<M, void>) {
+        mv = ggml_cuda_cast<float>(mask[(t % n_ps)*s_mask1 + (t / n_ps)*s_mask3 + kv]);
+        if (mv <= -1e30f) {
+            dst[dst_idx] = ggml_cuda_cast<D>(mv);
+            return;
+        }
+    }
+
     const int d = rel_pos[t*s_pos1 + kv];
 
     float v = 0.0f;
@@ -1126,15 +1137,17 @@ static __global__ void inkling2_rel_bias_f32(
     }
     v -= sinks[t*s_sinks1 + h];
     if constexpr (!std::is_same_v<M, void>) {
-        v += ggml_cuda_cast<float>(mask[(t % n_ps)*s_mask1 + (t / n_ps)*s_mask3 + kv]);
+        v += mv;
     }
 
-    dst[(t % n_ps)*s_dst1 + h*s_dst2 + (t / n_ps)*s_dst3 + kv] = v;
+    dst[dst_idx] = ggml_cuda_cast<D>(v);
 }
 
 bool ggml_cuda_inkling2_rel_bias_supported(const ggml_tensor * op) {
     const ggml_type type = op->src[0]->type;
-    return (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16) && op->src[1]->ne[1] <= 65535 && op->src[1]->ne[2] <= 65535;
+    return (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16) &&
+        (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+        op->src[1]->ne[1] <= 65535 && op->src[1]->ne[2] <= 65535;
 }
 
 void ggml_cuda_op_inkling2_rel_bias(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -1160,20 +1173,30 @@ void ggml_cuda_op_inkling2_rel_bias(ggml_backend_cuda_context & ctx, ggml_tensor
     const int64_t s_mask1 = mask ? mask->nb[1]/ggml_type_size(mask->type) : 0;
     const int64_t s_mask3 = mask ? mask->nb[3]/ggml_type_size(mask->type) : 0;
 
-    auto launch = [&](auto kernel, const auto * table_d, const auto * mask_d) {
+    const size_t dst_ts = ggml_type_size(dst->type);
+
+    auto launch = [&](auto kernel, const auto * table_d, const auto * mask_d, auto * dst_d) {
         kernel<<<grid, n_threads, smem, ctx.stream()>>>(table_d, (const float *) r->data, (const float *) sinks->data,
-                (const int32_t *) rel_pos->data, mask_d, (float *) dst->data, n_rel, n_extent, n_kv, n_ps, s_table1,
+                (const int32_t *) rel_pos->data, mask_d, dst_d, n_rel, n_extent, n_kv, n_ps, s_table1,
                 r->nb[1]/sizeof(float), r->nb[2]/sizeof(float), sinks->nb[1]/sizeof(float), rel_pos->nb[1]/sizeof(int32_t),
-                s_mask1, s_mask3, dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), dst->nb[3]/sizeof(float));
+                s_mask1, s_mask3, dst->nb[1]/dst_ts, dst->nb[2]/dst_ts, dst->nb[3]/dst_ts);
+    };
+    auto launch_dst = [&](auto t_tag, auto m_tag, const auto * table_d, const auto * mask_d) {
+        using T = decltype(t_tag);
+        using M = std::remove_pointer_t<decltype(m_tag)>;
+        if (dst->type == GGML_TYPE_F16) {
+            launch(inkling2_rel_bias_f32<T, M, half>, table_d, mask_d, (half *) dst->data);
+        } else {
+            launch(inkling2_rel_bias_f32<T, M, float>, table_d, mask_d, (float *) dst->data);
+        }
     };
     auto launch_mask = [&](auto t_tag, const auto * table_d) {
-        using T = decltype(t_tag);
         if (!mask) {
-            launch(inkling2_rel_bias_f32<T, void>, table_d, (const void *) nullptr);
+            launch_dst(t_tag, (void *) nullptr, table_d, (const void *) nullptr);
         } else if (mask->type == GGML_TYPE_F16) {
-            launch(inkling2_rel_bias_f32<T, half>, table_d, (const half *) mask->data);
+            launch_dst(t_tag, (half *) nullptr, table_d, (const half *) mask->data);
         } else {
-            launch(inkling2_rel_bias_f32<T, float>, table_d, (const float *) mask->data);
+            launch_dst(t_tag, (float *) nullptr, table_d, (const float *) mask->data);
         }
     };
 

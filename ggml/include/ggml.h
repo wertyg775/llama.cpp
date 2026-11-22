@@ -2603,7 +2603,7 @@ extern "C" {
     //   sinks:   [n_head, T] f32
     //   rel_pos: [n_kv, T] i32, distances in [0, n_extent], n_extent has no bias
     //   mask:    [n_kv, T/n_stream, 1, n_stream] f32 or f16 or NULL, added last
-    //   result:  [n_kv, T/n_stream, n_head, n_stream] f32, the kq_b of ggml_soft_max_ext / flash attention
+    //   result:  [n_kv, T/n_stream, n_head, n_stream] f32 or f16, the kq_b of ggml_soft_max_ext / flash attention
     //   result[kv, i, h, s] = table[:, d].r[:, h, t] - sinks[h, t] + mask[kv, i, 0, s], t = s*T/n_stream + i, d = rel_pos[kv, t]
     //
     GGML_API struct ggml_tensor * ggml_inkling2_rel_bias(
@@ -2613,7 +2613,8 @@ extern "C" {
             struct ggml_tensor  * sinks,
             struct ggml_tensor  * rel_pos,
             struct ggml_tensor  * mask,
-            int64_t               n_stream);
+            int64_t               n_stream,
+            enum ggml_type        dst_type);
 
     // inkling2 SiTU activation of the expert FFN
     //   gate, up: same shape f32, rows contiguous (views of the merged gate_up output are fine)

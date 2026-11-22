@@ -5138,14 +5138,15 @@ struct test_inkling2_rel_bias : public test_case {
     const int64_t   n_tokens;
     const int64_t   n_stream;
     const int       mask; // 0: none, 1: f32, 2: f16
+    const ggml_type dst_type;
 
     std::string vars() override {
-        return VARS_TO_STR8(type, n_rel, n_extent, n_head, n_kv, n_tokens, n_stream, mask);
+        return VARS_TO_STR9(type, n_rel, n_extent, n_head, n_kv, n_tokens, n_stream, mask, dst_type);
     }
 
     test_inkling2_rel_bias(ggml_type type = GGML_TYPE_F32, int64_t n_rel = 16, int64_t n_extent = 100, int64_t n_head = 4,
-            int64_t n_kv = 256, int64_t n_tokens = 1, int64_t n_stream = 1, int mask = 0)
-        : type(type), n_rel(n_rel), n_extent(n_extent), n_head(n_head), n_kv(n_kv), n_tokens(n_tokens), n_stream(n_stream), mask(mask) {}
+            int64_t n_kv = 256, int64_t n_tokens = 1, int64_t n_stream = 1, int mask = 0, ggml_type dst_type = GGML_TYPE_F32)
+        : type(type), n_rel(n_rel), n_extent(n_extent), n_head(n_head), n_kv(n_kv), n_tokens(n_tokens), n_stream(n_stream), mask(mask), dst_type(dst_type) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * table = ggml_new_tensor_2d(ctx, type, n_rel, n_extent);
@@ -5166,7 +5167,7 @@ struct test_inkling2_rel_bias : public test_case {
             ggml_set_name(m, "mask");
         }
 
-        ggml_tensor * out = ggml_inkling2_rel_bias(ctx, table, r, sinks, rel_pos, m, n_stream);
+        ggml_tensor * out = ggml_inkling2_rel_bias(ctx, table, r, sinks, rel_pos, m, n_stream, dst_type);
         ggml_set_name(out, "out");
         return out;
     }
@@ -11439,6 +11440,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int mask : {1, 2}) {
         test_cases.emplace_back(new test_inkling2_rel_bias(GGML_TYPE_F32, 16, 1024, 24, 1000, 3, 1, mask));
         test_cases.emplace_back(new test_inkling2_rel_bias(GGML_TYPE_BF16, 16, 100, 4, 300, 6, 2, mask));
+        test_cases.emplace_back(new test_inkling2_rel_bias(GGML_TYPE_F32, 16, 1024, 24, 1000, 3, 1, mask, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_inkling2_rel_bias(GGML_TYPE_BF16, 16, 100, 4, 300, 6, 2, mask, GGML_TYPE_F16));
     }
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int64_t n_blocks : {0, 1, 5, 15}) {
