@@ -3554,6 +3554,502 @@ static __global__ void __launch_bounds__(256, 2) inkling2_attn_prefill_tile(
     }
 }
 
+// GQA tiled causal prefill attention with 1D positions (full or standard SWA), D = 128, n_gqa = 3, 64-lane waves (HIP only).
+// One block = one KV head x 32 queries x its 3 query heads = 96 rows; wave w of 8 owns queries 4w..4w+3 of all 3 heads (12 rows),
+// so the 3 heads share every K/V tile and the bias table row of each (query, key).
+// QK: lane = key, Q rows by LDS broadcast reads (~1 clk per b128 on gfx906). PV: lane = dim pair, V stored key-pair
+// interleaved so one v_dot2 covers 2 keys. Softmax in log2 units with a lazy per-row stabilizer m: a row is reduced over the
+// wave and rescaled only when one of its logits exceeds m by more than INKLING2_PF_TAU (so p <= 2^tau fits the FP16 P tile).
+// Tile classes: skip (nothing visible to the block), fast (per wave: every valid key visible to its 4 queries and beyond the
+// bias extent), slow (per element mask + relative bias). The next tile's K/V bytes are prefetched into registers one phase ahead.
+// v_dot2_f32_f16 as a builtin: ggml_cuda_mad emits it as asm volatile, which the scheduler cannot move LDS reads across
+static __device__ __forceinline__ void inkling2_dot2(float & acc, const half2 a, const half2 b) {
+#if defined(GGML_USE_HIP) && defined(V_DOT2_F32_F16_AVAILABLE)
+    typedef _Float16 f16x2 __attribute__((ext_vector_type(2)));
+    acc = __builtin_amdgcn_fdot2(__builtin_bit_cast(f16x2, a), __builtin_bit_cast(f16x2, b), acc, false);
+#else
+    ggml_cuda_mad(acc, a, b);
+#endif
+}
+
+static constexpr float INKLING2_PF_TAU = 8.0f;
+
+// block barrier that only orders LDS: LLVM puts s_waitcnt vmcnt(0) before every s_barrier on gfx906 (no back-off
+// barrier), which would wait for the K/V prefetch loads still in flight; outstanding global loads to registers are
+// tracked per wave and waited for at their first use as usual
+static __device__ __forceinline__ void inkling2_lds_barrier() {
+#if defined(GGML_USE_HIP)
+    asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+#else
+    __syncthreads();
+#endif
+}
+
+template <bool kv_q8_0>
+static __global__ void __launch_bounds__(512, 1) inkling2_attn_prefill_gqa(
+        const float * __restrict__ q, const char * __restrict__ k, const char * __restrict__ v,
+        const float * __restrict__ table, const float * __restrict__ r, const float * __restrict__ sinks,
+        const int32_t * __restrict__ cell_pos, const int32_t * __restrict__ q_pos,
+        const float * __restrict__ gate, float * __restrict__ dst, float * __restrict__ partial,
+        const int T, const int n_kv, const int n_rel, const int n_extent, const int n_swa,
+        const int64_t s_q1, const int64_t s_q2, const int64_t s_k1, const int64_t s_k2,
+        const int64_t s_v1, const int64_t s_v2, const int64_t s_t1, const int64_t s_r1, const int64_t s_r2,
+        const int64_t s_s1, const int64_t s_g1, const int64_t s_dst1, const float scale) {
+#if defined(GGML_USE_HIP)
+    constexpr int   D     = 128;
+    constexpr int   G     = 3;
+    constexpr int   BQ    = 32;
+    constexpr int   BK    = 64;
+    constexpr int   NW    = 8;      // waves: 2 per SIMD (1 wave/SIMD issues dot2 at only ~70% of peak on gfx906)
+    constexpr int   NT    = 64*NW;
+    constexpr int   NR    = BQ*G;   // 96 rows, row = qi*G + g
+    constexpr int   RW    = NR/NW;  // 12 rows per wave
+    constexpr int   QW    = BQ/NW;  // 4 queries per wave
+    constexpr float LOG2E = 1.4426950408889634f;
+
+    const int q0   = blockIdx.x*BQ;
+    const int qn   = min(BQ, T - q0);
+    const int hk   = blockIdx.y;
+    const int tid  = threadIdx.x;
+    const int wave = __builtin_amdgcn_readfirstlane(tid >> 6);
+    const int lane = tid & 63;
+
+    // ~59 KiB: 1 block (8 waves) per CU, <= 128 VGPRs per lane
+    __shared__ __align__(16) half2   s_Q[NR][D/2];    // scale*log2e folded in
+    __shared__ __align__(16) half2   s_KV[BK*D/2];    // K: [key][16 B chunk ^ (key & 15)]; V: [key pair][dim] half2 of 2 keys
+    __shared__ __align__(16) half    s_P[NR][BK];
+    __shared__ __align__(16) float   s_R[NR][16];     // log2e folded in, zero padded to 16
+    __shared__               float   s_sink[NR];      // log2e folded in
+    __shared__               float   s_cs[NR];        // per-row stabilizer of u = logit + sink (log2 units), wave-uniform
+    __shared__               int32_t s_qpos[BQ];
+    __shared__               int32_t s_vis[2][NW];     // per-wave "tile visible" votes, double buffered by tile parity
+
+    const float qscale = scale*LOG2E;
+    for (int idx = tid; idx < NR*(D/2); idx += NT) {
+        const int row = idx/(D/2);
+        const int j   = idx%(D/2);
+        const int qi  = row/G;
+        half2 val = make_half2(0.0f, 0.0f);
+        if (qi < qn) {
+            const float * qp = q + int64_t(q0 + qi)*s_q2 + int64_t(hk*G + row%G)*s_q1;
+            val = make_half2(qp[2*j]*qscale, qp[2*j + 1]*qscale);
+        }
+        s_Q[row][j] = val;
+    }
+    for (int idx = tid; idx < NR*16; idx += NT) {
+        const int row = idx/16;
+        const int rr  = idx%16;
+        const int qi  = row/G;
+        s_R[row][rr] = qi < qn && rr < n_rel ? LOG2E*r[int64_t(q0 + qi)*s_r2 + int64_t(hk*G + row%G)*s_r1 + rr] : 0.0f;
+    }
+    if (tid < NR) {
+        const int qi = tid/G;
+        s_sink[tid] = qi < qn ? LOG2E*sinks[int64_t(q0 + qi)*s_s1 + hk*G + tid%G] : 0.0f;
+        s_cs[tid]   = -INFINITY;
+    }
+    if (tid < BQ) {
+        s_qpos[tid] = tid < qn ? q_pos[q0 + tid] : 0;
+    }
+    __syncthreads();
+
+    int32_t p_min = INT32_MAX;
+    int32_t p_max = INT32_MIN;
+    for (int qi = 0; qi < qn; ++qi) {
+        p_min = min(p_min, s_qpos[qi]);
+        p_max = max(p_max, s_qpos[qi]);
+    }
+    int32_t w_min = INT32_MAX;
+    int32_t w_max = INT32_MIN;
+    for (int ql = 0; ql < QW; ++ql) {
+        if (wave*QW + ql < qn) {
+            w_min = min(w_min, s_qpos[wave*QW + ql]);
+            w_max = max(w_max, s_qpos[wave*QW + ql]);
+        }
+    }
+    const bool w_full = wave*QW + QW <= qn;
+
+    const int    n_active = min(n_kv, max(0, cell_pos[n_kv]));
+    const char * k_head   = k + int64_t(hk)*s_k1;
+    const char * v_head   = v + int64_t(hk)*s_v1;
+
+    // loaders: K thread = (key tid/8, 16 dims (tid%8)*16); V thread = (key pair tid/16, 8 dims (tid%16)*8)
+    const int kk = tid >> 3;
+    const int kb = tid & 7;
+    const int kp = tid >> 4;
+    const int vs = tid & 15;
+
+    uint4   kr[kv_q8_0 ? 1 : 2];
+    float   kd  = 0.0f;
+    int32_t kcp = -1;
+    int32_t lcp = -1; // cell position of key k0 + lane (QK)
+    uint4   vr[2];    // q8_0: .x/.y = 8 quants; f16: 8 halves
+    float   vd[2]  = {0.0f, 0.0f};
+    int32_t vcp[2] = {-1, -1};
+
+    // loads are unconditional from a clamped cell (no phis across the tile loop); validity travels in the cell position
+    const int k_last = max(n_active - 1, 0);
+    auto load_k = [&](const int k0) {
+        const int key = min(k0 + kk, k_last);
+        const int kl  = min(k0 + lane, k_last);
+        const int32_t c_k = cell_pos[key];
+        const int32_t c_l = cell_pos[kl];
+        kcp = k0 + kk   < n_active ? c_k : -1;
+        lcp = k0 + lane < n_active ? c_l : -1;
+        const char * row = k_head + int64_t(key)*s_k2;
+        if constexpr (kv_q8_0) {
+            const block_q8_0 * blk = (const block_q8_0 *) row + (kb >> 1);
+            kd    = __half2float(blk->d);
+            kr[0] = inkling2_load_q8_16(blk->qs + 16*(kb & 1));
+        } else {
+            kr[0] = ((const uint4 *) row)[2*kb + 0];
+            kr[1] = ((const uint4 *) row)[2*kb + 1];
+        }
+    };
+    auto store_k = [&]() {
+        uint4 h4[2];
+        if constexpr (kv_q8_0) {
+            const int * qw = (const int *) kr;
+            half2 * h = (half2 *) h4;
+            const float d = kcp >= 0 ? kd : 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int w = kcp >= 0 ? qw[j] : 0;
+                h[2*j + 0] = make_half2(d*int8_t(w >>  0), d*int8_t(w >>  8));
+                h[2*j + 1] = make_half2(d*int8_t(w >> 16), d*int8_t(w >> 24));
+            }
+        } else {
+            h4[0] = kcp >= 0 ? kr[0] : make_uint4(0, 0, 0, 0);
+            h4[1] = kcp >= 0 ? kr[1] : make_uint4(0, 0, 0, 0);
+        }
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            const int sc = (2*kb + c) ^ (kk & 15);
+            *(uint4 *) &s_KV[kk*(D/2) + 4*sc] = h4[c];
+        }
+    };
+    auto load_v = [&](const int k0) {
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+            const int key = min(k0 + 2*kp + e, k_last);
+            const int32_t c_v = cell_pos[key];
+            vcp[e] = k0 + 2*kp + e < n_active ? c_v : -1;
+            const char * row = v_head + int64_t(key)*s_v2;
+            if constexpr (kv_q8_0) {
+                const block_q8_0 * blk = (const block_q8_0 *) row + (vs >> 2);
+                vd[e]   = __half2float(blk->d);
+                vr[e].x = inkling2_load_q8_4(blk->qs + 8*(vs & 3) + 0);
+                vr[e].y = inkling2_load_q8_4(blk->qs + 8*(vs & 3) + 4);
+            } else {
+                vr[e] = ((const uint4 *) row)[vs];
+            }
+        }
+    };
+    auto store_v = [&]() {
+        uint4 h4[2];
+        half2 * h = (half2 *) h4;
+        if constexpr (kv_q8_0) {
+            const float d0 = vcp[0] >= 0 ? vd[0] : 0.0f;
+            const float d1 = vcp[1] >= 0 ? vd[1] : 0.0f;
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int a = vcp[0] >= 0 ? (j ? vr[0].y : vr[0].x) : 0;
+                const int b = vcp[1] >= 0 ? (j ? vr[1].y : vr[1].x) : 0;
+#pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    h[4*j + s] = make_half2(d0*int8_t(a >> (8*s)), d1*int8_t(b >> (8*s)));
+                }
+            }
+        } else {
+            const half * a = (const half *) &vr[0];
+            const half * b = (const half *) &vr[1];
+            const half z = __float2half(0.0f);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                h[i] = __halves2half2(vcp[0] >= 0 ? a[i] : z, vcp[1] >= 0 ? b[i] : z);
+            }
+        }
+        *(uint4 *) &s_KV[kp*D + 8*vs + 0] = h4[0];
+        *(uint4 *) &s_KV[kp*D + 8*vs + 4] = h4[1];
+    };
+
+    float o0[RW];
+    float o1[RW];
+    float l_p[RW];
+#pragma unroll
+    for (int i = 0; i < RW; ++i) {
+        o0[i]  = 0.0f;
+        o1[i]  = 0.0f;
+        l_p[i] = 0.0f;
+    }
+
+    // lazy online softmax of this lane's key for all rows of the wave (u: logits without the sink, -inf = masked);
+    // the stabilizers cs live in LDS, are read once per tile and only written back when a row is rescaled
+    auto softmax_rows = [&](float (&u)[RW]) {
+        float cs[RW];
+        bool  need = false;
+#pragma unroll
+        for (int i = 0; i < RW; ++i) {
+            cs[i] = s_cs[wave*RW + i];
+            need |= u[i] > cs[i] + INKLING2_PF_TAU;
+        }
+        if (inkling2_wave_any(need)) {
+#pragma unroll
+            for (int i = 0; i < RW; ++i) {
+                if (inkling2_wave_any(u[i] > cs[i] + INKLING2_PF_TAU)) {
+                    const float cs_new = fmaxf(cs[i], inkling2_max64(u[i]));
+                    const float alpha  = __builtin_amdgcn_exp2f(cs[i] - cs_new);
+                    o0[i]  *= alpha;
+                    o1[i]  *= alpha;
+                    l_p[i] *= alpha;
+                    cs[i]   = cs_new;
+                    s_cs[wave*RW + i] = cs_new;
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < RW; ++i) {
+            const float p = u[i] > -INFINITY ? __builtin_amdgcn_exp2f(u[i] - cs[i]) : 0.0f;
+            l_p[i] += p;
+            s_P[wave*RW + i][lane] = __float2half(p);
+        }
+    };
+
+    const int32_t p_lo = n_swa > 0 ? p_min - n_swa + 1 : INT32_MIN;
+
+    // KV split (blockIdx.z of gridDim.z): a contiguous range of 64-cell tiles; partial results go to `partial`
+    const int n_tiles = (n_active + BK - 1)/BK;
+    const int k_begin = BK*((blockIdx.z*n_tiles)/gridDim.z);
+    const int k_end   = min(n_active, BK*(((blockIdx.z + 1)*n_tiles)/gridDim.z));
+
+    load_k(k_begin);
+    for (int k0 = k_begin; k0 < k_end; k0 += BK) {
+        // A: skip test (also orders the previous PV before the K/V tile is overwritten), K tile, V prefetch
+        const bool vis = inkling2_wave_any(lcp >= 0 && lcp <= p_max && lcp >= p_lo);
+        const int  par = (k0/BK) & 1;
+        if (lane == 0) {
+            s_vis[par][wave] = vis;
+        }
+        inkling2_lds_barrier();
+        bool any_vis = false;
+#pragma unroll
+        for (int w = 0; w < NW; ++w) {
+            any_vis |= s_vis[par][w] != 0;
+        }
+        if (any_vis) {
+        const int32_t cp = lcp;
+        store_k();
+        load_v(k0);
+        inkling2_lds_barrier();
+
+        // B: S = Q K^T for 12 rows x 1 key per lane
+        float s[RW];
+#pragma unroll
+        for (int i = 0; i < RW; ++i) {
+            s[i] = 0.0f;
+        }
+#pragma unroll 1
+        for (int c = 0; c < D/8; ++c) {
+            __align__(16) half2 kh[4];
+            *(uint4 *) kh = *(const uint4 *) &s_KV[lane*(D/2) + 4*(c ^ (lane & 15))];
+#pragma unroll
+            for (int i = 0; i < RW; ++i) {
+                __align__(16) half2 qh[4];
+                *(uint4 *) qh = *(const uint4 *) &s_Q[wave*RW + i][4*c];
+                inkling2_dot2(s[i], qh[0], kh[0]);
+                inkling2_dot2(s[i], qh[1], kh[1]);
+                inkling2_dot2(s[i], qh[2], kh[2]);
+                inkling2_dot2(s[i], qh[3], kh[3]);
+            }
+            // pipeline: K + 3 Q rows ahead, then 1 Q read per 4 dot2 (keeps ~4 rows of Q in flight instead of all of them)
+            __builtin_amdgcn_sched_group_barrier(0x100, 4, 0);
+#pragma unroll
+            for (int i = 0; i < RW - 3; ++i) {
+                __builtin_amdgcn_sched_group_barrier(0x002, 4, 0);
+                __builtin_amdgcn_sched_group_barrier(0x100, 1, 0);
+            }
+            __builtin_amdgcn_sched_group_barrier(0x002, 12, 0);
+        }
+
+        // fast: every valid cell is visible to all queries of the wave and beyond the bias extent (holes are masked)
+        const bool valid = cp >= 0;
+        const bool fast  = w_full && inkling2_wave_all(!valid || (cp <= w_min && (n_swa == 0 || w_max - cp < n_swa) &&
+                                                                  w_min - cp >= n_extent));
+        if (fast) {
+            if (!valid) {
+#pragma unroll
+                for (int i = 0; i < RW; ++i) {
+                    s[i] = -INFINITY;
+                }
+            }
+            softmax_rows(s);
+        } else {
+#pragma unroll
+            for (int ql = 0; ql < QW; ++ql) {
+                const int     qi   = wave*QW + ql;
+                const int32_t qp   = s_qpos[qi];
+                const bool    ok   = qi < qn && cp >= 0 && cp <= qp && (n_swa == 0 || qp - cp < n_swa);
+                const int32_t dist = qp - cp;
+                float b[G] = {0.0f, 0.0f, 0.0f};
+                if (ok && dist < n_extent) {
+                    const float * tb = table + int64_t(dist)*s_t1;
+                    if (n_rel == 16 && (s_t1 & 3) == 0) {
+#pragma unroll
+                        for (int c4 = 0; c4 < 4; ++c4) {
+                            const float4 a = ((const float4 *) tb)[c4];
+#pragma unroll
+                            for (int g = 0; g < G; ++g) {
+                                const float4 rr = ((const float4 *) s_R[qi*G + g])[c4];
+                                b[g] += a.x*rr.x + a.y*rr.y + a.z*rr.z + a.w*rr.w;
+                            }
+                        }
+                    } else {
+                        for (int rr = 0; rr < n_rel; ++rr) {
+                            const float a = tb[rr];
+#pragma unroll
+                            for (int g = 0; g < G; ++g) {
+                                b[g] += a*s_R[qi*G + g][rr];
+                            }
+                        }
+                    }
+                }
+#pragma unroll
+                for (int g = 0; g < G; ++g) {
+                    s[ql*G + g] = ok ? s[ql*G + g] + b[g] : -INFINITY;
+                }
+                __builtin_amdgcn_sched_barrier(0); // one query's table row in flight at a time
+            }
+            softmax_rows(s);
+        }
+
+        // C: V tile (key-pair interleaved) over the consumed K tile, next K prefetch (hidden behind PV)
+        inkling2_lds_barrier();
+        store_v();
+        load_k(k0 + BK);
+        inkling2_lds_barrier();
+
+        // D: O += P V, lane owns dims 2*lane, 2*lane + 1
+#pragma unroll 1
+        for (int k8 = 0; k8 < BK/8; ++k8) {
+            half2 va[4];
+            half2 vb[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                __align__(8) half2 t2[2];
+                *(uint2 *) t2 = *(const uint2 *) &s_KV[(4*k8 + j)*D + 2*lane];
+                va[j] = t2[0];
+                vb[j] = t2[1];
+            }
+#pragma unroll
+            for (int i = 0; i < RW; ++i) {
+                __align__(16) half2 ph[4];
+                *(uint4 *) ph = *(const uint4 *) &s_P[wave*RW + i][8*k8];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    inkling2_dot2(o0[i], ph[j], va[j]);
+                    inkling2_dot2(o1[i], ph[j], vb[j]);
+                }
+            }
+            // pipeline: 4 V + 2 P reads ahead, then 1 P read per 8 dot2
+            __builtin_amdgcn_sched_group_barrier(0x100, 6, 0);
+#pragma unroll
+            for (int i = 0; i < RW - 2; ++i) {
+                __builtin_amdgcn_sched_group_barrier(0x002, 8, 0);
+                __builtin_amdgcn_sched_group_barrier(0x100, 1, 0);
+            }
+            __builtin_amdgcn_sched_group_barrier(0x002, 16, 0);
+        }
+        } else {
+            load_k(k0 + BK);
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < RW; ++i) {
+        const float l  = inkling2_sum64(l_p[i]);
+        const int   qi = wave*QW + i/G;
+        if (qi >= qn) {
+            continue;
+        }
+        const int   t       = q0 + qi;
+        const int   h       = hk*G + i%G;
+        const float m       = s_cs[wave*RW + i] - s_sink[wave*RW + i]; // stabilizer of the logits (sink included)
+        if (partial) {
+            // [split][t][h][D + 2]: unnormalized O, then m and l
+            float * pt = partial + ((int64_t(blockIdx.z)*T + t)*(gridDim.y*G) + h)*(D + 2);
+            *(float2 *) (pt + 2*lane) = make_float2(o0[i], o1[i]);
+            if (lane == 0) {
+                pt[D]     = m;
+                pt[D + 1] = l;
+            }
+            continue;
+        }
+        const float m_final = fmaxf(m, 0.0f);
+        const float scale_o = m > -INFINITY ? __builtin_amdgcn_exp2f(m - m_final) : 0.0f;
+        const float l_final = l*scale_o + __builtin_amdgcn_exp2f(-m_final);
+        const float inv_l   = scale_o/l_final;
+        float v0 = o0[i]*inv_l;
+        float v1 = o1[i]*inv_l;
+        if (gate) {
+            const float * gt = gate + int64_t(t)*s_g1 + h*D;
+            v0 *= 1.0f/(1.0f + expf(-gt[2*lane + 0]));
+            v1 *= 1.0f/(1.0f + expf(-gt[2*lane + 1]));
+        }
+        *(float2 *) (dst + int64_t(t)*s_dst1 + h*D + 2*lane) = make_float2(v0, v1);
+    }
+#else
+    GGML_UNUSED_VARS(q, k, v, table, r, sinks, cell_pos, q_pos, gate, dst, T, n_kv, n_rel, n_extent, n_swa,
+        s_q1, s_q2, s_k1, s_k2, s_v1, s_v2, s_t1, s_r1, s_r2, s_s1, s_g1, s_dst1, scale);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP)
+}
+
+// merges the KV splits of inkling2_attn_prefill_gqa (log2-unit stabilizers) and applies the zero sink and the gate;
+// one 64-lane wave per (token, head), lane = dim pair
+static __global__ void __launch_bounds__(256) inkling2_attn_prefill_combine(
+        const float * __restrict__ partial, const float * __restrict__ gate, float * __restrict__ dst,
+        const int T, const int n_head, const int n_split, const int64_t s_g1, const int64_t s_dst1) {
+    constexpr int D = 128;
+    const int task = blockIdx.x*4 + threadIdx.x/64;
+    const int lane = threadIdx.x % 64;
+    if (task >= T*n_head) {
+        return;
+    }
+    const int t = task / n_head;
+    const int h = task % n_head;
+
+    float M = -INFINITY;
+    for (int sp = 0; sp < n_split; ++sp) {
+        M = fmaxf(M, partial[((int64_t(sp)*T + t)*n_head + h)*(D + 2) + D]);
+    }
+    float  l = 0.0f;
+    float2 o = make_float2(0.0f, 0.0f);
+    if (M > -INFINITY) {
+        for (int sp = 0; sp < n_split; ++sp) {
+            const float * pt = partial + ((int64_t(sp)*T + t)*n_head + h)*(D + 2);
+            const float   ms = pt[D];
+            if (ms > -INFINITY) {
+                const float  w  = exp2f(ms - M);
+                const float2 os = *(const float2 *) (pt + 2*lane);
+                o.x += w*os.x;
+                o.y += w*os.y;
+                l   += w*pt[D + 1];
+            }
+        }
+    }
+    const float m_final = fmaxf(M, 0.0f);
+    const float scale_o = M > -INFINITY ? exp2f(M - m_final) : 0.0f;
+    const float l_final = l*scale_o + exp2f(-m_final);
+    const float inv_l   = scale_o/l_final;
+    float v0 = o.x*inv_l;
+    float v1 = o.y*inv_l;
+    if (gate) {
+        const float * gt = gate + int64_t(t)*s_g1 + h*D;
+        v0 *= 1.0f/(1.0f + expf(-gt[2*lane + 0]));
+        v1 *= 1.0f/(1.0f + expf(-gt[2*lane + 1]));
+    }
+    *(float2 *) (dst + int64_t(t)*s_dst1 + h*D + 2*lane) = make_float2(v0, v1);
+}
+
 bool ggml_cuda_inkling2_attn_supported(const ggml_tensor * op) {
     const ggml_type type    = op->src[1]->type;
     const int64_t   d       = op->src[0]->ne[0];
@@ -3597,8 +4093,51 @@ void ggml_cuda_op_inkling2_attn(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     if (mask->type == GGML_TYPE_I32) {
         const int n_swa = ggml_get_op_params_i32(dst, 4);
-        const dim3 grid((T + 31)/32, n_head, 1);
         const int64_t s_g1 = gate ? gate->nb[1]/sizeof(float) : 0;
+        if (n_gqa == 3) {
+            // KV split so that the (1 block per CU) grid fills whole rounds: 256 blocks on 60 CUs take 5 rounds unsplit,
+            // 13 rounds of 1/3 the work with 3 splits; only full-attention layers (SWA visibility clusters in a few tiles)
+            const int n_blocks = ((T + 31)/32)*k->ne[1];
+            const int n_sm     = ggml_cuda_info().devices[ctx.device].nsm;
+            const int s_max    = n_swa > 0 ? 1 : std::min(n_blocks >= n_sm ? 4 : 16, std::max(1, n_kv/2048));
+            int    n_split = 1;
+            double best    = (n_blocks + n_sm - 1)/n_sm;
+            for (int sp = 2; sp <= s_max; ++sp) {
+                const double rounds = double((n_blocks*sp + n_sm - 1)/n_sm)/sp;
+                if (rounds < best - 1e-9) {
+                    best    = rounds;
+                    n_split = sp;
+                }
+            }
+            ggml_cuda_pool_alloc<float> partial(ctx.pool());
+            if (n_split > 1) {
+                partial.alloc((size_t) n_split*T*n_head*(d + 2));
+            }
+            const dim3 grid_gqa((T + 31)/32, k->ne[1], n_split);
+            auto launch_gqa = [&](auto kv_tag) {
+                inkling2_attn_prefill_gqa<decltype(kv_tag)::value><<<grid_gqa, 512, 0, ctx.stream()>>>(
+                    (const float *) q->data, (const char *) k->data, (const char *) v->data,
+                    (const float *) table->data, (const float *) r->data, (const float *) sinks->data,
+                    (const int32_t *) rel_pos->data, (const int32_t *) mask->data,
+                    gate ? (const float *) gate->data : nullptr, (float *) dst->data, n_split > 1 ? partial.get() : nullptr,
+                    T, n_kv, n_rel, (int) table->ne[1], n_swa,
+                    q->nb[1]/sizeof(float), q->nb[2]/sizeof(float), k->nb[1], k->nb[2],
+                    v->nb[1], v->nb[2], table->nb[1]/sizeof(float), r->nb[1]/sizeof(float), r->nb[2]/sizeof(float),
+                    sinks->nb[1]/sizeof(float), s_g1, dst->nb[1]/sizeof(float), scale);
+            };
+            if (k->type == GGML_TYPE_Q8_0) {
+                launch_gqa(std::true_type{});
+            } else {
+                launch_gqa(std::false_type{});
+            }
+            if (n_split > 1) {
+                inkling2_attn_prefill_combine<<<(T*n_head + 3)/4, 256, 0, ctx.stream()>>>(
+                    partial.get(), gate ? (const float *) gate->data : nullptr, (float *) dst->data,
+                    T, n_head, n_split, s_g1, dst->nb[1]/sizeof(float));
+            }
+            return;
+        }
+        const dim3 grid((T + 31)/32, n_head, 1);
         if (k->type == GGML_TYPE_Q8_0) {
             inkling2_attn_prefill_tile<true><<<grid, 256, 0, ctx.stream()>>>(
                 (const float *) q->data, (const char *) k->data, (const char *) v->data,

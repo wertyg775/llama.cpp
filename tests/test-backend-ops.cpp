@@ -5384,9 +5384,11 @@ struct test_inkling2_attn_compact : public test_case {
     const int64_t   n_active;
     const bool      with_gate;
     const int32_t   n_swa;
+    const int64_t   n_extent;
+    const bool      holes; // every 11th cell empty (cell_pos -1); a model cache filled by one sequence has none
 
     std::string vars() override {
-        return VARS_TO_STR9(type, d, n_head, n_head_kv, n_kv, n_tokens, n_active, with_gate, n_swa);
+        return VARS_TO_STR11(type, d, n_head, n_head_kv, n_kv, n_tokens, n_active, with_gate, n_swa, n_extent, holes);
     }
 
     double max_nmse_err() override {
@@ -5394,12 +5396,11 @@ struct test_inkling2_attn_compact : public test_case {
     }
 
     test_inkling2_attn_compact(ggml_type type, int64_t d, int64_t n_head, int64_t n_head_kv, int64_t n_kv,
-            int64_t n_tokens, int64_t n_active, bool with_gate, int32_t n_swa = 0)
+            int64_t n_tokens, int64_t n_active, bool with_gate, int32_t n_swa = 0, int64_t n_extent = 100, bool holes = true)
         : type(type), d(d), n_head(n_head), n_head_kv(n_head_kv), n_kv(n_kv), n_tokens(n_tokens),
-          n_active(n_active), with_gate(with_gate), n_swa(n_swa) {}
+          n_active(n_active), with_gate(with_gate), n_swa(n_swa), n_extent(n_extent), holes(holes) {}
 
-    static constexpr int64_t n_rel    = 16;
-    static constexpr int64_t n_extent = 100;
+    static constexpr int64_t n_rel = 16;
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_head, n_tokens);
@@ -5443,7 +5444,7 @@ struct test_inkling2_attn_compact : public test_case {
             if (name == "cell_pos") {
                 std::vector<int32_t> data(n_kv + 1, -1);
                 for (int64_t j = 0; j < n_active; ++j) {
-                    data[j] = (j % 11 == 5) ? -1 : (int32_t) j;
+                    data[j] = (holes && j % 11 == 5) ? -1 : (int32_t) j;
                 }
                 data[n_kv] = (int32_t) n_active;
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
@@ -11516,6 +11517,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_F16,  128, 24, 8, 512,  32,  512, true));
     test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 1536, 65,  1500, false, 128));
     test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_F16,  128, 24, 8, 1536, 35,  1000, false, 256));
+    // long enough for the KV-split path of the GQA prefill kernel
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 8192, 65,  7000, true,  0, 1025));
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_F16,  128, 24, 8, 6144, 40,  6144, false, 0, 100));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, 256, true,  GGML_TYPE_F16, 512, 128, 128));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, 4096, true,  GGML_TYPE_F16, 4096));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, 4096, false, GGML_TYPE_F16, 4096));
@@ -14625,6 +14629,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 8, n_kv, false, GGML_TYPE_F16, n_kv, 128, 128, true));
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, n_kv, 1, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     }
+
+    // INKLING2_ATTN compact causal prefill (Q8_0 KV, 24/8 heads, ubatch 1024 at the end of the cache):
+    // full-attention layers at depth (relative extent 1025), and a SWA layer (window 1024, SWA cache of ub + n_swa)
+    for (int64_t n_kv : {32768, 131072, 262144}) {
+        test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, n_kv, 1024, n_kv, false, 0, 1025, false));
+    }
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 2048, 1024, 2048, false, 1024, 1024, false));
 
     // INKLING2_PROJ: Inkling 2 Mini projections of a SWA layer input, decode
     test_cases.emplace_back(new test_inkling2_proj(GGML_TYPE_BF16, 2304, {3072, 384, 24, 3072, 512, 512}, 1, true));
