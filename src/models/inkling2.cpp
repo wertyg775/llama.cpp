@@ -436,6 +436,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             const int     ctrl = LOOP_CTRL_Q + j;
             const int64_t k    = std::min<int64_t>(j, mixed->ne[1] - 1);
             inputs[j] = control(inputs[j], fused ? nullptr : row(mixed_norm, k), row(messages, ctrl), fused ? nullptr : row(messages_norm, ctrl), *loop, ctrl, ip);
+            // all three controls before the projections, so that a backend can batch the projections (and the controls)
+            ggml_build_forward_expand(gf, inputs[j]);
         }
     }
 
