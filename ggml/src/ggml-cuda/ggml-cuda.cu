@@ -4580,6 +4580,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // inkling2 proj ops of independent inputs: one launch
+    if (node->op == GGML_OP_INKLING2_PROJ) {
+        const int proj_skip = ggml_cuda_inkling2_proj_batch_fusion(*cuda_ctx, cgraph, i);
+        if (proj_skip > 0) {
+            return proj_skip;
+        }
+    }
+
     // inkling2 conv -> cpy: batch independent conv (+ optional trailing clip), else fuse conv -> state cpy
     if (node->op == GGML_OP_INKLING2_CONV) {
         const int batch_skip = ggml_cuda_inkling2_conv_batch_fusion(*cuda_ctx, cgraph, i);
@@ -5836,6 +5844,30 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 add_alloc_deps(i, i + 4);
                 i += 4;
                 continue;
+            }
+
+            // inkling2 proj batch: the proj ops run concurrently, keep all their inputs alive to the end
+            if (cgraph->nodes[i]->op == GGML_OP_INKLING2_PROJ) {
+                const int last = ggml_cuda_inkling2_proj_batch_group(cgraph, i);
+                if (last > i) {
+                    for (int j = i; j <= last; ++j) {
+                        ggml_tensor * n = cgraph->nodes[j];
+                        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                            ggml_tensor * src = n->src[s];
+                            if (src) {
+                                params->add_alloc_dep(params->user_data, src, cgraph->nodes[last]);
+                                if (src->view_src) {
+                                    params->add_alloc_dep(params->user_data, src->view_src, cgraph->nodes[last]);
+                                }
+                            }
+                        }
+                        if (j < last) {
+                            params->add_alloc_dep(params->user_data, n, cgraph->nodes[last]);
+                        }
+                    }
+                    i = last;
+                    continue;
+                }
             }
 
             // inkling2 conv batch fusion runs two convs and a clip concurrently: keep all their inputs alive to the end

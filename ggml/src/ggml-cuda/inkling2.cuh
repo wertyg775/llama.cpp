@@ -35,6 +35,12 @@ bool ggml_cuda_inkling2_proj_supported(const ggml_tensor * op);
 
 void ggml_cuda_op_inkling2_proj(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// before allocation: the last node of a run of independent single-token proj ops starting at node_idx, or -1
+int ggml_cuda_inkling2_proj_batch_group(const ggml_cgraph * cgraph, int node_idx);
+
+// run such a run of proj ops as one launch; returns nodes to skip or 0
+int ggml_cuda_inkling2_proj_batch_fusion(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
+
 bool ggml_cuda_inkling2_attn_supported(const ggml_tensor * op);
 
 void ggml_cuda_op_inkling2_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
