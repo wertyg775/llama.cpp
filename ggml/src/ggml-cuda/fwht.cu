@@ -240,3 +240,144 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
             return false;
     }
 }
+
+// fused warp-level FWHT + Q8_0 quantization + row scatter for quantized KV cache writes
+template <int N, typename T>
+__launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void fwht_set_rows_q8_0_cuda(
+        const T * __restrict__ src, const int64_t * __restrict__ idxs, char * __restrict__ dst,
+        const int64_t n_rows, const int rows_per_tok, const int64_t s_idx, const size_t nb1, const float scale) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    static constexpr int el_w = N / warp_size;
+
+    const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
+    if (r >= n_rows) {
+        return;
+    }
+
+    src += r * N;
+    const int lane = threadIdx.x;
+    float reg[el_w];
+
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        reg[i] = ggml_cuda_cast<float>(src[i * warp_size + lane]) * scale;
+    }
+
+#pragma unroll
+    for (int h = 1; h < warp_size; h *= 2) {
+#pragma unroll
+        for (int j = 0; j < el_w; ++j) {
+            const float val  = reg[j];
+            const float val2 = ggml_cuda_shfl_xor(val, h, warp_size);
+            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+        }
+    }
+
+#pragma unroll
+    for (int h = warp_size; h < N; h *= 2) {
+        const int step = h / warp_size;
+#pragma unroll
+        for (int j = 0; j < el_w; j += 2 * step) {
+#pragma unroll
+            for (int k = 0; k < step; ++k) {
+                const float x = reg[j + k];
+                const float y = reg[j + k + step];
+                reg[j + k]        = x + y;
+                reg[j + k + step] = x - y;
+            }
+        }
+    }
+
+    const int64_t tok     = r / rows_per_tok;
+    const int     head    = (int) (r % rows_per_tok);
+    const int64_t dst_row = idxs[tok * s_idx];
+    block_q8_0 *  row_ptr = (block_q8_0 *) (dst + dst_row * nb1);
+    const int     sub     = lane & 31;
+
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        const float v = reg[i];
+        float amax = fabsf(v);
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            amax = fmaxf(amax, ggml_cuda_shfl_xor(amax, mask, 32));
+        }
+        const float  d  = amax / 127.0f;
+        const float  id = d ? 1.0f/d : 0.0f;
+        const int8_t q  = roundf(v*id);
+
+        const int blk_idx = (head * N + i * warp_size + (lane & ~31)) / QK8_0;
+        block_q8_0 * blk = row_ptr + blk_idx;
+        if (sub == 0) {
+            blk->d = d;
+        }
+        blk->qs[sub] = q;
+    }
+}
+
+bool ggml_cuda_op_fwht_set_rows_supported(const ggml_tensor * mm, const ggml_tensor * reshape, const ggml_tensor * view, const ggml_tensor * set_rows) {
+    if (!ggml_cuda_op_mul_mat_use_fwht(mm)) {
+        return false;
+    }
+    const int64_t n = mm->ne[0];
+    if (n != 64 && n != 128 && n != 256 && n != 512) {
+        return false;
+    }
+    if (reshape->op != GGML_OP_RESHAPE || reshape->src[0] != mm) {
+        return false;
+    }
+    if (view->op != GGML_OP_VIEW || view->src[0] != reshape || !ggml_is_contiguous(view) || view->view_offs != 0) {
+        return false;
+    }
+    if (view->ne[0] % n != 0 || view->ne[2] != 1 || view->ne[3] != 1 || ggml_nelements(view) != ggml_nelements(mm)) {
+        return false;
+    }
+    if (set_rows->op != GGML_OP_SET_ROWS || set_rows->src[0] != view || set_rows->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    const ggml_tensor * idxs = set_rows->src[1];
+    return idxs->type == GGML_TYPE_I64 && set_rows->ne[0] == view->ne[0] &&
+        set_rows->ne[2] == 1 && set_rows->ne[3] == 1 && idxs->ne[0] == view->ne[1] &&
+        idxs->ne[1] == 1 && idxs->ne[2] == 1 && idxs->ne[3] == 1 && set_rows->nb[0] == sizeof(block_q8_0);
+}
+
+template <typename T>
+static void ggml_cuda_op_fwht_set_rows_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * set_rows) {
+    const int     n            = (int) src->ne[0];
+    const int64_t rows         = ggml_nrows(src);
+    const int     rows_per_tok = (int) (set_rows->ne[0] / n);
+    const int64_t s_idx        = set_rows->src[1]->nb[0] / sizeof(int64_t);
+    const size_t  nb1          = set_rows->nb[1];
+    const float   scale        = 1.0f / sqrtf((float) n);
+
+    const int warp_size      = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const int rows_per_block = 4;
+    const int64_t num_blocks = (rows + rows_per_block - 1) / rows_per_block;
+
+    dim3 grid_dims(num_blocks, 1, 1);
+    dim3 block_dims(warp_size, rows_per_block, 1);
+    const ggml_cuda_kernel_launch_params launch_params(grid_dims, block_dims, 0, ctx.stream());
+
+    const T *       src_d  = (const T *) src->data;
+    const int64_t * idxs_d = (const int64_t *) set_rows->src[1]->data;
+    char *          dst_d  = (char *) set_rows->data;
+
+    switch (n) {
+        case  64: ggml_cuda_kernel_launch(fwht_set_rows_q8_0_cuda< 64, T>, launch_params, src_d, idxs_d, dst_d, rows, rows_per_tok, s_idx, nb1, scale); break;
+        case 128: ggml_cuda_kernel_launch(fwht_set_rows_q8_0_cuda<128, T>, launch_params, src_d, idxs_d, dst_d, rows, rows_per_tok, s_idx, nb1, scale); break;
+        case 256: ggml_cuda_kernel_launch(fwht_set_rows_q8_0_cuda<256, T>, launch_params, src_d, idxs_d, dst_d, rows, rows_per_tok, s_idx, nb1, scale); break;
+        case 512: ggml_cuda_kernel_launch(fwht_set_rows_q8_0_cuda<512, T>, launch_params, src_d, idxs_d, dst_d, rows, rows_per_tok, s_idx, nb1, scale); break;
+        default: GGML_ABORT("unsupported fwht_set_rows n=%d", n);
+    }
+}
+
+void ggml_cuda_op_fwht_set_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, ggml_tensor * set_rows) {
+    const ggml_tensor * src = mm->src[1];
+    switch (src->type) {
+        case GGML_TYPE_F32: ggml_cuda_op_fwht_set_rows_impl<float>(ctx, src, set_rows); break;
+        case GGML_TYPE_F16: ggml_cuda_op_fwht_set_rows_impl<half>(ctx, src, set_rows);  break;
+        default: GGML_ABORT("unsupported fwht_set_rows src type %s", ggml_type_name(src->type));
+    }
+}

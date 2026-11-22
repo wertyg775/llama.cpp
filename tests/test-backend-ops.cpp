@@ -6277,6 +6277,84 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
+// GGML_OP_MUL_MAT(HADAMARD) + GGML_OP_RESHAPE + GGML_OP_VIEW + GGML_OP_SET_ROWS(Q8_0)
+struct test_fwht_set_rows : public test_case {
+    const ggml_type src_type;
+    const int64_t   d;
+    const int64_t   n_head;
+    const int64_t   n_tokens;
+    const int64_t   n_rows;
+
+    std::string vars() override {
+        return VARS_TO_STR5(src_type, d, n_head, n_tokens, n_rows);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FWHT_SET_ROWS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 1e-4;
+    }
+
+    test_fwht_set_rows(ggml_type src_type = GGML_TYPE_F32, int64_t d = 128, int64_t n_head = 4, int64_t n_tokens = 1, int64_t n_rows = 32)
+        : src_type(src_type), d(d), n_head(n_head), n_tokens(n_tokens), n_rows(n_rows) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, d);
+        ggml_set_name(rot, "rot");
+
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, src_type, d, n_head*n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * mm = ggml_mul_mat(ctx, rot, x);
+        ggml_mul_mat_set_hint(mm, GGML_HINT_SRC0_IS_HADAMARD);
+
+        ggml_tensor * rsh  = ggml_reshape_4d(ctx, mm, d, n_head, n_tokens, 1);
+        ggml_tensor * view = ggml_view_2d(ctx, rsh, d*n_head, n_tokens, rsh->nb[2], 0);
+
+        ggml_tensor * idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+        ggml_set_name(idxs, "idxs");
+
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, d*n_head, n_rows);
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * out = ggml_set_rows(ctx, cache, view, idxs);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(19);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "rot") == 0) {
+                std::vector<float> data(d*d);
+                const float scale = 1.0f / sqrtf((float) d);
+                for (int64_t r = 0; r < d; ++r) {
+                    for (int64_t i = 0; i < d; ++i) {
+                        int pop = 0;
+                        for (int64_t v = r & i; v; v >>= 1) {
+                            pop += (v & 1);
+                        }
+                        data[r*d + i] = (pop % 2 == 0) ? scale : -scale;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            } else if (strcmp(t->name, "idxs") == 0) {
+                std::vector<int64_t> perm(n_rows);
+                std::iota(perm.begin(), perm.end(), 0);
+                std::shuffle(perm.begin(), perm.end(), rng);
+                ggml_backend_tensor_set(t, perm.data(), 0, n_tokens*sizeof(int64_t));
+            } else if (strcmp(t->name, "x") == 0 || strcmp(t->name, "cache") == 0) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // FP4 W4A8 path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_w4a8 : public test_mul_mat {
     test_mul_mat_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -11329,6 +11407,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 4, 256, false, GGML_TYPE_F16, 512, 128, 128));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 4, 64,  false, GGML_TYPE_F32, 0,    64,  64));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, 256, true,  GGML_TYPE_F16, 512, 128, 128));
+    for (ggml_type src_type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int64_t d : {64, 128, 256, 512}) {
+            test_cases.emplace_back(new test_fwht_set_rows(src_type, d, 4, 1, 32));
+            test_cases.emplace_back(new test_fwht_set_rows(src_type, d, 4, 17, 64));
+        }
+    }
     for (ggml_type type : {GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (bool norm : {true, false}) {
             test_cases.emplace_back(new test_inkling2_proj(type, 64, {32, 5}, 1, norm));

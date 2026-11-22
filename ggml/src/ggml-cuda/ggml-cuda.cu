@@ -4284,6 +4284,21 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    std::initializer_list<enum ggml_op> fwht_set_rows_ops = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+
+    if (is_equal(fwht_set_rows_ops, ops) && ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 3 })) {
+        const ggml_tensor * mm       = cgraph->nodes[node_idx];
+        const ggml_tensor * reshape  = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * view     = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * set_rows = cgraph->nodes[node_idx + 3];
+
+        if (ggml_check_edges(cgraph, node_idx, {{1, 0, 0}, {2, 0, 1}, {3, 0, 2}}) &&
+                ggml_cuda_op_fwht_set_rows_supported(mm, reshape, view, set_rows)) {
+            int out_nodes[] = { node_idx + 3 };
+            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+        }
+    }
+
     // scale_out*sigmoid(scale_in*post) as the hc_post weights (qwen4exp hc_combine)
     std::initializer_list<enum ggml_op> hc_post_gate_ops = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
 
@@ -4675,6 +4690,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
         ggml_cuda_op_rope_fused(*cuda_ctx, rope, set_rows);
         return 2;
+    }
+
+    // FWHT (Hadamard MUL_MAT) + reshape + view + set-rows (Q8_0)
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+        ggml_tensor * mm       = cgraph->nodes[i];
+        ggml_tensor * set_rows = cgraph->nodes[i + 3];
+
+        ggml_cuda_op_fwht_set_rows(*cuda_ctx, mm, set_rows);
+        return 3;
     }
 
     // Snake activation: y = x + sin(a*x)^2 * inv_b
