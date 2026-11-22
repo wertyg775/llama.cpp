@@ -12,6 +12,9 @@ void ggml_cuda_op_inkling2_conv(ggml_backend_cuda_context & ctx, ggml_tensor * d
 // the number of nodes to skip when the next copy of the new conv state can be fused, else 0
 int ggml_cuda_inkling2_conv_state_fusion(const ggml_cgraph * cgraph, int node_idx, float ** state_dst, int64_t * s_state_q);
 
+// fuse two independent convs (with optional state stores) and an optional trailing clip into one launch; returns nodes to skip or 0
+int ggml_cuda_inkling2_conv_batch_fusion(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
+
 bool ggml_cuda_inkling2_mix_supported(const ggml_tensor * op);
 
 void ggml_cuda_op_inkling2_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

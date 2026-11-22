@@ -369,6 +369,7 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     tau = ggml_scale_bias(ctx0, ggml_cast(ctx0, inp_pos, GGML_TYPE_F32), 1.0f, 1.0f);
     tau = ggml_log(ctx0, ggml_clamp(ctx0, ggml_scale(ctx0, tau, 1.0f/hparams.n_log_scale_floor), 1.0f, INFINITY));
     tau = ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, tau, hparams.f_log_scale_alpha, 1.0f), 1, 1, n_tokens);
+    ggml_build_forward_expand(gf, tau);
 
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
 
@@ -477,6 +478,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                     ws.push_back(ws_all[i]);
                 }
                 ggml_tensor * out = ggml_inkling2_proj(ctx0, g.x, ws.data(), (int) ws.size(), g.norm, hparams.f_norm_rms_eps);
+                ggml_build_forward_expand(gf, out);
                 res->add_fused_node({LLM_FUSED_OP_INKLING2, out, ip});
 
                 size_t offs = 0;
@@ -530,6 +532,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             ggml_tensor * qr = ggml_inkling2_clip2(ctx0,
                     ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), layer.attn_q_clip, hparams.f_qk_clip,
                     ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip, tau_l, 1e-6f);
+            ggml_build_forward_expand(gf, qr);
             res->add_fused_node({LLM_FUSED_OP_INKLING2, qr, ip});
 
             Qcur = ggml_view_3d(ctx0, qr, n_embd_head, n_head, n_tokens, n_embd_head*sizeof(float), n_embd_head*n_head*sizeof(float), 0);

@@ -4580,8 +4580,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // inkling2 conv -> cpy: write the new conv state into the cache
+    // inkling2 conv -> cpy: batch independent conv (+ optional trailing clip), else fuse conv -> state cpy
     if (node->op == GGML_OP_INKLING2_CONV) {
+        const int batch_skip = ggml_cuda_inkling2_conv_batch_fusion(*cuda_ctx, cgraph, i);
+        if (batch_skip > 0) {
+            return batch_skip;
+        }
         float * state_dst = nullptr;
         int64_t s_state_q = 0;
         const int nodes_to_skip = ggml_cuda_inkling2_conv_state_fusion(cgraph, i, &state_dst, &s_state_q);

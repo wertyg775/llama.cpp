@@ -464,6 +464,330 @@ int ggml_cuda_inkling2_conv_state_fusion(const ggml_cgraph * cgraph, int node_id
     return skip;
 }
 
+struct inkling2_conv_args {
+    const float   * cur;
+    const float   * past;
+    const float   * weight;
+    const float   * dynamic;
+    const float   * residual;
+    const int32_t * ids;
+    float         * y;
+    float         * state;
+    int             C, K, n_st, n_cph, offset;
+    int64_t         s_cur1, s_past0, s_past1, s_past2, s_dyn1, s_res1, s_state_q;
+    float           scale;
+    int             post, hd;
+    float           post_param;
+};
+
+struct inkling2_clip_args {
+    inkling2_clip_src a;
+    inkling2_clip_src b;
+    const float     * tau;
+    int               s_tau2;
+    bool              has_scale;
+};
+
+static inkling2_conv_args inkling2_conv_make_args(const ggml_tensor * dst, float * state_dst, int64_t s_state_q) {
+    const ggml_tensor * cur      = dst->src[0];
+    const ggml_tensor * past     = dst->src[1];
+    const ggml_tensor * weight   = dst->src[2];
+    const ggml_tensor * dynamic  = dst->src[3];
+    const ggml_tensor * residual = dst->src[4];
+    const ggml_tensor * ids      = dst->src[5];
+
+    inkling2_conv_args a = {};
+    memcpy(&a.scale, dst->op_params, sizeof(float));
+    a.offset     = ggml_get_op_params_i32(dst, 1);
+    a.post       = ggml_get_op_params_i32(dst, 2);
+    a.hd         = ggml_get_op_params_i32(dst, 3);
+    a.post_param = ggml_get_op_params_f32(dst, 4);
+
+    a.C      = cur->ne[0];
+    a.K      = weight->ne[0];
+    const int T      = cur->ne[1];
+    const int n_seqs = ids ? ids->ne[0] : past->ne[2];
+    a.n_st   = T/n_seqs;
+    a.n_cph  = dynamic ? a.C/(dynamic->ne[0]/a.K) : 1;
+
+    a.cur       = (const float *) cur->data;
+    a.past      = (const float *) past->data;
+    a.weight    = (const float *) weight->data;
+    a.dynamic   = dynamic ? (const float *) dynamic->data : nullptr;
+    a.residual  = residual ? (const float *) residual->data : nullptr;
+    a.ids       = ids ? (const int32_t *) ids->data : nullptr;
+    a.y         = (float *) dst->data;
+    a.state     = state_dst ? state_dst : a.y + (int64_t) a.C*T;
+    a.s_cur1    = cur->nb[1]/sizeof(float);
+    a.s_past0   = past->nb[0]/sizeof(float);
+    a.s_past1   = past->nb[1]/sizeof(float);
+    a.s_past2   = ids ? 0 : past->nb[2]/sizeof(float);
+    a.s_dyn1    = dynamic ? dynamic->nb[1]/sizeof(float) : 0;
+    a.s_res1    = residual ? residual->nb[1]/sizeof(float) : 0;
+    a.s_state_q = state_dst ? s_state_q : (int64_t) a.C*(a.K - 1);
+    return a;
+}
+
+static __device__ __forceinline__ void inkling2_conv_block(const inkling2_conv_args & a, const int bx) {
+    const int  c_raw = bx*blockDim.x + threadIdx.x;
+    const bool valid = c_raw < a.C;
+    const int  c     = valid ? c_raw : a.C - 1;
+
+    const float * xp = a.ids ? a.past + a.ids[0]*a.s_past1 + (int64_t) (a.offset + c)*(a.K - 1) : a.past + c*a.s_past1;
+    const float * xc = a.cur + c;
+    const float * w  = a.weight + (int64_t) c*a.K;
+
+    auto x = [&](int k) {
+        return k < a.K - 1 ? xp[k*a.s_past0] : xc[(k - (a.K - 1))*a.s_cur1];
+    };
+
+    for (int i = 0; i < a.n_st; ++i) {
+        float sum = 0.0f;
+        for (int k = 0; k < a.K; ++k) {
+            sum += x(i + k)*w[k];
+        }
+
+        if (a.dynamic) {
+            const float * taps = a.dynamic + (int64_t) i*a.s_dyn1 + (c/a.n_cph)*a.K;
+            for (int lag = 0; lag < a.K; ++lag) {
+                sum += x(i + a.K - 1 - lag)*taps[lag];
+            }
+        }
+
+        const float out = __fmul_rn(sum + x(i + a.K - 1), a.scale);
+        float       yv  = a.residual ? a.residual[(int64_t) i*a.s_res1 + c] + out : out;
+
+        if (a.post != GGML_INKLING2_HEAD_POST_NONE) {
+            __shared__ float hs[1024/WARP_SIZE];
+            const float ss = warp_reduce_sum(yv*yv);
+            if (threadIdx.x % WARP_SIZE == 0) {
+                hs[threadIdx.x / WARP_SIZE] = ss;
+            }
+            __syncthreads();
+            float sum_h = 0.0f;
+            const int w0 = (threadIdx.x / a.hd)*(a.hd / WARP_SIZE);
+            for (int wi = 0; wi < a.hd / WARP_SIZE; ++wi) {
+                sum_h += hs[w0 + wi];
+            }
+            __syncthreads();
+            if (a.post == GGML_INKLING2_HEAD_POST_CLIP) {
+                yv = yv/fmaxf(sqrtf(sum_h)*(1.0f/a.post_param) + 1e-6f/a.post_param, 1.0f);
+            } else {
+                yv = yv*rsqrtf(sum_h/a.hd + a.post_param);
+            }
+        }
+
+        if (valid) {
+            a.y[(int64_t) i*a.C + c] = yv;
+        }
+    }
+
+    if (valid) {
+        for (int k = 0; k < a.K - 1; ++k) {
+            a.state[(int64_t) c*(a.K - 1) + k] = x(a.n_st + k);
+        }
+    }
+}
+
+static __global__ void inkling2_conv2_clip_f32(
+        const inkling2_conv_args c0, const inkling2_conv_args c1, const inkling2_clip_args cl,
+        const int b0, const int b1) {
+    const int bx = blockIdx.x;
+    if (bx < b0) {
+        inkling2_conv_block(c0, bx);
+        return;
+    }
+    if (bx < b0 + b1) {
+        inkling2_conv_block(c1, bx - b0);
+        return;
+    }
+
+    int64_t ir = (int64_t) (bx - b0 - b1)*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    if (ir >= cl.a.nr + cl.b.nr) {
+        return;
+    }
+    const inkling2_clip_src & p = ir < cl.a.nr ? cl.a : cl.b;
+    if (ir >= cl.a.nr) {
+        ir -= cl.a.nr;
+    }
+    const int lane = threadIdx.x % WARP_SIZE;
+
+    const int64_t i1 = ir % p.ne01;
+    const int64_t i2 = (ir/p.ne01) % p.ne02;
+    const int64_t i3 = ir/((int64_t) p.ne01*p.ne02);
+
+    const float * xs = p.x + i1*p.s01 + i2*p.s02 + i3*p.s03;
+    const float * ss = cl.has_scale ? p.scale + i1*p.s_scale1 : nullptr;
+    float       * y  = p.dst + ir*p.ne00;
+
+    float sum = 0.0f;
+    for (int i0 = lane; i0 < p.ne00; i0 += WARP_SIZE) {
+        const float v = cl.has_scale ? xs[i0]*ss[i0] : xs[i0];
+        sum += v*v;
+    }
+    sum = warp_reduce_sum(sum);
+
+    const float d = fmaxf(sqrtf(sum)*p.inv_threshold + p.eps_threshold, 1.0f);
+    const float t = cl.tau ? cl.tau[i2*cl.s_tau2] : 1.0f;
+
+    for (int i0 = lane; i0 < p.ne00; i0 += WARP_SIZE) {
+        const float v = cl.has_scale ? xs[i0]*ss[i0] : xs[i0];
+        y[i0] = v/d*t;
+    }
+}
+
+static bool inkling2_tensor_depends_on(const ggml_tensor * consumer, const ggml_tensor * producer) {
+    const ggml_tensor * prod_root = producer->view_src ? producer->view_src : producer;
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        const ggml_tensor * src = consumer->src[s];
+        if (!src) {
+            continue;
+        }
+        const ggml_tensor * src_root = src->view_src ? src->view_src : src;
+        if (src_root == prod_root || src->data == producer->data) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool inkling2_ranges_overlap(const void * a, size_t na, const void * b, size_t nb) {
+    if (!a || !b || na == 0 || nb == 0) {
+        return false;
+    }
+    const uintptr_t a0 = (uintptr_t) a;
+    const uintptr_t a1 = a0 + na;
+    const uintptr_t b0 = (uintptr_t) b;
+    const uintptr_t b1 = b0 + nb;
+    return a0 < b1 && b0 < a1;
+}
+
+int ggml_cuda_inkling2_conv_batch_fusion(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * conv0 = cgraph->nodes[node_idx];
+    if (conv0->op != GGML_OP_INKLING2_CONV) {
+        return 0;
+    }
+
+    auto conv_is_single_chunk = [](const ggml_tensor * conv) {
+        const ggml_tensor * ids    = conv->src[5];
+        const int64_t       T      = conv->src[0]->ne[1];
+        const int64_t       n_seqs = ids ? ids->ne[0] : conv->src[1]->ne[2];
+        return n_seqs == 1 && T <= INKLING2_CONV_CHUNK;
+    };
+    if (!conv_is_single_chunk(conv0)) {
+        return 0;
+    }
+
+    float * state_dst0 = nullptr;
+    int64_t s_state_q0 = 0;
+    const int skip0 = ggml_cuda_inkling2_conv_state_fusion(cgraph, node_idx, &state_dst0, &s_state_q0);
+
+    auto next_compute = [&](int start) {
+        for (int j = start; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (ggml_is_empty(n) || n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE ||
+                n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE || n->op == GGML_OP_NONE) {
+                continue;
+            }
+            return j;
+        }
+        return -1;
+    };
+
+    const int idx1 = next_compute(node_idx + skip0 + 1);
+    if (idx1 < 0 || cgraph->nodes[idx1]->op != GGML_OP_INKLING2_CONV) {
+        return 0;
+    }
+    ggml_tensor * conv1 = cgraph->nodes[idx1];
+    if (!conv_is_single_chunk(conv1) || inkling2_tensor_depends_on(conv1, conv0)) {
+        return 0;
+    }
+
+    float * state_dst1 = nullptr;
+    int64_t s_state_q1 = 0;
+    const int skip1 = ggml_cuda_inkling2_conv_state_fusion(cgraph, idx1, &state_dst1, &s_state_q1);
+
+    // check that conv0 and conv1 touch disjoint channel ranges if they share a recurrent state buffer
+    const int64_t C0   = conv0->src[0]->ne[0];
+    const int64_t C1   = conv1->src[0]->ne[0];
+    const int64_t K0   = conv0->src[2]->ne[0];
+    const int64_t K1   = conv1->src[2]->ne[0];
+    const int     off0 = ggml_get_op_params_i32(conv0, 1);
+    const int     off1 = ggml_get_op_params_i32(conv1, 1);
+
+    if (conv0->src[5] && conv1->src[5]) {
+        const ggml_tensor * p0 = conv0->src[1]->view_src ? conv0->src[1]->view_src : conv0->src[1];
+        const ggml_tensor * p1 = conv1->src[1]->view_src ? conv1->src[1]->view_src : conv1->src[1];
+        if (p0 == p1 && off0 < off1 + C1 && off1 < off0 + C0) {
+            return 0;
+        }
+    }
+    if (state_dst0 && state_dst1 &&
+        inkling2_ranges_overlap(state_dst0, (size_t) (K0 - 1)*C0*sizeof(float),
+                                state_dst1, (size_t) (K1 - 1)*C1*sizeof(float))) {
+        return 0;
+    }
+    if (state_dst0 && inkling2_ranges_overlap(state_dst0, (size_t) (K0 - 1)*C0*sizeof(float),
+                                              conv1->src[1]->data, ggml_nbytes(conv1->src[1]))) {
+        // state_dst0 is inside conv1's past buffer: safe only when indexed by ids with disjoint channel offsets
+        if (!(conv0->src[5] && conv1->src[5] && (off0 + C0 <= off1 || off1 + C1 <= off0))) {
+            return 0;
+        }
+    }
+    if (state_dst1 && inkling2_ranges_overlap(state_dst1, (size_t) (K1 - 1)*C1*sizeof(float),
+                                              conv0->src[1]->data, ggml_nbytes(conv0->src[1]))) {
+        if (!(conv0->src[5] && conv1->src[5] && (off0 + C0 <= off1 || off1 + C1 <= off0))) {
+            return 0;
+        }
+    }
+
+    int last_idx = idx1 + skip1;
+    inkling2_clip_args cl = {};
+    int b2 = 0;
+
+    const int idx2 = next_compute(idx1 + skip1 + 1);
+    if (idx2 >= 0 && cgraph->nodes[idx2]->op == GGML_OP_INKLING2_CLIP) {
+        ggml_tensor * clip = cgraph->nodes[idx2];
+        if (ggml_is_contiguous(clip) &&
+            !inkling2_tensor_depends_on(clip, conv0) &&
+            !inkling2_tensor_depends_on(clip, conv1)) {
+            const ggml_tensor * x      = clip->src[0];
+            const ggml_tensor * scale  = clip->src[1];
+            const ggml_tensor * tau    = clip->src[2];
+            const ggml_tensor * x2     = clip->src[3];
+            const ggml_tensor * scale2 = clip->src[4];
+            if (!x2 || !scale == !scale2) {
+                const float threshold  = ggml_get_op_params_f32(clip, 0);
+                const float eps        = ggml_get_op_params_f32(clip, 1);
+                const float threshold2 = ggml_get_op_params_f32(clip, 2);
+                float * y = (float *) clip->data;
+                cl.a = inkling2_clip_make_src(x, scale, y, threshold, eps);
+                if (x2) {
+                    cl.b = inkling2_clip_make_src(x2, scale2, y + ggml_nelements(x), threshold2, eps);
+                }
+                cl.tau       = tau ? (const float *) tau->data : nullptr;
+                cl.s_tau2    = tau && tau->ne[2] > 1 ? 1 : 0;
+                cl.has_scale = scale != nullptr;
+
+                const int rows_per_block = 256/WARP_SIZE;
+                b2 = (int) ((cl.a.nr + cl.b.nr + rows_per_block - 1)/rows_per_block);
+                last_idx = idx2;
+            }
+        }
+    }
+
+    const inkling2_conv_args a0 = inkling2_conv_make_args(conv0, state_dst0, s_state_q0);
+    const inkling2_conv_args a1 = inkling2_conv_make_args(conv1, state_dst1, s_state_q1);
+    const int n_threads = 256;
+    const int b0 = (a0.C + n_threads - 1)/n_threads;
+    const int b1 = (a1.C + n_threads - 1)/n_threads;
+    GGML_ASSERT(a0.post == GGML_INKLING2_HEAD_POST_NONE || (n_threads % a0.hd == 0 && a0.hd % WARP_SIZE == 0));
+    GGML_ASSERT(a1.post == GGML_INKLING2_HEAD_POST_NONE || (n_threads % a1.hd == 0 && a1.hd % WARP_SIZE == 0));
+
+    inkling2_conv2_clip_f32<<<dim3(b0 + b1 + b2), n_threads, 0, ctx.stream()>>>(a0, a1, cl, b0, b1);
+    return last_idx - node_idx;
+}
+
 // the most blocks a mix kernel keeps in registers
 static constexpr int INKLING2_MIX_MAX_BLOCKS = 15;
 
