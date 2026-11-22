@@ -4563,7 +4563,7 @@ ggml_tensor * llm_graph_context::build_attn_inkling2_fused(
     const int32_t n_rot_q = k_rot ? (int32_t) k_rot->ne[0] : 0;
     const int32_t n_rot_v = v_rot ? (int32_t) v_rot->ne[0] : 0;
 
-    if (mctx_cur->get_k_scale(il) || mctx_cur->get_v_scale(il) || attn_mask.rows || attn_mask.raw->ne[3] != 1 || rel_pos->ne[0] > n_kv_max ||
+    if (mctx_cur->get_k_scale(il) || mctx_cur->get_v_scale(il) || attn_mask.rows || attn_mask.raw->ne[3] != 1 ||
         (n_rot_q > 0 && ((n_rot_q & (n_rot_q - 1)) != 0 || q_cur->ne[0] % n_rot_q != 0)) ||
         (n_rot_v > 0 && ((n_rot_v & (n_rot_v - 1)) != 0 || q_cur->ne[0] % n_rot_v != 0))) {
         return nullptr;
@@ -4579,7 +4579,7 @@ ggml_tensor * llm_graph_context::build_attn_inkling2_fused(
     }
     const bool ok_type = k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_F32 ||
         (k->type == GGML_TYPE_Q8_0 && !v_trans && q_cur->ne[0] % ggml_blck_size(k->type) == 0);
-    if (!ok_type) {
+    if (!ok_type || (k->type != GGML_TYPE_Q8_0 && rel_pos->ne[0] > n_kv_max)) {
         return nullptr;
     }
 
