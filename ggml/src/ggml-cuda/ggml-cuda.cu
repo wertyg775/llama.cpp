@@ -4586,6 +4586,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (batch_skip > 0) {
             return batch_skip;
         }
+        const int mix_skip = ggml_cuda_inkling2_conv_mix_fusion(*cuda_ctx, cgraph, i);
+        if (mix_skip > 0) {
+            return mix_skip;
+        }
         float * state_dst = nullptr;
         int64_t s_state_q = 0;
         const int nodes_to_skip = ggml_cuda_inkling2_conv_state_fusion(cgraph, i, &state_dst, &s_state_q);

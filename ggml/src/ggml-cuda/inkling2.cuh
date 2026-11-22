@@ -15,6 +15,9 @@ int ggml_cuda_inkling2_conv_state_fusion(const ggml_cgraph * cgraph, int node_id
 // fuse two independent convs (with optional state stores) and an optional trailing clip into one launch; returns nodes to skip or 0
 int ggml_cuda_inkling2_conv_batch_fusion(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
 
+// fuse a single-token conv (+ its state store) with the following one-query mix of its output; returns nodes to skip or 0
+int ggml_cuda_inkling2_conv_mix_fusion(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
+
 bool ggml_cuda_inkling2_mix_supported(const ggml_tensor * op);
 
 void ggml_cuda_op_inkling2_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

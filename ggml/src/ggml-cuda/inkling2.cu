@@ -1055,6 +1055,266 @@ static __global__ void inkling2_mix_f32_vec(
     }
 }
 
+// single-token conv of channel c (same arithmetic as inkling2_conv_f32 with one token and no head post op):
+// writes y[c] and the new state of channel c, returns y[c]
+static __device__ __forceinline__ float inkling2_conv1(const inkling2_conv_args & a, const int c) {
+    const int     K  = a.K;
+    const float * xp = a.ids ? a.past + a.ids[0]*a.s_past1 + (int64_t) (a.offset + c)*(K - 1) : a.past + c*a.s_past1;
+    const float * xc = a.cur + c;
+    const float * w  = a.weight + (int64_t) c*K;
+
+    auto x = [&](int k) {
+        return k < K - 1 ? xp[k*a.s_past0] : xc[(k - (K - 1))*a.s_cur1];
+    };
+
+    float sum = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        sum += x(k)*w[k];
+    }
+    if (a.dynamic) {
+        const float * taps = a.dynamic + (c/a.n_cph)*K;
+        for (int lag = 0; lag < K; ++lag) {
+            sum += x(K - 1 - lag)*taps[lag];
+        }
+    }
+
+    // inkling2_conv_f32 compiles residual + __fmul_rn(.., scale) to one fma on HIP: match it bit for bit
+    const float yv = a.residual ? fmaf(sum + x(K - 1), a.scale, a.residual[c]) : __fmul_rn(sum + x(K - 1), a.scale);
+
+    a.y[c] = yv;
+    for (int k = 0; k < K - 1; ++k) {
+        a.state[(int64_t) c*(K - 1) + k] = x(1 + k);
+    }
+    return yv;
+}
+
+// one token: conv of all channels, then the depth mix of its output with one query, in one block.
+// All conv reads happen before the first barrier and all mix writes after the last one, so the mix
+// output may alias the conv inputs.
+extern __shared__ float inkling2_conv_mix_ys[];
+
+template <int NB>
+static __global__ void inkling2_conv_mix_f32(
+        const inkling2_conv_args a, const float * __restrict__ query, const float * __restrict__ blocks, float * __restrict__ dst,
+        const int n, const int64_t s_b1, const float scale, const float eps) {
+    const int n4 = n / 4;
+    const int i4 = threadIdx.x;
+
+    float4 xv = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 bv[NB > 0 ? NB : 1];
+    float  dot[NB > 0 ? NB : 1];
+#pragma unroll
+    for (int j = 0; j < NB; ++j) {
+        dot[j] = 0.0f;
+    }
+    float ss = 0.0f;
+    float dx = 0.0f;
+
+    // K = 4 without dynamic taps and 16-byte aligned conv weights: the coalesced conv path
+    const bool fast = a.K == 4 && !a.dynamic && ((uintptr_t) a.weight % 16) == 0;
+
+    if (i4 < n4) {
+        if (fast) {
+            // channel c = i4 + j*n4 per thread so that the loads of a warp are contiguous; y goes through LDS to
+            // the float4 layout of the mix. Same arithmetic as inkling2_conv1.
+            float * ys = inkling2_conv_mix_ys;
+            const float * past = a.ids ? a.past + a.ids[0]*a.s_past1 + (int64_t) a.offset*3 : a.past;
+            const int64_t s_pc = a.ids ? 3 : a.s_past1;
+            float xp[4][3], xc[4], rv[4];
+            float4 w[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = i4 + j*n4;
+#pragma unroll
+                for (int k = 0; k < 3; ++k) {
+                    xp[j][k] = past[c*s_pc + k*a.s_past0];
+                }
+                xc[j] = a.cur[c];
+                w[j]  = ((const float4 *) a.weight)[c];
+                rv[j] = a.residual ? a.residual[c] : 0.0f;
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = i4 + j*n4;
+                float sum = 0.0f;
+                sum += xp[j][0]*w[j].x;
+                sum += xp[j][1]*w[j].y;
+                sum += xp[j][2]*w[j].z;
+                sum += xc[j]*w[j].w;
+                const float yv = a.residual ? fmaf(sum + xc[j], a.scale, rv[j]) : __fmul_rn(sum + xc[j], a.scale);
+                a.y[c] = yv;
+                ys[c]  = yv;
+                a.state[(int64_t) c*3 + 0] = xp[j][1];
+                a.state[(int64_t) c*3 + 1] = xp[j][2];
+                a.state[(int64_t) c*3 + 2] = xc[j];
+            }
+        }
+    }
+    if (fast) {
+        __syncthreads();
+    }
+    if (i4 < n4) {
+        if (fast) {
+            xv = ((const float4 *) inkling2_conv_mix_ys)[i4];
+        } else {
+            xv.x = inkling2_conv1(a, 4*i4 + 0);
+            xv.y = inkling2_conv1(a, 4*i4 + 1);
+            xv.z = inkling2_conv1(a, 4*i4 + 2);
+            xv.w = inkling2_conv1(a, 4*i4 + 3);
+        }
+        const float4 qv = ((const float4 *) query)[i4];
+        ss = xv.x*xv.x + xv.y*xv.y + xv.z*xv.z + xv.w*xv.w;
+        dx = xv.x*qv.x + xv.y*qv.y + xv.z*qv.z + xv.w*qv.w;
+#pragma unroll
+        for (int j = 0; j < NB; ++j) {
+            const float4 b = ((const float4 *) (blocks + j*s_b1))[i4];
+            bv[j]  = b;
+            dot[j] = b.x*qv.x + b.y*qv.y + b.z*qv.z + b.w*qv.w;
+        }
+    }
+
+    __shared__ float red[NB + 2][32];
+    __shared__ float p[NB + 2];
+
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int nw   = blockDim.x / WARP_SIZE;
+
+#pragma unroll
+    for (int j = 0; j < NB; ++j) {
+        const float v = warp_reduce_sum(dot[j]);
+        if (lane == 0) {
+            red[j][warp] = v;
+        }
+    }
+    ss = warp_reduce_sum(ss);
+    dx = warp_reduce_sum(dx);
+    if (lane == 0) {
+        red[NB + 0][warp] = ss;
+        red[NB + 1][warp] = dx;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float sum_ss = 0.0f;
+        float sum_dx = 0.0f;
+        float d      = 0.0f;
+        for (int w = 0; w < nw; ++w) {
+            sum_ss += red[NB + 0][w];
+            sum_dx += red[NB + 1][w];
+            if (lane < NB) {
+                d += red[lane][w];
+            }
+        }
+        const float s = rsqrtf(sum_ss/n + eps);
+        if (lane == NB) {
+            d = sum_dx*s;
+        }
+
+        const float sc  = lane <= NB ? d*scale : -INFINITY;
+        const float max = warp_reduce_max(sc);
+        const float e   = lane <= NB ? expf(sc - max) : 0.0f;
+        const float sum = warp_reduce_sum(e);
+        if (lane <= NB) {
+            p[lane] = e/sum;
+        }
+        if (lane == 0) {
+            p[NB + 1] = s;
+        }
+    }
+    __syncthreads();
+
+    if (i4 < n4) {
+        const float sx = p[NB]*p[NB + 1];
+        float4 acc = make_float4(xv.x*sx, xv.y*sx, xv.z*sx, xv.w*sx);
+#pragma unroll
+        for (int j = 0; j < NB; ++j) {
+            const float pj = p[j];
+            acc.x += bv[j].x*pj;
+            acc.y += bv[j].y*pj;
+            acc.z += bv[j].z*pj;
+            acc.w += bv[j].w*pj;
+        }
+        ((float4 *) dst)[i4] = acc;
+    }
+}
+
+static int inkling2_next_compute(const ggml_cgraph * cgraph, int start) {
+    for (int j = start; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_is_empty(n) || n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE ||
+            n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE || n->op == GGML_OP_NONE) {
+            continue;
+        }
+        return j;
+    }
+    return -1;
+}
+
+int ggml_cuda_inkling2_conv_mix_fusion(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * conv = cgraph->nodes[node_idx];
+    if (conv->op != GGML_OP_INKLING2_CONV || (conv->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    const ggml_tensor * ids    = conv->src[5];
+    const int64_t       C      = conv->src[0]->ne[0];
+    const int64_t       T      = conv->src[0]->ne[1];
+    const int64_t       n_seqs = ids ? ids->ne[0] : conv->src[1]->ne[2];
+    if (T != 1 || n_seqs != 1 || ggml_get_op_params_i32(conv, 2) != GGML_INKLING2_HEAD_POST_NONE ||
+        C % 4 != 0 || C/4 > 1024) {
+        return 0;
+    }
+
+    float * state_dst = nullptr;
+    int64_t s_state_q = 0;
+    const int skip = ggml_cuda_inkling2_conv_state_fusion(cgraph, node_idx, &state_dst, &s_state_q);
+
+    const int idx_mix = inkling2_next_compute(cgraph, node_idx + skip + 1);
+    if (idx_mix < 0) {
+        return 0;
+    }
+    ggml_tensor * mix = cgraph->nodes[idx_mix];
+    if (mix->op != GGML_OP_INKLING2_MIX) {
+        return 0;
+    }
+    const ggml_tensor * x      = mix->src[0];
+    const ggml_tensor * query  = mix->src[1];
+    const ggml_tensor * blocks = mix->src[2];
+    const int n_blocks = blocks ? blocks->ne[1] : 0;
+    if (x->data != conv->data || x->ne[0] != C || x->ne[1] != 1 || query->type != GGML_TYPE_F32 || query->ne[1] != 1 ||
+        n_blocks > 6 || !inkling2_aligned(conv->data, 16) || !inkling2_aligned(mix->data, 16) ||
+        !inkling2_aligned(query->data, 16) || (blocks && !inkling2_aligned(blocks->data, blocks->nb[1]))) {
+        return 0;
+    }
+
+    float scale;
+    float eps;
+    memcpy(&scale, (const float *) mix->op_params + 0, sizeof(float));
+    memcpy(&eps,   (const float *) mix->op_params + 1, sizeof(float));
+
+    const inkling2_conv_args a = inkling2_conv_make_args(conv, state_dst, s_state_q);
+    const float * b_d  = blocks ? (const float *) blocks->data : nullptr;
+    const int64_t s_b1 = blocks ? blocks->nb[1]/sizeof(float) : 0;
+    const int n_threads = (int) ((C/4 + 63)/64)*64;
+
+    auto go = [&](auto nb_tag) {
+        constexpr int NB = decltype(nb_tag)::value;
+        inkling2_conv_mix_f32<NB><<<1, n_threads, C*sizeof(float), ctx.stream()>>>(a, (const float *) query->data, b_d, (float *) mix->data,
+                (int) C, s_b1, scale, eps);
+    };
+    switch (n_blocks) {
+        case 0: go(std::integral_constant<int, 0>()); break;
+        case 1: go(std::integral_constant<int, 1>()); break;
+        case 2: go(std::integral_constant<int, 2>()); break;
+        case 3: go(std::integral_constant<int, 3>()); break;
+        case 4: go(std::integral_constant<int, 4>()); break;
+        case 5: go(std::integral_constant<int, 5>()); break;
+        case 6: go(std::integral_constant<int, 6>()); break;
+        default: GGML_ABORT("unexpected n_blocks %d", n_blocks);
+    }
+    return idx_mix - node_idx;
+}
+
 bool ggml_cuda_inkling2_mix_supported(const ggml_tensor * op) {
     const ggml_tensor * query  = op->src[1];
     const ggml_tensor * blocks = op->src[2];
