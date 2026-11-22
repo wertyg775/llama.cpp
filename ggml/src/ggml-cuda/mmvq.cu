@@ -1104,6 +1104,180 @@ static __global__ void mul_mat_vec_q_moe(
     }
 }
 
+#if defined(GGML_USE_HIP)
+struct mmvq_nvfp4_q8_1_lds {
+    int   qs[8];
+    float d;
+};
+
+static __device__ __constant__ float k_ue4m3_lut[256] = {
+    0.0f, 0.0009765625f, 0.001953125f, 0.0029296875f, 0.00390625f, 0.0048828125f, 0.005859375f, 0.0068359375f,
+    0.0078125f, 0.0087890625f, 0.009765625f, 0.0107421875f, 0.01171875f, 0.0126953125f, 0.013671875f, 0.0146484375f,
+    0.015625f, 0.017578125f, 0.01953125f, 0.021484375f, 0.0234375f, 0.025390625f, 0.02734375f, 0.029296875f,
+    0.03125f, 0.03515625f, 0.0390625f, 0.04296875f, 0.046875f, 0.05078125f, 0.0546875f, 0.05859375f,
+    0.0625f, 0.0703125f, 0.078125f, 0.0859375f, 0.09375f, 0.1015625f, 0.109375f, 0.1171875f,
+    0.125f, 0.140625f, 0.15625f, 0.171875f, 0.1875f, 0.203125f, 0.21875f, 0.234375f,
+    0.25f, 0.28125f, 0.3125f, 0.34375f, 0.375f, 0.40625f, 0.4375f, 0.46875f,
+    0.5f, 0.5625f, 0.625f, 0.6875f, 0.75f, 0.8125f, 0.875f, 0.9375f,
+    1.0f, 1.125f, 1.25f, 1.375f, 1.5f, 1.625f, 1.75f, 1.875f,
+    2.0f, 2.25f, 2.5f, 2.75f, 3.0f, 3.25f, 3.5f, 3.75f,
+    4.0f, 4.5f, 5.0f, 5.5f, 6.0f, 6.5f, 7.0f, 7.5f,
+    8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f,
+    16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f,
+    32.0f, 36.0f, 40.0f, 44.0f, 48.0f, 52.0f, 56.0f, 60.0f,
+    64.0f, 72.0f, 80.0f, 88.0f, 96.0f, 104.0f, 112.0f, 120.0f,
+    128.0f, 144.0f, 160.0f, 176.0f, 192.0f, 208.0f, 224.0f, 0.0f,
+    0.0f, 0.0009765625f, 0.001953125f, 0.0029296875f, 0.00390625f, 0.0048828125f, 0.005859375f, 0.0068359375f,
+    0.0078125f, 0.0087890625f, 0.009765625f, 0.0107421875f, 0.01171875f, 0.0126953125f, 0.013671875f, 0.0146484375f,
+    0.015625f, 0.017578125f, 0.01953125f, 0.021484375f, 0.0234375f, 0.025390625f, 0.02734375f, 0.029296875f,
+    0.03125f, 0.03515625f, 0.0390625f, 0.04296875f, 0.046875f, 0.05078125f, 0.0546875f, 0.05859375f,
+    0.0625f, 0.0703125f, 0.078125f, 0.0859375f, 0.09375f, 0.1015625f, 0.109375f, 0.1171875f,
+    0.125f, 0.140625f, 0.15625f, 0.171875f, 0.1875f, 0.203125f, 0.21875f, 0.234375f,
+    0.25f, 0.28125f, 0.3125f, 0.34375f, 0.375f, 0.40625f, 0.4375f, 0.46875f,
+    0.5f, 0.5625f, 0.625f, 0.6875f, 0.75f, 0.8125f, 0.875f, 0.9375f,
+    1.0f, 1.125f, 1.25f, 1.375f, 1.5f, 1.625f, 1.75f, 1.875f,
+    2.0f, 2.25f, 2.5f, 2.75f, 3.0f, 3.25f, 3.5f, 3.75f,
+    4.0f, 4.5f, 5.0f, 5.5f, 6.0f, 6.5f, 7.0f, 7.5f,
+    8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f,
+    16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f,
+    32.0f, 36.0f, 40.0f, 44.0f, 48.0f, 52.0f, 56.0f, 60.0f,
+    64.0f, 72.0f, 80.0f, 88.0f, 96.0f, 104.0f, 112.0f, 120.0f,
+    128.0f, 144.0f, 160.0f, 176.0f, 192.0f, 208.0f, 224.0f, 240.0f
+};
+
+// GCN/CDNA single-column NVFP4 mat-vec: caches q8_1 y and ue4m3 LUT in LDS, maps LPR lanes to NR rows.
+template <int LPR, int NW, int NR, int MIN_BLOCKS = 1>
+__launch_bounds__(64 * NW, MIN_BLOCKS)
+static __global__ void mul_mat_vec_q_nvfp4_gcn(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr,
+        const float * x_scale_ptr, const float * x_bias_ptr, float * dst_ptr,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst, const uint3 channel_ratio,
+        const uint3 sample_ratio, const uint32_t stride_sample_x, const uint32_t stride_sample_y,
+        const uint32_t stride_sample_dst) {
+    const block_nvfp4 * GGML_CUDA_RESTRICT vx  = (const block_nvfp4 *) vx_ptr;
+    const block_q8_1  * GGML_CUDA_RESTRICT vy  = (const block_q8_1  *) vy_ptr;
+    const int32_t     * GGML_CUDA_RESTRICT ids = ids_ptr;
+    float             * GGML_CUDA_RESTRICT dst = dst_ptr;
+
+    constexpr int n_threads = 64 * NW;
+    constexpr int sub_per_wave = 64 / LPR;
+    constexpr int rows_per_block = NW * sub_per_wave * NR;
+    constexpr int blocks_per_iter = LPR / 2;
+
+    const int tid = threadIdx.y * 64 + threadIdx.x;
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t sample_dst  = blockIdx.z;
+
+    const uint32_t channel_x = ids ? ids[channel_dst] : fastdiv(channel_dst, channel_ratio);
+    const uint32_t channel_y = ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
+    const uint32_t sample_x  = fastdiv(sample_dst, sample_ratio);
+    const uint32_t sample_y  = sample_dst;
+
+    const int blocks_per_row_x = ncols_x / QK_NVFP4;
+    const int n_y_blocks = 2 * blocks_per_row_x;
+
+    extern __shared__ char smem[];
+    float * ue4m3_lut = (float *) smem;
+    mmvq_nvfp4_q8_1_lds * ys = (mmvq_nvfp4_q8_1_lds *) (ue4m3_lut + 256);
+
+    for (int i = tid; i < 256; i += n_threads) {
+        ue4m3_lut[i] = k_ue4m3_lut[i];
+    }
+
+    const block_q8_1 * y_base = vy + (size_t) sample_y * stride_sample_y + (size_t) channel_y * stride_channel_y;
+    for (int b = tid; b < n_y_blocks; b += n_threads) {
+        const block_q8_1 yb = y_base[b];
+        ys[b].d = __low2float(yb.ds);
+#pragma unroll
+        for (int q = 0; q < 8; ++q) {
+            ys[b].qs[q] = get_int_b4(yb.qs, q);
+        }
+    }
+    __syncthreads();
+
+    const int sub_id   = threadIdx.x / LPR;
+    const int sub_lane = threadIdx.x % LPR;
+    const int half_blk = sub_lane & 1;
+    const int q_off    = half_blk * 4;
+    const int d_off    = half_blk * 2;
+
+    const int row_base = blockIdx.x * rows_per_block + (threadIdx.y * sub_per_wave + sub_id) * NR;
+    const size_t x_base_off = (size_t) sample_x * stride_sample_x + (size_t) channel_x * stride_channel_x;
+
+    const block_nvfp4 * x_row[NR];
+    float sum[NR];
+#pragma unroll
+    for (int r = 0; r < NR; ++r) {
+        const uint32_t row = min((uint32_t) (row_base + r), nrows_x - 1);
+        x_row[r] = vx + x_base_off + (size_t) row * stride_row_x;
+        sum[r] = 0.0f;
+    }
+
+    for (int kbx = sub_lane >> 1; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = (kbx << 1) + half_blk;
+        const int * yq = ys[kby].qs;
+        const float yd = ys[kby].d;
+
+        int q0[NR], q1[NR], q2[NR], q3[NR];
+        uint8_t d0[NR], d1[NR];
+#pragma unroll
+        for (int r = 0; r < NR; ++r) {
+            const block_nvfp4 * bq4 = x_row[r] + kbx;
+            q0[r] = get_int_b4(bq4->qs, q_off + 0);
+            q1[r] = get_int_b4(bq4->qs, q_off + 1);
+            q2[r] = get_int_b4(bq4->qs, q_off + 2);
+            q3[r] = get_int_b4(bq4->qs, q_off + 3);
+            d0[r] = bq4->d[d_off + 0];
+            d1[r] = bq4->d[d_off + 1];
+        }
+
+        const int y0 = yq[0], y1 = yq[1], y2 = yq[2], y3 = yq[3];
+        int sumi0[NR];
+#pragma unroll
+        for (int r = 0; r < NR; ++r) {
+            const int2 v0 = get_int_from_table_16(q0[r], kvalues_mxfp4);
+            const int2 v1 = get_int_from_table_16(q1[r], kvalues_mxfp4);
+            int s = ggml_cuda_dp4a(v0.x, y0, 0);
+            s = ggml_cuda_dp4a(v0.y, y2, s);
+            s = ggml_cuda_dp4a(v1.x, y1, s);
+            sumi0[r] = ggml_cuda_dp4a(v1.y, y3, s);
+        }
+
+        const int y4 = yq[4], y5 = yq[5], y6 = yq[6], y7 = yq[7];
+#pragma unroll
+        for (int r = 0; r < NR; ++r) {
+            const int2 v2 = get_int_from_table_16(q2[r], kvalues_mxfp4);
+            const int2 v3 = get_int_from_table_16(q3[r], kvalues_mxfp4);
+            int sumi1 = ggml_cuda_dp4a(v2.x, y4, 0);
+            sumi1 = ggml_cuda_dp4a(v2.y, y6, sumi1);
+            sumi1 = ggml_cuda_dp4a(v3.x, y5, sumi1);
+            sumi1 = ggml_cuda_dp4a(v3.y, y7, sumi1);
+
+            sum[r] += yd * (ue4m3_lut[d0[r]] * float(sumi0[r]) + ue4m3_lut[d1[r]] * float(sumi1));
+        }
+    }
+
+    const float x_scale = x_scale_ptr ? x_scale_ptr[ids ? channel_x : 0] : 1.0f;
+    const float * x_bias = x_bias_ptr ? x_bias_ptr + (size_t) sample_dst * stride_sample_dst + (size_t) (ids ? channel_x : channel_dst) * stride_channel_dst : nullptr;
+    float * dst_row = dst + (size_t) sample_dst * stride_sample_dst + (size_t) channel_dst * stride_channel_dst;
+
+#pragma unroll
+    for (int r = 0; r < NR; ++r) {
+        const float s = warp_reduce_sum<LPR>(sum[r]);
+        const uint32_t row = (uint32_t) (row_base + r);
+        if (sub_lane == 0 && row < nrows_x) {
+            float out = s * x_scale;
+            if (x_bias) {
+                out += x_bias[row];
+            }
+            dst_row[row] = out;
+        }
+    }
+}
+#endif
+
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
@@ -1283,6 +1457,36 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     switch (ncols_dst) {
         case 1: {
+#if defined(GGML_USE_HIP)
+            if constexpr (type == GGML_TYPE_NVFP4) {
+                if (table_id == MMVQ_PARAMETERS_GCN && warp_size == 64 &&
+                    fusion.gate == nullptr && fusion.shared_up == nullptr &&
+                    fusion.gate_bias == nullptr && fusion.gate_scale == nullptr &&
+                    ncols_x <= 8192) {
+                    const int n_y_blocks = 2 * (ncols_x / QK_NVFP4);
+                    const int smem = 256 * (int) sizeof(float) + n_y_blocks * (int) sizeof(mmvq_nvfp4_q8_1_lds);
+                    auto launch_nvfp4 = [&](auto lpr_tag) {
+                        constexpr int LPR = decltype(lpr_tag)::value;
+                        constexpr int NW  = 4;
+                        constexpr int NR  = 2;
+                        constexpr int rpb = NW * (64 / LPR) * NR;
+                        const dim3 grid((nrows_x + rpb - 1) / rpb, nchannels_dst, nsamples_dst);
+                        const dim3 block(64, NW, 1);
+                        mul_mat_vec_q_nvfp4_gcn<LPR, NW, NR, 7><<<grid, block, smem, stream>>>(
+                            vx, vy, ids, (const float *) fusion.x_scale, (const float *) fusion.x_bias, dst,
+                            ncols_x, nchannels_y_fd, nrows_x, stride_row_x, stride_channel_x, stride_channel_y,
+                            stride_channel_dst, channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y,
+                            stride_sample_dst);
+                    };
+                    if (ncols_x >= 2048) {
+                        launch_nvfp4(std::integral_constant<int, 16>{});
+                    } else {
+                        launch_nvfp4(std::integral_constant<int, 8>{});
+                    }
+                    return;
+                }
+            }
+#endif
             // static, else MSVC lambda capture breaks the constexpr uses below
             static constexpr int c_ncols_dst = 1;
 
