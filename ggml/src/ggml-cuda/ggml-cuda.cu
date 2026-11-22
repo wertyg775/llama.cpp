@@ -5829,6 +5829,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
             }
 
+            // Same for a lone MUL_MAT_ID with per-expert scales (the down projection): MUL_MAT_ID, RESHAPE, REPEAT, GET_ROWS, MUL.
+            if (i + 4 < cgraph->n_nodes && cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[i + 4]->op == GGML_OP_MUL &&
+                    ggml_cuda_get_mul_mat_id_scale(cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3],
+                                                   cgraph->nodes[i + 4], cgraph->nodes[i])) {
+                add_alloc_deps(i, i + 4);
+                i += 4;
+                continue;
+            }
+
             // inkling2 conv batch fusion runs two convs and a clip concurrently: keep all their inputs alive to the end
             if (cgraph->nodes[i]->op == GGML_OP_INKLING2_CONV) {
                 const int last = ggml_cuda_inkling2_conv_batch_group(cgraph, i);
