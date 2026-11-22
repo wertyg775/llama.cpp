@@ -471,6 +471,91 @@ static void mul_mat_vec_f_switch_fusion(
 
 }
 
+#if defined(GGML_USE_HIP)
+static __host__ __device__ __forceinline__ int mmvf_ys_idx(int i) {
+    return i + ((i >> 5) << 2);
+}
+
+// vectorized BF16 single-column mat-vec: y in bank-conflict-free LDS, 16-byte weight loads, 2 rows per logical warp
+template <int nw>
+static __global__ void mul_mat_vec_f_bf16_vec(
+        const nv_bfloat16 * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
+        const int ncols, const int nrows, const int stride_row,
+        const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
+    constexpr int rpb = 2*nw;
+
+    extern __shared__ float ys[];
+
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+
+    const int channel_dst = blockIdx.y;
+    const int sample_dst  = blockIdx.z;
+    const int channel_x   = fastdiv((uint32_t) channel_dst, channel_ratio);
+    const int sample_x    = fastdiv((uint32_t) sample_dst,  sample_ratio);
+
+    x   += int64_t(sample_x)  *stride_sample_x   + int64_t(channel_x)  *stride_channel_x;
+    y   += int64_t(sample_dst)*stride_sample_y   + int64_t(channel_dst)*stride_channel_y;
+    dst += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_dst)*stride_channel_dst;
+
+    for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
+        ys[mmvf_ys_idx(i)] = y[i];
+    }
+    __syncthreads();
+
+    const int r0 = blockIdx.x*rpb + warp;
+    const int r1 = r0 + nw;
+
+    if (r1 < nrows) {
+        const nv_bfloat16 * x0 = x + int64_t(r0)*stride_row;
+        const nv_bfloat16 * x1 = x + int64_t(r1)*stride_row;
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        for (int c = lane*8; c < ncols; c += WARP_SIZE*8) {
+            const int4   raw0 = *(const int4 *) (x0 + c);
+            const int4   raw1 = *(const int4 *) (x1 + c);
+            const float * ysp = ys + mmvf_ys_idx(c);
+            const float4 y0   = ((const float4 *) ysp)[0];
+            const float4 y1   = ((const float4 *) ysp)[1];
+            const nv_bfloat16 * w0 = (const nv_bfloat16 *) &raw0;
+            const nv_bfloat16 * w1 = (const nv_bfloat16 *) &raw1;
+            const float yv[8] = { y0.x, y0.y, y0.z, y0.w, y1.x, y1.y, y1.z, y1.w };
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                acc0 += ggml_cuda_cast<float>(w0[q])*yv[q];
+                acc1 += ggml_cuda_cast<float>(w1[q])*yv[q];
+            }
+        }
+        acc0 = warp_reduce_sum(acc0);
+        acc1 = warp_reduce_sum(acc1);
+        if (lane == 0) {
+            dst[r0] = acc0;
+            dst[r1] = acc1;
+        }
+    } else if (r0 < nrows) {
+        const nv_bfloat16 * x0 = x + int64_t(r0)*stride_row;
+        float acc0 = 0.0f;
+        for (int c = lane*8; c < ncols; c += WARP_SIZE*8) {
+            const int4   raw0 = *(const int4 *) (x0 + c);
+            const float * ysp = ys + mmvf_ys_idx(c);
+            const float4 y0   = ((const float4 *) ysp)[0];
+            const float4 y1   = ((const float4 *) ysp)[1];
+            const nv_bfloat16 * w0 = (const nv_bfloat16 *) &raw0;
+            const float yv[8] = { y0.x, y0.y, y0.z, y0.w, y1.x, y1.y, y1.z, y1.w };
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                acc0 += ggml_cuda_cast<float>(w0[q])*yv[q];
+            }
+        }
+        acc0 = warp_reduce_sum(acc0);
+        if (lane == 0) {
+            dst[r0] = acc0;
+        }
+    }
+}
+#endif // GGML_USE_HIP
+
 template <typename T, typename type_acc, int ncols_dst, bool is_multi_token_id = false>
 void launch_mul_mat_vec_f_cuda(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -489,6 +574,36 @@ void launch_mul_mat_vec_f_cuda(
     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0) : init_fastdiv_values(nchannels_dst / nchannels_x);
     const uint3 sample_ratio_fd  = init_fastdiv_values(nsamples_dst  / nsamples_x);
 
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+
+#if defined(GGML_USE_HIP)
+    if constexpr (std::is_same_v<T, nv_bfloat16> && ncols_dst == 1 && !is_multi_token_id) {
+        const size_t smem = (size_t) mmvf_ys_idx((int) ncols)*sizeof(float);
+        if (!has_fusion && !ids && ncols % 8 == 0 && stride_row % 8 == 0 &&
+                ((uintptr_t) x % 16 == 0) && smem <= 48*1024 &&
+                stride_channel_x % 8 == 0 && stride_sample_x % 8 == 0) {
+            if (nrows <= 512) {
+                constexpr int nw  = 2;
+                constexpr int rpb = 2*nw;
+                const dim3 grid((nrows + rpb - 1)/rpb, nchannels_dst, nsamples_or_ntokens);
+                mul_mat_vec_f_bf16_vec<nw><<<grid, nw*WARP_SIZE, smem, stream>>>(
+                        x, y, dst, ncols, nrows, stride_row,
+                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio_fd,  stride_sample_x,  stride_sample_y,  stride_sample_dst);
+            } else {
+                constexpr int nw  = 16;
+                constexpr int rpb = 2*nw;
+                const dim3 grid((nrows + rpb - 1)/rpb, nchannels_dst, nsamples_or_ntokens);
+                mul_mat_vec_f_bf16_vec<nw><<<grid, nw*WARP_SIZE, smem, stream>>>(
+                        x, y, dst, ncols, nrows, stride_row,
+                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio_fd,  stride_sample_x,  stride_sample_y,  stride_sample_dst);
+            }
+            return;
+        }
+    }
+#endif // GGML_USE_HIP
+
     const int device = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
 
@@ -505,8 +620,6 @@ void launch_mul_mat_vec_f_cuda(
             block_size_best = block_size;
         }
     }
-
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
