@@ -572,6 +572,117 @@ static __global__ void inkling2_mix_f32(
     }
 }
 
+// single-pass vectorized mix for small n_blocks and n/4 <= 1024: each thread holds one float4 of x and each block in registers
+template <typename T, int NB>
+static __global__ void inkling2_mix_f32_vec(
+        const float * __restrict__ x, const T * __restrict__ query, const float * __restrict__ blocks, float * __restrict__ dst,
+        const int n, const int nq, const int64_t s_x1, const int64_t s_q1, const int64_t s_b1, const int64_t s_b2,
+        const float scale, const float eps) {
+    const int iq = blockIdx.x;
+    const int t  = blockIdx.y;
+    const int n4 = n / 4;
+    const int i4 = threadIdx.x;
+
+    const float * xs = x + t*s_x1;
+    const T     * qs = query + iq*s_q1;
+    const float * bs = blocks + t*s_b2;
+
+    float4 xv = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 bv[NB > 0 ? NB : 1];
+    float  dot[NB > 0 ? NB : 1];
+#pragma unroll
+    for (int j = 0; j < NB; ++j) {
+        dot[j] = 0.0f;
+    }
+    float ss = 0.0f;
+    float dx = 0.0f;
+
+    if (i4 < n4) {
+        xv = ((const float4 *) xs)[i4];
+        float4 qv;
+        if constexpr (std::is_same_v<T, float>) {
+            qv = ((const float4 *) qs)[i4];
+        } else {
+            const int i = 4*i4;
+            qv = make_float4(ggml_cuda_cast<float>(qs[i + 0]), ggml_cuda_cast<float>(qs[i + 1]),
+                             ggml_cuda_cast<float>(qs[i + 2]), ggml_cuda_cast<float>(qs[i + 3]));
+        }
+        ss = xv.x*xv.x + xv.y*xv.y + xv.z*xv.z + xv.w*xv.w;
+        dx = xv.x*qv.x + xv.y*qv.y + xv.z*qv.z + xv.w*qv.w;
+#pragma unroll
+        for (int j = 0; j < NB; ++j) {
+            const float4 b = ((const float4 *) (bs + j*s_b1))[i4];
+            bv[j]  = b;
+            dot[j] = b.x*qv.x + b.y*qv.y + b.z*qv.z + b.w*qv.w;
+        }
+    }
+
+    __shared__ float red[NB + 2][32];
+    __shared__ float p[NB + 2];
+
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int nw   = blockDim.x / WARP_SIZE;
+
+#pragma unroll
+    for (int j = 0; j < NB; ++j) {
+        const float v = warp_reduce_sum(dot[j]);
+        if (lane == 0) {
+            red[j][warp] = v;
+        }
+    }
+    ss = warp_reduce_sum(ss);
+    dx = warp_reduce_sum(dx);
+    if (lane == 0) {
+        red[NB + 0][warp] = ss;
+        red[NB + 1][warp] = dx;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float sum_ss = 0.0f;
+        float sum_dx = 0.0f;
+        float d      = 0.0f;
+        for (int w = 0; w < nw; ++w) {
+            sum_ss += red[NB + 0][w];
+            sum_dx += red[NB + 1][w];
+            if (lane < NB) {
+                d += red[lane][w];
+            }
+        }
+        const float s = rsqrtf(sum_ss/n + eps);
+        if (lane == NB) {
+            d = sum_dx*s;
+        }
+
+        const float sc  = lane <= NB ? d*scale : -INFINITY;
+        const float max = warp_reduce_max(sc);
+        const float e   = lane <= NB ? expf(sc - max) : 0.0f;
+        const float sum = warp_reduce_sum(e);
+        if (lane <= NB) {
+            p[lane] = e/sum;
+        }
+        if (lane == 0) {
+            p[NB + 1] = s;
+        }
+    }
+    __syncthreads();
+
+    if (i4 < n4) {
+        const float sx = p[NB]*p[NB + 1];
+        float4 acc = make_float4(xv.x*sx, xv.y*sx, xv.z*sx, xv.w*sx);
+#pragma unroll
+        for (int j = 0; j < NB; ++j) {
+            const float pj = p[j];
+            acc.x += bv[j].x*pj;
+            acc.y += bv[j].y*pj;
+            acc.z += bv[j].z*pj;
+            acc.w += bv[j].w*pj;
+        }
+        ((float4 *) (dst + ((int64_t) t*nq + iq)*n))[i4] = acc;
+    }
+}
+
 bool ggml_cuda_inkling2_mix_supported(const ggml_tensor * op) {
     const ggml_tensor * query  = op->src[1];
     const ggml_tensor * blocks = op->src[2];
@@ -595,15 +706,50 @@ void ggml_cuda_op_inkling2_mix(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int nq       = query->ne[1];
     const int n_blocks = blocks ? blocks->ne[1] : 0;
 
-    // decode runs only nq blocks: a big block keeps more loads in flight
     const dim3 grid(nq, T);
-    const dim3 threads(1024);
 
     const float * b_d  = blocks ? (const float *) blocks->data : nullptr;
     const int64_t s_b1 = blocks ? blocks->nb[1]/sizeof(float) : 0;
     const int64_t s_b2 = blocks ? blocks->nb[2]/sizeof(float) : 0;
     const int64_t s_x1 = x->nb[1]/sizeof(float);
     const int64_t s_q1 = query->nb[1]/ggml_type_size(query->type);
+
+    const bool fast_vec = n % 4 == 0 && n/4 <= 1024 && n_blocks <= 6 &&
+        inkling2_aligned(x->data, x->nb[1]) && inkling2_aligned(dst->data, (size_t) n*sizeof(float)) &&
+        (query->type != GGML_TYPE_F32 || inkling2_aligned(query->data, query->nb[1])) &&
+        (!blocks || (inkling2_aligned(blocks->data, blocks->nb[1]) && blocks->nb[2] % 16 == 0));
+
+    if (fast_vec) {
+        const int n_threads = ((n/4 + 63)/64)*64;
+        auto launch_nb = [&](auto tag) {
+            using T = decltype(tag);
+            const T * q_d = (const T *) query->data;
+            auto go = [&](auto nb_tag) {
+                constexpr int NB = decltype(nb_tag)::value;
+                inkling2_mix_f32_vec<T, NB><<<grid, n_threads, 0, ctx.stream()>>>((const float *) x->data, q_d, b_d, (float *) dst->data,
+                        n, nq, s_x1, s_q1, s_b1, s_b2, scale, eps);
+            };
+            switch (n_blocks) {
+                case 0: go(std::integral_constant<int, 0>()); break;
+                case 1: go(std::integral_constant<int, 1>()); break;
+                case 2: go(std::integral_constant<int, 2>()); break;
+                case 3: go(std::integral_constant<int, 3>()); break;
+                case 4: go(std::integral_constant<int, 4>()); break;
+                case 5: go(std::integral_constant<int, 5>()); break;
+                case 6: go(std::integral_constant<int, 6>()); break;
+                default: GGML_ABORT("unexpected n_blocks %d", n_blocks);
+            }
+        };
+        switch (query->type) {
+            case GGML_TYPE_F32:  launch_nb(float());       return;
+            case GGML_TYPE_F16:  launch_nb(half());        return;
+            case GGML_TYPE_BF16: launch_nb(nv_bfloat16()); return;
+            default: GGML_ABORT("unsupported type %s", ggml_type_name(query->type));
+        }
+    }
+
+    // decode runs only nq blocks: a big block keeps more loads in flight
+    const dim3 threads(1024);
 
     switch (query->type) {
         case GGML_TYPE_F32:
