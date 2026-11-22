@@ -808,6 +808,10 @@ public:
     // distance from the token to the cell, extent for the empty, future and more distant cells
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
+    // 1D cell and query positions for compact causal prefill (avoids 2D rel_pos and mask)
+    ggml_tensor * self_cell_pos     = nullptr; // I32 [n_kv + 1], last element is active cell count
+    ggml_tensor * self_cell_pos_swa = nullptr; // I32 [n_kv_swa + 1]
+    ggml_tensor * self_q_pos        = nullptr; // I32 [n_batch]
 
     const uint32_t extent;
     const uint32_t extent_swa;

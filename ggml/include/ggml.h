@@ -2641,15 +2641,15 @@ extern "C" {
             struct ggml_tensor  * norm,
             float                 eps);
 
-    // inkling2 attention of one token: relative-position bias, per-query sink logit, zero sink, mask, and the output gate
-    //   q:       [d, n_head, 1] f32
-    //   k:       [d, n_head_kv, n_kv] f32, f16 or bf16 (a KV cache view)
+    // inkling2 attention: relative-position bias, per-query sink logit, zero sink, mask, and optional output gate
+    //   q:       [d, n_head, T] f32
+    //   k:       [d, n_head_kv, n_kv] f32, f16, bf16 or q8_0 (a KV cache view)
     //   v:       [d, n_head_kv, n_kv] or transposed [n_kv, n_head_kv, d], same type as k
-    //   table, r, sinks, rel_pos: as in ggml_inkling2_rel_bias, for 1 token
-    //   mask:    [n_kv, 1] f32 or f16
-    //   gate:    [d*n_head, 1] f32, the output is multiplied by sigmoid(gate)
-    //   logit[j] = scale*q.k[j] + table[:, rel_pos[j]].r - sinks + mask[j], softmax with an extra logit 0
-    //   result:  [d*n_head, 1] = sigmoid(gate)*sum_j softmax(logit)[j]*v[j]
+    //   table, r, sinks: as in ggml_inkling2_rel_bias
+    //   standard mode (T == 1, mask f32/f16): rel_pos [n_kv, 1] i32, mask [n_kv, 1] f32/f16, gate [d*n_head, 1] f32
+    //   compact causal mode (mask i32): rel_pos is cell_pos [n_kv + 1] i32 (cell_pos[n_kv] = active cells),
+    //     mask is q_pos [T] i32, gate is [d*n_head, T] f32 or NULL
+    //   result:  [d*n_head, T] f32
     //
     GGML_API struct ggml_tensor * ggml_inkling2_attn(
             struct ggml_context * ctx,
@@ -2666,6 +2666,9 @@ extern "C" {
             float                 scale,
             int32_t               n_rot_q,
             int32_t               n_rot_v);
+
+    // optional sliding window size for compact causal ggml_inkling2_attn (0 = full attention)
+    GGML_API void ggml_inkling2_attn_set_n_swa(struct ggml_tensor * op, int32_t n_swa);
 
     // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
     //

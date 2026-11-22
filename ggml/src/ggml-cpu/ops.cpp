@@ -12327,13 +12327,20 @@ static void ggml_compute_forward_inkling2_attn_f32(
     const bool    v_trans = ggml_get_op_params_i32(dst, 1) != 0;
     const int32_t n_rot_q = ggml_get_op_params_i32(dst, 2);
     const int32_t n_rot_v = ggml_get_op_params_i32(dst, 3);
+    const int32_t n_swa   = ggml_get_op_params_i32(dst, 4);
 
     const int64_t d        = q->ne[0];
     const int64_t n_head   = q->ne[1];
-    const int64_t n_kv     = rel_pos->ne[0];
+    const int64_t T        = q->ne[2];
+    const bool    compact  = mask->type == GGML_TYPE_I32;
+    const int64_t n_kv     = k->ne[2];
     const int64_t n_rel    = table->ne[0];
     const int64_t n_extent = table->ne[1];
     const int64_t n_gqa    = n_head/k->ne[1];
+
+    const int32_t * cpos     = compact ? (const int32_t *) rel_pos->data : nullptr;
+    const int32_t * qpos     = compact ? (const int32_t *) mask->data    : nullptr;
+    const int64_t   n_active = compact ? MAX((int64_t) 0, MIN(n_kv, (int64_t) cpos[n_kv])) : n_kv;
 
     const ggml_to_float_t k_to_float = k->type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(k->type)->to_float;
     const ggml_to_float_t v_to_float = v->type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(v->type)->to_float;
@@ -12346,19 +12353,29 @@ static void ggml_compute_forward_inkling2_attn_f32(
     float * acc   = row + d;
     float * qbuf  = acc + d;
 
-    for (int64_t h = ith; h < n_head; h += nth) {
+    for (int64_t task = ith; task < T*n_head; task += nth) {
+        const int64_t t  = task/n_head;
+        const int64_t h  = task%n_head;
         const int64_t hk = h/n_gqa;
-        const float * qh = (const float *) ((const char *) q->data + h*q->nb[1]);
+        const float * qh = (const float *) ((const char *) q->data + t*q->nb[2] + h*q->nb[1]);
         if (n_rot_q > 0) {
             memcpy(qbuf, qh, d*sizeof(float));
             inkling2_fwht(qbuf, d, n_rot_q);
             qh = qbuf;
         }
-        const float * rh = (const float *) ((const char *) r->data + h*r->nb[1]);
-        const float   sh = ((const float *) sinks->data)[h];
+        const float * rh = (const float *) ((const char *) r->data + t*r->nb[2] + h*r->nb[1]);
+        const float   sh = ((const float *) ((const char *) sinks->data + t*sinks->nb[1]))[h];
+        const int32_t qp = compact ? qpos[t] : 0;
 
         float max = 0.0f; // the zero sink
-        for (int64_t j = 0; j < n_kv; ++j) {
+        for (int64_t j = 0; j < n_active; ++j) {
+            if (compact) {
+                const int32_t p0 = cpos[j];
+                if (p0 < 0 || p0 > qp || (n_swa > 0 && qp - p0 >= n_swa)) {
+                    logit[j] = -INFINITY;
+                    continue;
+                }
+            }
             const char  * kj = (const char *) k->data + hk*k->nb[1] + j*k->nb[2];
             const float * kf = (const float *) kj;
             if (k_to_float) {
@@ -12369,22 +12386,24 @@ static void ggml_compute_forward_inkling2_attn_f32(
             for (int64_t i = 0; i < d; ++i) {
                 qk += qh[i]*kf[i];
             }
-            const int32_t dist = ((const int32_t *) rel_pos->data)[j];
+            const int32_t dist = compact ? (qp - cpos[j]) : ((const int32_t *) rel_pos->data)[j];
             float b = 0.0f;
-            if (dist < n_extent) {
+            if (dist >= 0 && dist < n_extent) {
                 for (int64_t i = 0; i < n_rel; ++i) {
                     b += inkling2_attn_get(table, (const char *) table->data + i*table->nb[0] + dist*table->nb[1])*rh[i];
                 }
             }
             b -= sh;
-            b += inkling2_attn_get(mask, (const char *) mask->data + j*mask->nb[0]);
+            if (!compact) {
+                b += inkling2_attn_get(mask, (const char *) mask->data + j*mask->nb[0]);
+            }
 
             logit[j] = qk*scale + b;
             max = MAX(max, logit[j]);
         }
 
         ggml_float sum = expf(0.0f - max);
-        for (int64_t j = 0; j < n_kv; ++j) {
+        for (int64_t j = 0; j < n_active; ++j) {
             logit[j] = expf(logit[j] - max);
             sum += logit[j];
         }
@@ -12393,7 +12412,7 @@ static void ggml_compute_forward_inkling2_attn_f32(
             for (int64_t i = 0; i < d; ++i) {
                 float a = 0.0f;
                 const char * vi = (const char *) v->data + hk*v->nb[1] + i*v->nb[2];
-                for (int64_t j = 0; j < n_kv; ++j) {
+                for (int64_t j = 0; j < n_active; ++j) {
                     a += logit[j]*inkling2_attn_get(v, vi + j*v->nb[0]);
                 }
                 acc[i] = a;
@@ -12402,14 +12421,17 @@ static void ggml_compute_forward_inkling2_attn_f32(
             for (int64_t i = 0; i < d; ++i) {
                 acc[i] = 0.0f;
             }
-            for (int64_t j = 0; j < n_kv; ++j) {
+            for (int64_t j = 0; j < n_active; ++j) {
+                const float w = logit[j];
+                if (w == 0.0f) {
+                    continue;
+                }
                 const char  * vj = (const char *) v->data + hk*v->nb[1] + j*v->nb[2];
                 const float * vf = (const float *) vj;
                 if (v_to_float) {
                     v_to_float(vj, row, d);
                     vf = row;
                 }
-                const float w = logit[j];
                 for (int64_t i = 0; i < d; ++i) {
                     acc[i] += w*vf[i];
                 }
@@ -12420,9 +12442,17 @@ static void ggml_compute_forward_inkling2_attn_f32(
             acc[i] = (float) (acc[i]/sum);
         }
         inkling2_fwht(acc, d, n_rot_v);
-        for (int64_t i = 0; i < d; ++i) {
-            const float g = ((const float *) gate->data)[h*d + i];
-            ((float *) dst->data)[h*d + i] = acc[i]*(1.0f/(1.0f + expf(-g)));
+        float * dst_t = (float *) ((char *) dst->data + t*dst->nb[1]);
+        if (gate) {
+            const float * gt = (const float *) ((const char *) gate->data + t*gate->nb[1]);
+            for (int64_t i = 0; i < d; ++i) {
+                const float g = gt[h*d + i];
+                dst_t[h*d + i] = acc[i]*(1.0f/(1.0f + expf(-g)));
+            }
+        } else {
+            for (int64_t i = 0; i < d; ++i) {
+                dst_t[h*d + i] = acc[i];
+            }
         }
     }
 }

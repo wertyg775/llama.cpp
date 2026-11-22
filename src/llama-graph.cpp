@@ -1417,6 +1417,18 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
     }
 
+    if (self_cell_pos && self_cell_pos->buffer) {
+        attn_ctx->get_base()->set_input_cell_pos(self_cell_pos, ubatch);
+    }
+
+    if (self_q_pos && self_q_pos->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_q_pos->buffer));
+        int32_t * data = (int32_t *) self_q_pos->data;
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            data[i] = ubatch->pos[i];
+        }
+    }
+
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
         attn_ctx->get_swa()->set_input_k_idxs(inp_attn->self_k_idxs_swa, ubatch);
@@ -1429,6 +1441,10 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
 
     if (self_rel_pos_swa->buffer) {
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
+    }
+
+    if (self_cell_pos_swa && self_cell_pos_swa->buffer) {
+        attn_ctx->get_swa()->set_input_cell_pos(self_cell_pos_swa, ubatch);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -1465,6 +1481,14 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
     res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
 
+    if (self_cell_pos && self_cell_pos->buffer) {
+        res &= self_cell_pos->ne[0] == attn_ctx->get_base()->get_n_kv() + 1;
+        res &= params.ubatch.n_seqs == 1 && !params.ubatch.is_pos_2d();
+    }
+    if (self_q_pos && self_q_pos->buffer) {
+        res &= self_q_pos->ne[0] == params.ubatch.n_tokens;
+    }
+
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
         res &= inp_attn->self_k_idxs_swa->ne[0] == params.ubatch.n_tokens;
@@ -1474,6 +1498,11 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+
+    if (self_cell_pos_swa && self_cell_pos_swa->buffer) {
+        res &= self_cell_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv() + 1;
+        res &= params.ubatch.n_seqs == 1 && !params.ubatch.is_pos_2d();
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -4487,6 +4516,18 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     ggml_set_input(inp->self_rel_pos_swa);
     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
 
+    inp->self_cell_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv() + 1);
+    ggml_set_input(inp->self_cell_pos);
+    ggml_set_name(inp->self_cell_pos, "attn_inp_cell_pos");
+
+    inp->self_cell_pos_swa = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv() + 1);
+    ggml_set_input(inp->self_cell_pos_swa);
+    ggml_set_name(inp->self_cell_pos_swa, "attn_inp_cell_pos_swa");
+
+    inp->self_q_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+    ggml_set_input(inp->self_q_pos);
+    ggml_set_name(inp->self_q_pos, "attn_inp_q_pos");
+
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }
 
@@ -4541,11 +4582,17 @@ ggml_tensor * llm_graph_context::build_attn_inkling2_fused(
         ggml_tensor * gate,
             float     kq_scale,
             int       il) const {
-    if (!cparams.fused_inkling2 || n_tokens != 1 || cparams.training) {
+    if (!cparams.fused_inkling2 || cparams.training) {
         return nullptr;
     }
 
     const bool is_swa = hparams.is_swa(il);
+    const bool prefill = n_tokens > 1;
+    if (prefill && ((is_swa && hparams.swa_type != LLAMA_SWA_TYPE_STANDARD) ||
+            !cparams.causal_attn || ubatch.n_seqs != 1 || ubatch.is_pos_2d() ||
+            q_cur->ne[0] != 128 || table->type != GGML_TYPE_F32 || table->ne[0] > 16)) {
+        return nullptr;
+    }
 
     auto * inp_attn = inp->get_attn();
 
@@ -4574,13 +4621,18 @@ ggml_tensor * llm_graph_context::build_attn_inkling2_fused(
     if (k->type != v->type || k->ne[3] != 1 || v->ne[3] != 1) {
         return nullptr;
     }
-    const bool ok_type = k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_F32 ||
-        (k->type == GGML_TYPE_Q8_0 && !v_trans && q_cur->ne[0] % ggml_blck_size(k->type) == 0);
+    const bool ok_type = prefill
+        ? (!v_trans && (k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_F16))
+        : (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_F32 ||
+           (k->type == GGML_TYPE_Q8_0 && !v_trans && q_cur->ne[0] % ggml_blck_size(k->type) == 0));
     if (!ok_type) {
         return nullptr;
     }
 
     if (k_rot) {
+        if (prefill) {
+            q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
+        }
         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
     }
     if (v_rot) {
@@ -4594,7 +4646,21 @@ ggml_tensor * llm_graph_context::build_attn_inkling2_fused(
     ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
     ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
 
-    ggml_tensor * cur = ggml_inkling2_attn(ctx0, q_cur, k, v, table, r, sinks, rel_pos, attn_mask.raw, gate, v_trans, kq_scale, n_rot_q, n_rot_v);
+    ggml_tensor * cur;
+    if (prefill) {
+        ggml_tensor * cpos = is_swa ? inp->self_cell_pos_swa : inp->self_cell_pos;
+        cur = ggml_inkling2_attn(ctx0, q_cur, k, v, table, r, sinks, cpos, inp->self_q_pos, nullptr, false, kq_scale, 0, 0);
+        if (is_swa) {
+            ggml_inkling2_attn_set_n_swa(cur, (int32_t) hparams.n_swa);
+        }
+        if (v_rot) {
+            cur = ggml_reshape_3d(ctx0, cur, q_cur->ne[0], q_cur->ne[1], n_tokens);
+            cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
+            cur = ggml_reshape_2d(ctx0, cur, q_cur->ne[0]*q_cur->ne[1], n_tokens);
+        }
+    } else {
+        cur = ggml_inkling2_attn(ctx0, q_cur, k, v, table, r, sinks, rel_pos, attn_mask.raw, gate, v_trans, kq_scale, n_rot_q, n_rot_v);
+    }
     cb(cur, "kqv_out", il);
 
     return cur;

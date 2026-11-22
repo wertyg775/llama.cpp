@@ -557,12 +557,16 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         ggml_tensor * sinks = mm(6, layer.attn_sink_proj, inputs[0]);
 
-        // at decode the attention, with the bias, the sinks and the output gate, can run as one fused op
-        ggml_tensor * attn_out = proj[0] ? build_attn_inkling2_fused(inp, Qcur, Kcur, Vcur, layer.attn_rel_bias, Rcur, sinks, proj[7],
-                1.0f/sqrtf(n_embd_head), il) : nullptr;
+        // at decode (and compact causal full-attention prefill) attention runs as one fused op
+        ggml_tensor * attn_out = build_attn_inkling2_fused(inp, Qcur, Kcur, Vcur, layer.attn_rel_bias, Rcur, sinks,
+                proj[0] ? proj[7] : nullptr, 1.0f/sqrtf(n_embd_head), il);
         if (attn_out) {
-            res->add_fused_node({LLM_FUSED_OP_INKLING2, attn_out, ip});
-            cur = attn_out;
+            if (proj[0]) {
+                res->add_fused_node({LLM_FUSED_OP_INKLING2, attn_out, ip});
+                cur = attn_out;
+            } else {
+                cur = ggml_mul(ctx0, attn_out, ggml_sigmoid(ctx0, mm(7, layer.wqkv_gate, inputs[0])));
+            }
         } else {
             // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
             ggml_tensor * kq_b;

@@ -2021,6 +2021,26 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
 }
 
+void llama_kv_cache::set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ubatch->n_seqs == 1);
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    const int64_t n_kv = dst->ne[0] - 1;
+    const llama_seq_id seq_id = ubatch->seq_id[0][0];
+    const auto & cells = v_cells.at(seq_to_stream.at(seq_id));
+    int32_t * data = (int32_t *) dst->data;
+    int32_t last_valid = 0;
+    for (int64_t j = 0; j < n_kv; ++j) {
+        if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
+            data[j] = cells.pos_get(j);
+            last_valid = (int32_t) (j + 1);
+        } else {
+            data[j] = -1;
+        }
+    }
+    data[n_kv] = last_valid;
+}
+
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
@@ -3126,6 +3146,10 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
     kv->set_input_relative_pos(dst, ubatch, extent);
+}
+
+void llama_kv_cache_context::set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_cell_pos(dst, ubatch);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

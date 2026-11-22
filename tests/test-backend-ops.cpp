@@ -5374,6 +5374,95 @@ struct test_inkling2_attn : public test_case {
     }
 };
 
+struct test_inkling2_attn_compact : public test_case {
+    const ggml_type type;
+    const int64_t   d;
+    const int64_t   n_head;
+    const int64_t   n_head_kv;
+    const int64_t   n_kv;
+    const int64_t   n_tokens;
+    const int64_t   n_active;
+    const bool      with_gate;
+    const int32_t   n_swa;
+
+    std::string vars() override {
+        return VARS_TO_STR9(type, d, n_head, n_head_kv, n_kv, n_tokens, n_active, with_gate, n_swa);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_inkling2_attn_compact(ggml_type type, int64_t d, int64_t n_head, int64_t n_head_kv, int64_t n_kv,
+            int64_t n_tokens, int64_t n_active, bool with_gate, int32_t n_swa = 0)
+        : type(type), d(d), n_head(n_head), n_head_kv(n_head_kv), n_kv(n_kv), n_tokens(n_tokens),
+          n_active(n_active), with_gate(with_gate), n_swa(n_swa) {}
+
+    static constexpr int64_t n_rel    = 16;
+    static constexpr int64_t n_extent = 100;
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_head, n_tokens);
+        ggml_set_name(q, "q");
+
+        const int64_t kv_size = n_kv + 9;
+        ggml_tensor * kc = ggml_new_tensor_2d(ctx, type, d*n_head_kv, kv_size);
+        ggml_set_name(kc, "k_cache");
+        ggml_tensor * k = ggml_view_3d(ctx, kc, d, n_head_kv, n_kv, ggml_row_size(type, d), kc->nb[1], 0);
+
+        ggml_tensor * vc = ggml_new_tensor_2d(ctx, type, d*n_head_kv, kv_size);
+        ggml_set_name(vc, "v_cache");
+        ggml_tensor * v = ggml_view_3d(ctx, vc, d, n_head_kv, n_kv, ggml_row_size(type, d), vc->nb[1], 0);
+
+        ggml_tensor * table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rel, n_extent);
+        ggml_set_name(table, "table");
+        ggml_tensor * r = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_rel, n_head, n_tokens);
+        ggml_set_name(r, "r");
+        ggml_tensor * sinks = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_tokens);
+        ggml_set_name(sinks, "sinks");
+        ggml_tensor * cell_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv + 1);
+        ggml_set_name(cell_pos, "cell_pos");
+        ggml_tensor * q_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+        ggml_set_name(q_pos, "q_pos");
+        ggml_tensor * gate = with_gate ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d*n_head, n_tokens) : nullptr;
+        if (gate) {
+            ggml_set_name(gate, "gate");
+        }
+
+        ggml_tensor * out = ggml_inkling2_attn(ctx, q, k, v, table, r, sinks, cell_pos, q_pos, gate, false, 1.0f/sqrtf(d), 0, 0);
+        if (n_swa > 0) {
+            ggml_inkling2_attn_set_n_swa(out, n_swa);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "cell_pos") {
+                std::vector<int32_t> data(n_kv + 1, -1);
+                for (int64_t j = 0; j < n_active; ++j) {
+                    data[j] = (j % 11 == 5) ? -1 : (int32_t) j;
+                }
+                data[n_kv] = (int32_t) n_active;
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (name == "q_pos") {
+                std::vector<int32_t> data(n_tokens);
+                const int32_t p0 = std::max<int32_t>(0, (int32_t) n_active - (int32_t) n_tokens);
+                for (int64_t i = 0; i < n_tokens; ++i) {
+                    data[i] = p0 + (int32_t) i;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (name == "q") {
+                init_tensor_uniform(t, -3.0f, 3.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -11418,6 +11507,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 12, 3000, false, GGML_TYPE_F32, 3000, 128, 128));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 128, 24, 6, 300, false, GGML_TYPE_F16, 512));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_Q8_0, 64, 8, 4, 2000, false, GGML_TYPE_F16, 2000, 64, 64));
+    // compact causal prefill (1D cell_pos + q_pos, T >= 1, with and without gate, Q8_0 and F16)
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 512,  17,  200, false));
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 512,  64,  512, true));
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 2048, 65,  1500, false));
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 256,  16,  0,   false));
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_F16,  128, 24, 8, 512,  35,  300, false));
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_F16,  128, 24, 8, 512,  32,  512, true));
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 1536, 65,  1500, false, 128));
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_F16,  128, 24, 8, 1536, 35,  1000, false, 256));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, 256, true,  GGML_TYPE_F16, 512, 128, 128));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, 4096, true,  GGML_TYPE_F16, 4096));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, 4096, false, GGML_TYPE_F16, 4096));
