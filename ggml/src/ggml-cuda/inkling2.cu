@@ -3635,7 +3635,6 @@ static __global__ void __launch_bounds__(512, 1) inkling2_attn_prefill_gqa(
     __shared__               float   s_sink[NR];      // log2e folded in
     __shared__               float   s_cs[NR];        // per-row stabilizer of u = logit + sink (log2 units), wave-uniform
     __shared__               int32_t s_qpos[BQ];
-    __shared__               int32_t s_vis[2][NW];     // per-wave "tile visible" votes, double buffered by tile parity
     __shared__               int32_t s_cpos[BK];       // cell positions of the current tile (-1 = invalid), from wave 0
 
     const float qscale = scale*LOG2E;
@@ -3891,21 +3890,13 @@ static __global__ void __launch_bounds__(512, 1) inkling2_attn_prefill_gqa(
 
     load_k(k_begin);
     for (int k0 = k_begin; k0 < k_end; k0 += BK) {
-        // A: skip test (also orders the previous PV before the K/V tile is overwritten), K tile, V prefetch
-        const bool vis = inkling2_wave_any(lcp >= 0 && lcp <= p_max && lcp >= p_lo);
-        const int  par = (k0/BK) & 1;
-        if ((otid() & 63) == 0) {
-            s_vis[par][wave] = vis;
-        }
+        // A: skip test, K tile, V prefetch. Every wave loads the same 64 cell positions and p_max/p_lo are block-wide, so
+        // the vote is block-uniform without an exchange; the barrier orders the previous PV before the K/V tile is overwritten
+        const bool any_vis = inkling2_wave_any(lcp >= 0 && lcp <= p_max && lcp >= p_lo);
         if (wave == 0) {
             s_cpos[otid() & 63] = lcp; // the previous tile's last reader (store_v) is behind the barrier of phase C
         }
         inkling2_lds_barrier();
-        bool any_vis = false;
-#pragma unroll
-        for (int w = 0; w < NW; ++w) {
-            any_vis |= s_vis[par][w] != 0;
-        }
         if (any_vis) {
         store_k();
         load_v(k0);
