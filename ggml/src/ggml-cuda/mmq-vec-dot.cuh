@@ -459,13 +459,23 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         for (int j0 = 0; j0 < J; j0 += nwarps) {
             const int j = j0 + threadIdx.y;
 
+            // y is warp-uniform: vector loads (ds_read_b128 on AMD) instead of 32 bit pairs,
+            // whose 8 bit LDS offsets overflow and need one address add per pair.
+            constexpr int max_cpy  = ggml_cuda_get_max_cpy_bytes();
+            constexpr int mcpy_int = max_cpy / sizeof(int);
+            int u[QI8_0];
+#pragma unroll
+            for (int l0 = 0; l0 < QI8_0; l0 += mcpy_int) {
+                ggml_cuda_memcpy_1<max_cpy>(u + l0, &y_qs[j*MMQ_TILE_Y_K + k01 + l0]);
+            }
+
 #pragma unroll
             for (int i0 = 0; i0 < I; i0 += warp_size) {
                 const int i = i0 + threadIdx.x;
 
                 sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q8_0_16_q8_1_impl<QI8_0>(
                     &x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0],
-                    &y_qs[j*MMQ_TILE_Y_K + k01],
+                    u,
                     &x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + k0/(QI8_0/2)],
                     y_df[j*MMQ_TILE_Y_K + k01/QI8_1]);
             }
