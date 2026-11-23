@@ -37,6 +37,9 @@
 #endif
 
 // utils
+// max output rows reserved per ubatch (0 = n_batch), not swept
+static int g_n_outputs_max = 0;
+
 static uint64_t get_time_ns() {
     using clock = std::chrono::high_resolution_clock;
     return std::chrono::nanoseconds(clock::now().time_since_epoch()).count();
@@ -463,6 +466,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -pg <pp,tg>                                       (default: %s)\n", join(transform_to_str(cmd_params_defaults.n_pg, pair_str), ",").c_str());
     printf("  -d, --n-depth <n>                                 (default: %s)\n", join(cmd_params_defaults.n_depth, ",").c_str());
     printf("  -b, --batch-size <n>                              (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
+    printf("  --n-outputs-max <n>                               (default: 0 = n_batch; max output rows reserved per ubatch)\n");
     printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
     printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
@@ -628,6 +632,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_batch.insert(params.n_batch.end(), p.begin(), p.end());
+            } else if (arg == "--n-outputs-max") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                g_n_outputs_max = std::stoi(argv[i]);
             } else if (arg == "-ub" || arg == "--ubatch-size") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1311,6 +1321,7 @@ struct cmd_params_instance {
         cparams.n_ctx           = n_prompt + n_gen + n_depth;
         cparams.n_batch         = n_batch;
         cparams.n_ubatch        = n_ubatch;
+        cparams.n_outputs_max   = g_n_outputs_max;
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
