@@ -14589,6 +14589,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));
     }
 
+    // Inkling2 MoE prefill at -ub 2048: 128 experts, top-8, gate_up 2304 -> 2304, down 1152 -> 2304
+    for (int64_t n : {2048, 512, 128}) {
+        for (int64_t k : {2304, 1152}) {
+            test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, false, 2304, n, k));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 8, false, 2304, 2048, 2304));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 128, 8, false, 2304, 2048, 1152));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 2304, 2048, 2304));
+
     // embedding lookups: one token (decode) and one batch of 2048 tokens (prefill)
     for (int r : {16, 32768}) {
         test_cases.emplace_back(new test_get_rows(GGML_TYPE_F8_E4M3, 160, 2000000, r, 1, 1, false)); // Qwen4-Exp n-gram table, 16 rows per token
