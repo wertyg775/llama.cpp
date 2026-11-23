@@ -435,6 +435,19 @@ static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config
 
 // ------------------------------------------------------------
 
+// GCN dp4a NVFP4: y is read from VRAM with scalar loads (ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a_sy), no SRAM y tile.
+static __host__ bool ggml_cuda_mmq_y_scalar(const ggml_type type, const int cc) {
+    return GGML_CUDA_CC_IS_GCN(cc) && type == GGML_TYPE_NVFP4;
+}
+
+template <ggml_type type> static constexpr __device__ bool ggml_cuda_mmq_y_scalar() {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    return type == GGML_TYPE_NVFP4;
+#else
+    return false;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
 // Weight types with a fused gate/up/GLU path (see ggml_cuda_mmq_get_util_funcs).
 static constexpr __host__ __device__ bool ggml_cuda_mmq_fusion_supported(const ggml_type type) {
     return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_XS ||
@@ -953,9 +966,11 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr ggml_cuda_mmq_vec_dot_t    vec_dot    = ggml_cuda_mmq_get_vec_dot<type, J, fallback, prec_src1>();
     constexpr ggml_cuda_mmq_write_back_t write_back = ggml_cuda_mmq_get_write_back<type, J, fallback, prec_src1, has_fusion>();
 
+    constexpr bool y_scalar = ggml_cuda_mmq_y_scalar<type>();
+
     extern __shared__ int data_mul_mat_q[];
     int * tile_y = data_mul_mat_q + J;
-    int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
+    int * tile_x = y_scalar ? tile_y : tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
     // FP4 tile stores 8 blocks. src1 above Q4 uses the generic
@@ -975,6 +990,17 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_i_max, stride_row_x);
+        if constexpr (y_scalar) {
+            const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+
+            __syncthreads();
+
+            ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a_sy<type, J, fallback>(tile_x, by0,                sum, 0);
+            ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a_sy<type, J, fallback>(tile_x, by0 + ncols_y * sz, sum, MMQ_TILE_NE_K);
+
+            __syncthreads();
+            continue;
+        }
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
@@ -1475,7 +1501,7 @@ struct mmq_args {
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
     const size_t nbs_ids = config.J*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
-    const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
+    const size_t nbs_y = ggml_cuda_mmq_y_scalar(config.type, cc) ? 0 : config.J * (sizeof(block_q8_1_mmq));
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 

@@ -483,6 +483,68 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// GCN, NVFP4: like ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a, but y is read from VRAM (same layout as the SRAM tile)
+// with wave-uniform scalar loads into SGPRs instead of SRAM broadcasts. A b128 SRAM read costs ~8 CU clocks on GCN
+// even when all lanes read the same address, which made the SRAM y reads the bottleneck. It also frees the SRAM y tile.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a_sy(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8);
+
+    typedef const __attribute__((address_space(4))) int   cint;
+    typedef const __attribute__((address_space(4))) float cfloat;
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, I);
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) x_qs + txs.qs;
+
+    const int wy = __builtin_amdgcn_readfirstlane(threadIdx.y);
+    cint   * y_qs = (cint   *) y + wy*MMQ_TILE_Y_K + 4;
+    cfloat * y_df = (cfloat *) y + wy*MMQ_TILE_Y_K;
+
+#pragma unroll 1
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+        const int k0 = k00 + k01;
+
+        // the scalar loads of up to 8 columns are issued before their dot products to hide the scalar cache latency
+        constexpr int nj = J / nwarps;
+        constexpr int jb = nj % 8 == 0 ? 8 : (nj % 4 == 0 ? 4 : (nj % 2 == 0 ? 2 : 1));
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += jb*nwarps) {
+            int   u[jb][QI8_0];
+            float dy[jb];
+#pragma unroll
+            for (int jj = 0; jj < jb; ++jj) {
+#pragma unroll
+                for (int l = 0; l < QI8_0; ++l) {
+                    u[jj][l] = y_qs[(j0 + jj*nwarps)*MMQ_TILE_Y_K + k01 + l];
+                }
+                dy[jj] = y_df[(j0 + jj*nwarps)*MMQ_TILE_Y_K + k01/QI8_1];
+            }
+
+#pragma unroll
+            for (int jj = 0; jj < jb; ++jj) {
+#pragma unroll
+                for (int i0 = 0; i0 < I; i0 += warp_size) {
+                    const int i = i0 + threadIdx.x;
+
+                    sum[(j0/nwarps + jj)*I/warp_size + i0/warp_size] += vec_dot_q8_0_16_q8_1_impl<QI8_0>(
+                        &x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0],
+                        u[jj],
+                        &x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + k0/(QI8_0/2)],
+                        dy[jj]);
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(x, y, sum, k00);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
 // Used for Q3_K, IQ2_S, and IQ2_XS:
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
