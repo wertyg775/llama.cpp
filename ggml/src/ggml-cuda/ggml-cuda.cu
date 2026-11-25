@@ -6306,6 +6306,25 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 #endif // CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA)
 }
 
+// pinned or registered host memory: the device can copy from it asynchronously
+static bool ggml_backend_cuda_host_ptr_is_pinned(const void * ptr) {
+#if defined(GGML_USE_HIP)
+    hipPointerAttribute_t attr;
+    if (hipPointerGetAttributes(&attr, ptr) != hipSuccess) {
+        (void)hipGetLastError();
+        return false;
+    }
+    return attr.type == hipMemoryTypeHost;
+#else
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    return attr.type == cudaMemoryTypeHost;
+#endif // defined(GGML_USE_HIP)
+}
+
 void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
     if (!ggml_cuda_register_host_enabled()) {
         return;
@@ -7218,6 +7237,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_host_ptr_is_pinned") == 0) {
+        return (void *)ggml_backend_cuda_host_ptr_is_pinned;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

@@ -1366,7 +1366,15 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() {
+        // before the mappings are unmapped
+        for (const auto & [unregister_fn, ptr] : host_regs) {
+            unregister_fn(ptr);
+        }
+    }
+
+    // mapped ranges registered with a GPU backend
+    std::vector<std::pair<void (*)(void *), void *>> host_regs;
 
     uint64_t n_elements = 0;
 
@@ -2094,6 +2102,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             GGML_ASSERT(!ml.no_alloc);
             const size_t max_size = ggml_get_max_tensor_size(ctx);
 
+            // let a GPU backend pin the mapped ranges, so that op offload can upload from them asynchronously
+            // the backend decides (e.g. CUDA/HIP only with GGML_CUDA_REGISTER_HOST=1)
+            auto register_host_range = [&](void * ptr, size_t size) {
+                for (const auto & d : devices) {
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d.dev);
+                    auto reg_fn   = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
+                    auto unreg_fn = (void (*)(void *))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
+                    if (reg_fn && unreg_fn && reg_fn(ptr, size)) {
+                        pimpl->host_regs.emplace_back(unreg_fn, ptr);
+                        LLAMA_LOG_INFO("load_tensors: registered %.2f MiB of mapped %s memory with %s\n",
+                            size/1024.0/1024.0, ggml_backend_buft_name(buft), ggml_backend_reg_name(reg));
+                        return;
+                    }
+                }
+            };
+
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // map the mmap regions that contain the tensors of this context
                 // this is important for metal with apple silicon: a backend buffer pins everything it
@@ -2109,6 +2133,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                     }
                     bufs.emplace_back(buf);
+                    if (!ctx_key.lazy) {
+                        register_host_range((char *) addr + range.first, range.last - range.first);
+                    }
                 }
             }
         } else {

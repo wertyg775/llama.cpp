@@ -2322,12 +2322,18 @@ static void ggml_backend_sched_place_uploads(ggml_backend_sched_t sched) {
             (sched->upload_backend_id >= 0 && split->backend_id != sched->upload_backend_id)) {
             continue;
         }
-        // only from the host buffer type of the device: copies from pageable memory do not run in parallel with the compute
-        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(sched->backends[split->backend_id]));
+        // only from pinned memory (the host buffer type of the device, or registered memory): copies from pageable memory do not run in parallel with the compute
+        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[split->backend_id]);
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+        auto host_ptr_is_pinned = (bool (*)(const void *)) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_host_ptr_is_pinned");
         for (int i = 0; i < split->n_inputs; i++) {
             struct ggml_tensor * input = split->inputs[i];
-            if (!ggml_backend_sched_is_host_weight(input) || input->view_src != NULL || !sched->hv_tensor_requires_copy[hash_id(input)] ||
-                host_buft == NULL || input->buffer->buft != host_buft) {
+            if (!ggml_backend_sched_is_host_weight(input) || input->view_src != NULL || !sched->hv_tensor_requires_copy[hash_id(input)]) {
+                continue;
+            }
+            const bool pinned = (host_buft != NULL && input->buffer->buft == host_buft) ||
+                (host_ptr_is_pinned != NULL && host_ptr_is_pinned(input->data) && host_ptr_is_pinned((const char *) input->data + ggml_nbytes(input) - 1));
+            if (!pinned) {
                 continue;
             }
             if (sched->n_uploads == sched->uploads_capacity) {
