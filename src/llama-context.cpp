@@ -806,6 +806,16 @@ void llama_context::sched_new(const sched_params & params) {
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 
+    // GGML_SCHED_UPLOAD_AHEAD: 1 = smallest ring buffer, > 1 = ring buffer size in MiB
+    // not with the MoE cache: its slot maps are host weights that only the copy callback can copy
+    if (const char * env = getenv("GGML_SCHED_UPLOAD_AHEAD"); env != nullptr && atoi(env) > 0) {
+        if (cparams.moe_cache_size > 0) {
+            LLAMA_LOG_WARN("%s: GGML_SCHED_UPLOAD_AHEAD is ignored with the MoE cache\n", __func__);
+        } else {
+            ggml_backend_sched_set_upload_ahead(sched.get(), true, (size_t) atoi(env) << 20);
+        }
+    }
+
     sched_params_cur = params;
 }
 

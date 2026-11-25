@@ -1183,6 +1183,18 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// a weight in host memory that is copied to the ring buffer on a second stream, before the split that reads it [GGML_SCHED_UPLOAD_AHEAD]
+struct ggml_backend_sched_upload {
+    struct ggml_tensor * src;
+    struct ggml_tensor * dst;
+    size_t offset;   // in the ring buffer
+    int split_id;    // the split that copies it
+    int last_split;  // the last split that reads it
+    int wait;        // the upload that used this ring space before, -1 if none
+    ggml_backend_event_t ready; // recorded on the upload backend after the copy
+    ggml_backend_event_t done;  // recorded on the split backend after last_split
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -1257,6 +1269,18 @@ struct ggml_backend_sched {
     int prefetch_backend_id; // the backend that copies them
 
     bool async_host_read[GGML_SCHED_MAX_BACKENDS]; // backend has in-flight set_tensor_async from a host buffer
+
+    // host weights uploaded ahead, see ggml_backend_sched_place_uploads
+    bool upload_ahead;
+    size_t upload_min_size;           // a bigger ring lets the uploads start earlier
+    int upload_backend_id;            // the backend of the splits that read the uploads, -1 if none
+    ggml_backend_t upload_backend;    // a second backend on the same device, the copies run on its stream
+    ggml_backend_buffer_t upload_buf; // ring buffer
+    ggml_backend_event_t upload_start;
+    struct ggml_backend_sched_upload * uploads; // ordered by split_id
+    int n_uploads;
+    int uploads_capacity;
+    int next_upload; // the first upload that is not issued in this graph
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -2276,6 +2300,191 @@ static void ggml_backend_sched_prefetch_inputs(ggml_backend_sched_t sched, int s
     }
 }
 
+static void ggml_backend_sched_disable_uploads(ggml_backend_sched_t sched, const char * reason) {
+    GGML_LOG_WARN("%s: upload ahead disabled: %s\n", __func__, reason);
+    sched->upload_ahead = false;
+    sched->n_uploads = 0;
+    sched->upload_backend_id = -1;
+}
+
+// the host weights copied to a device split get a place in a ring buffer instead of the compute buffer,
+// so that they can be uploaded on a second stream while the earlier splits compute
+static void ggml_backend_sched_place_uploads(ggml_backend_sched_t sched) {
+    sched->n_uploads = 0;
+    sched->upload_backend_id = -1;
+    if (!sched->upload_ahead || sched->n_copies > 1) {
+        return;
+    }
+
+    for (int s = 0; s < sched->n_splits; s++) {
+        struct ggml_backend_sched_split * split = &sched->splits[s];
+        if (ggml_backend_buft_is_host(sched->bufts[split->backend_id]) ||
+            (sched->upload_backend_id >= 0 && split->backend_id != sched->upload_backend_id)) {
+            continue;
+        }
+        // only from the host buffer type of the device: copies from pageable memory do not run in parallel with the compute
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(sched->backends[split->backend_id]));
+        for (int i = 0; i < split->n_inputs; i++) {
+            struct ggml_tensor * input = split->inputs[i];
+            if (!ggml_backend_sched_is_host_weight(input) || input->view_src != NULL || !sched->hv_tensor_requires_copy[hash_id(input)] ||
+                host_buft == NULL || input->buffer->buft != host_buft) {
+                continue;
+            }
+            if (sched->n_uploads == sched->uploads_capacity) {
+                const int old_cap = sched->uploads_capacity;
+                sched->uploads_capacity = std::max(16, 2*old_cap);
+                sched->uploads = (ggml_backend_sched_upload *) realloc(sched->uploads, sched->uploads_capacity*sizeof(sched->uploads[0]));
+                GGML_ASSERT(sched->uploads != NULL);
+                memset(sched->uploads + old_cap, 0, (sched->uploads_capacity - old_cap)*sizeof(sched->uploads[0]));
+            }
+            struct ggml_backend_sched_upload * up = &sched->uploads[sched->n_uploads++];
+            up->src        = input;
+            up->dst        = tensor_copy(input, split->backend_id, 0);
+            up->split_id   = s;
+            up->last_split = s;
+            sched->upload_backend_id = split->backend_id;
+        }
+    }
+    if (sched->n_uploads == 0) {
+        return;
+    }
+
+    // later splits on the same backend read the copy without copying it again
+    for (int s = sched->uploads[0].split_id; s < sched->n_splits; s++) {
+        struct ggml_backend_sched_split * split = &sched->splits[s];
+        if (split->backend_id != sched->upload_backend_id) {
+            continue;
+        }
+        for (int j = 0; j < split->graph.n_nodes; j++) {
+            const struct ggml_tensor * node = split->graph.nodes[j];
+            for (int k = 0; k < GGML_MAX_SRC; k++) {
+                const struct ggml_tensor * src = node->src[k];
+                if (src == NULL || src->data != NULL) {
+                    continue;
+                }
+                for (int u = 0; u < sched->n_uploads; u++) {
+                    if (src == sched->uploads[u].dst || src->view_src == sched->uploads[u].dst) {
+                        sched->uploads[u].last_split = std::max(sched->uploads[u].last_split, s);
+                    }
+                }
+            }
+        }
+    }
+
+    ggml_backend_t backend = sched->backends[sched->upload_backend_id];
+    ggml_backend_buffer_type_t buft = sched->bufts[sched->upload_backend_id];
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    auto up_size = [&](const ggml_backend_sched_upload & up) {
+        return GGML_PAD(ggml_backend_buft_get_alloc_size(buft, up.dst), align);
+    };
+
+    // start with room for the uploads of two consecutive splits, grow until no upload overwrites a copy that its own split still reads
+    size_t ring = 0;
+    for (int u0 = 0, u1 = 0; u0 < sched->n_uploads; u0 = u1) {
+        size_t size = 0;
+        for (u1 = u0; u1 < sched->n_uploads && sched->uploads[u1].split_id == sched->uploads[u0].split_id; u1++) {
+            size += up_size(sched->uploads[u1]);
+        }
+        for (int u2 = u1; u2 < sched->n_uploads && sched->uploads[u2].split_id == sched->uploads[u1].split_id; u2++) {
+            size += up_size(sched->uploads[u2]);
+        }
+        ring = std::max(ring, size);
+    }
+    ring = std::max(ring, sched->upload_min_size);
+    if (sched->upload_buf != NULL) {
+        ring = std::max(ring, ggml_backend_buffer_get_size(sched->upload_buf));
+    }
+    for (bool ok = false; !ok; ring += ring/2) {
+        ok = true;
+        size_t offset = 0;
+        for (int u = 0; u < sched->n_uploads && ok; u++) {
+            struct ggml_backend_sched_upload * up = &sched->uploads[u];
+            const size_t size = up_size(*up);
+            if (offset + size > ring) {
+                offset = 0;
+            }
+            up->offset = offset;
+            up->wait   = -1;
+            for (int j = 0; j < u; j++) {
+                const struct ggml_backend_sched_upload * prev = &sched->uploads[j];
+                if (prev->offset < offset + size && offset < prev->offset + up_size(*prev) &&
+                    (up->wait < 0 || prev->last_split >= sched->uploads[up->wait].last_split)) {
+                    up->wait = j;
+                }
+            }
+            ok = up->wait < 0 || sched->uploads[up->wait].last_split < up->split_id;
+            offset += size;
+        }
+        if (ok) {
+            break;
+        }
+    }
+
+    if (sched->upload_buf == NULL || ggml_backend_buffer_get_size(sched->upload_buf) < ring) {
+        if (sched->upload_backend == NULL) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            struct ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            if (!props.caps.async || !props.caps.events) {
+                ggml_backend_sched_disable_uploads(sched, "the device has no async copies or events");
+                return;
+            }
+            sched->upload_backend = ggml_backend_dev_init(dev, NULL);
+            sched->upload_start   = ggml_backend_event_new(dev);
+            if (sched->upload_backend == NULL || sched->upload_start == NULL) {
+                ggml_backend_sched_disable_uploads(sched, "failed to create the upload backend");
+                return;
+            }
+        }
+        if (sched->upload_buf != NULL) {
+            for (int b = 0; b < sched->n_backends; b++) {
+                ggml_backend_synchronize(sched->backends[b]);
+                sched->async_host_read[b] = false;
+            }
+            ggml_backend_synchronize(sched->upload_backend);
+            ggml_backend_buffer_free(sched->upload_buf);
+        }
+        sched->upload_buf = ggml_backend_buft_alloc_buffer(buft, ring);
+        if (sched->upload_buf == NULL) {
+            ggml_backend_sched_disable_uploads(sched, "failed to allocate the ring buffer");
+            return;
+        }
+        // compute usage: the backend does not clear the padding of quantized tensors at each allocation
+        ggml_backend_buffer_set_usage(sched->upload_buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        GGML_LOG_INFO("%s: %10s upload ring buffer size = %8.2f MiB\n", __func__, ggml_backend_name(backend), ring / 1024.0 / 1024.0);
+    }
+
+    char * base = (char *) ggml_backend_buffer_get_base(sched->upload_buf);
+    for (int u = 0; u < sched->n_uploads; u++) {
+        struct ggml_backend_sched_upload * up = &sched->uploads[u];
+        if (sched->debug > 1) {
+            GGML_LOG_DEBUG("upload %2d: %-28s split %3d/%3d last %3d wait %2d offset %8.2f size %8.2f MiB\n", u, up->src->name, up->split_id, sched->n_splits,
+                up->last_split, up->wait, up->offset/1048576.0, ggml_nbytes(up->src)/1048576.0);
+        }
+        GGML_ASSERT(ggml_backend_tensor_alloc(sched->upload_buf, up->dst, base + up->offset) == GGML_STATUS_SUCCESS);
+        if (up->ready == NULL) {
+            up->ready = ggml_backend_event_new(backend->device);
+            up->done  = ggml_backend_event_new(backend->device);
+            GGML_ASSERT(up->ready != NULL && up->done != NULL);
+        }
+    }
+}
+
+// issue the uploads of the splits up to max_split whose ring space is free after the splits up to done_split
+static void ggml_backend_sched_issue_uploads(ggml_backend_sched_t sched, int max_split, int done_split) {
+    for (; sched->next_upload < sched->n_uploads; sched->next_upload++) {
+        struct ggml_backend_sched_upload * up = &sched->uploads[sched->next_upload];
+        if (up->split_id > max_split || (up->wait >= 0 && sched->uploads[up->wait].last_split > done_split)) {
+            break;
+        }
+        if (up->wait >= 0) {
+            ggml_backend_event_wait(sched->upload_backend, sched->uploads[up->wait].done);
+        }
+        ggml_backend_tensor_set_async(sched->upload_backend, up->dst, up->src->data, 0, ggml_nbytes(up->src));
+        ggml_backend_event_record(up->ready, sched->upload_backend);
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -2289,6 +2498,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     int prev_backend_id = -1;
+
+    sched->next_upload = 0;
+    int wait_upload = 0; // the first upload that the split backend does not wait for yet
+    if (sched->n_uploads > 0) {
+        // the previous graph can still read the ring buffer
+        ggml_backend_event_record(sched->upload_start, sched->backends[sched->upload_backend_id]);
+        ggml_backend_event_wait(sched->upload_backend, sched->upload_start);
+        ggml_backend_sched_issue_uploads(sched, sched->n_splits, -1);
+    }
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -2339,9 +2557,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_backend_sched_prefetch_inputs(sched, split_id);
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             struct ggml_tensor * input = split->inputs[input_id];
-            if (ggml_backend_sched_is_host_weight(input) && sched->hv_tensor_requires_copy[hash_id(input)]) {
+            if (ggml_backend_sched_is_host_weight(input) && sched->hv_tensor_requires_copy[hash_id(input)] &&
+                (sched->upload_buf == NULL || tensor_copy(input, split_backend_id, sched->cur_copy)->buffer != sched->upload_buf)) {
                 ggml_backend_sched_copy_input(sched, split, input, defer_user_input_sync,
                         need_sync_backend, &need_sync_split_inputs, sched->async_host_read);
+            }
+        }
+        if (sched->n_uploads > 0) {
+            ggml_backend_sched_issue_uploads(sched, split_id, split_id - 1);
+            GGML_ASSERT(sched->next_upload == sched->n_uploads || sched->uploads[sched->next_upload].split_id > split_id);
+            for (; wait_upload < sched->next_upload && sched->uploads[wait_upload].split_id <= split_id; wait_upload++) {
+                ggml_backend_event_wait(split_backend, sched->uploads[wait_upload].ready);
             }
         }
 
@@ -2404,6 +2630,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+        }
+
+        if (sched->n_uploads > 0) {
+            for (int u = 0; u < sched->n_uploads; u++) {
+                if (sched->uploads[u].last_split == split_id) {
+                    ggml_backend_event_record(sched->uploads[u].done, split_backend);
+                }
+            }
+            // the uploads whose ring space is free after this split
+            ggml_backend_sched_issue_uploads(sched, sched->n_splits, split_id);
         }
 
         prev_backend_id = split_backend_id;
@@ -2480,6 +2716,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
 
+    sched->upload_backend_id = -1;
+
     ggml_backend_sched_reset(sched);
 
     return sched;
@@ -2495,6 +2733,17 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         }
         ggml_backend_event_free(sched->prefetch_events[b]);
     }
+    if (sched->upload_backend != NULL) {
+        ggml_backend_synchronize(sched->upload_backend);
+    }
+    for (int u = 0; u < sched->uploads_capacity; u++) {
+        ggml_backend_event_free(sched->uploads[u].ready);
+        ggml_backend_event_free(sched->uploads[u].done);
+    }
+    free(sched->uploads);
+    ggml_backend_event_free(sched->upload_start);
+    ggml_backend_buffer_free(sched->upload_buf);
+    ggml_backend_free(sched->upload_backend);
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
@@ -2550,6 +2799,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);
+    ggml_backend_sched_place_uploads(sched);
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
@@ -2569,6 +2819,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
     ggml_backend_sched_split_graph(sched, graph);
+    ggml_backend_sched_place_uploads(sched);
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
@@ -2606,6 +2857,9 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
         ggml_backend_synchronize(sched->backends[i]);
         sched->async_host_read[i] = false;
     }
+    if (sched->upload_backend != NULL) {
+        ggml_backend_synchronize(sched->upload_backend);
+    }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
         // this ensures that during generation the same copy is used every time,
@@ -2618,6 +2872,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_upload_ahead(ggml_backend_sched_t sched, bool enable, size_t min_ring_size) {
+    GGML_ASSERT(sched);
+    sched->upload_ahead    = enable;
+    sched->upload_min_size = min_ring_size;
 }
 
 void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {

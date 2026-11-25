@@ -390,6 +390,10 @@ extern "C" {
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 
+    // Copy the weights in the host buffer type of a device to it on a second stream, ahead of the splits that read them
+    // the copy callback is not called for these weights; min_ring_size: bigger lets the copies start earlier, 0 = smallest
+    GGML_API void                 ggml_backend_sched_set_upload_ahead(ggml_backend_sched_t sched, bool enable, size_t min_ring_size);
+
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
 
