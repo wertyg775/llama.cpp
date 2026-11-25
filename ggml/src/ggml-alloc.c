@@ -476,6 +476,24 @@ struct node_alloc {
     struct tensor_alloc src[GGML_MAX_SRC];
 };
 
+// a copy of the plan that sized the buffers
+struct gallocr_plan {
+    struct node_alloc * node_allocs; // [n_nodes]
+    struct leaf_alloc * leaf_allocs; // [n_leafs]
+    enum ggml_op * ops;              // [n_nodes]
+    size_t * chunk_sizes;            // [n_buffers * GGML_VBUFFER_MAX_CHUNKS]
+    int n_nodes;
+    int n_leafs;
+};
+
+static void ggml_gallocr_plan_free(struct gallocr_plan * plan) {
+    free(plan->node_allocs);
+    free(plan->leaf_allocs);
+    free(plan->ops);
+    free(plan->chunk_sizes);
+    memset(plan, 0, sizeof(*plan));
+}
+
 struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
@@ -490,6 +508,8 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    struct gallocr_plan sized_plan;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -573,6 +593,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->buf_tallocs);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
+    ggml_gallocr_plan_free(&galloc->sized_plan);
     free(galloc);
 }
 
@@ -819,6 +840,68 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 }
 
+static void ggml_gallocr_plan_save(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    struct gallocr_plan * plan = &galloc->sized_plan;
+    ggml_gallocr_plan_free(plan);
+
+    plan->n_nodes     = graph->n_nodes;
+    plan->n_leafs     = graph->n_leafs;
+    plan->node_allocs = malloc(graph->n_nodes * sizeof(struct node_alloc) + 1);
+    plan->leaf_allocs = malloc(graph->n_leafs * sizeof(struct leaf_alloc) + 1);
+    plan->ops         = malloc(graph->n_nodes * sizeof(enum ggml_op) + 1);
+    plan->chunk_sizes = calloc(galloc->n_buffers * GGML_VBUFFER_MAX_CHUNKS, sizeof(size_t));
+    GGML_ASSERT(plan->node_allocs && plan->leaf_allocs && plan->ops && plan->chunk_sizes);
+
+    memcpy(plan->node_allocs, galloc->node_allocs, graph->n_nodes * sizeof(struct node_alloc));
+    memcpy(plan->leaf_allocs, galloc->leaf_allocs, graph->n_leafs * sizeof(struct leaf_alloc));
+    for (int i = 0; i < graph->n_nodes; i++) {
+        plan->ops[i] = graph->nodes[i]->op;
+    }
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+            plan->chunk_sizes[i*GGML_VBUFFER_MAX_CHUNKS + c] = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
+        }
+    }
+}
+
+static bool ggml_gallocr_tensor_fits(const struct tensor_alloc * t, const struct tensor_alloc * slot) {
+    return t->buffer_id == slot->buffer_id && t->size_max <= slot->size_max;
+}
+
+// the graph has the same ops, each tensor of the new plan fits its saved slot, and the saved plan fits the current buffers
+static bool ggml_gallocr_plan_fits(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    const struct gallocr_plan * plan = &galloc->sized_plan;
+    if (plan->node_allocs == NULL || plan->n_nodes != graph->n_nodes || plan->n_leafs != graph->n_leafs) {
+        return false;
+    }
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->buffers[i] == NULL) {
+            return false;
+        }
+        for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS; c++) {
+            if (plan->chunk_sizes[i*GGML_VBUFFER_MAX_CHUNKS + c] > ggml_vbuffer_chunk_size(galloc->buffers[i], c)) {
+                return false;
+            }
+        }
+    }
+    for (int i = 0; i < graph->n_nodes; i++) {
+        if (graph->nodes[i]->op != plan->ops[i] || !ggml_gallocr_tensor_fits(&galloc->node_allocs[i].dst, &plan->node_allocs[i].dst)) {
+            return false;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (!ggml_gallocr_tensor_fits(&galloc->node_allocs[i].src[j], &plan->node_allocs[i].src[j])) {
+                return false;
+            }
+        }
+    }
+    for (int i = 0; i < graph->n_leafs; i++) {
+        if (!ggml_gallocr_tensor_fits(&galloc->leaf_allocs[i].leaf, &plan->leaf_allocs[i].leaf)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
@@ -898,7 +981,24 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
+    // a new plan of the same graph can need more memory than the plan that sized the buffers (fragmentation): reuse that plan instead of growing the buffers
+    if (!no_alloc) {
+        bool grow = false;
+        for (int i = 0; i < galloc->n_buffers && !grow; i++) {
+            grow = galloc->buffers[i] == NULL;
+            for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks && !grow; c++) {
+                grow = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c) > (galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0);
+            }
+        }
+        if (grow && ggml_gallocr_plan_fits(galloc, graph)) {
+            memcpy(galloc->node_allocs, galloc->sized_plan.node_allocs, graph->n_nodes * sizeof(struct node_alloc));
+            memcpy(galloc->leaf_allocs, galloc->sized_plan.leaf_allocs, graph->n_leafs * sizeof(struct leaf_alloc));
+            return true;
+        }
+    }
+
     // reallocate buffers if needed
+    bool resized = false;
     for (int i = 0; i < galloc->n_buffers; i++) {
         // if the buffer type is used multiple times, we reuse the same buffer
         for (int j = 0; j < i; j++) {
@@ -938,8 +1038,13 @@ static bool ggml_gallocr_reserve_n_impl(
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;
                 }
+                resized = true;
             }
         }
+    }
+
+    if (resized) {
+        ggml_gallocr_plan_save(galloc, graph);
     }
 
     return true;
