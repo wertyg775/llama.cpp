@@ -736,7 +736,8 @@ struct llama_moe_cache::impl {
         }
         const binding & b = it->second;
         const group & g = groups[layers[b.il].ig];
-        if (backend != devices[g.id].backend) {
+        // the backend of the split, or the upload backend of the same device (upload ahead)
+        if (ggml_backend_get_device(backend) != ggml_backend_get_device(devices[g.id].backend)) {
             return 0;
         }
 
@@ -774,6 +775,7 @@ struct llama_moe_cache::impl {
         layer & l = layers[il];
         group & g = groups[l.ig];
 
+        GGML_ASSERT(graph != nullptr && "the slot maps cannot be uploaded ahead");
         GGML_ASSERT(backend == devices[g.id].backend);
 
         // the get_rows that looks up the slots of the selected experts

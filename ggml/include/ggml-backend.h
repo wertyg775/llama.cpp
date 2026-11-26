@@ -339,6 +339,7 @@ extern "C" {
     // `src` is the tensor in the previous split
     // `dst` is the copy of `src` in the split
     // `graph` is the compute graph of the split
+    // with upload ahead, `graph` is NULL and `backend` is the upload backend: the copy runs before the split, so the whole weight is needed
     typedef bool (*ggml_backend_sched_copy_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
 
     // Callback when the buffers reserved for a graph are not sufficient and have to be reserved again

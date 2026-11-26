@@ -807,13 +807,9 @@ void llama_context::sched_new(const sched_params & params) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 
     // GGML_SCHED_UPLOAD_AHEAD: 1 = smallest ring buffer, > 1 = ring buffer size in MiB
-    // not with the MoE cache: its slot maps are host weights that only the copy callback can copy
+    // with the MoE cache, the copy callback copies the cached experts from the cache (see sched_copy_experts)
     if (const char * env = getenv("GGML_SCHED_UPLOAD_AHEAD"); env != nullptr && atoi(env) > 0) {
-        if (cparams.moe_cache_size > 0) {
-            LLAMA_LOG_WARN("%s: GGML_SCHED_UPLOAD_AHEAD is ignored with the MoE cache\n", __func__);
-        } else {
-            ggml_backend_sched_set_upload_ahead(sched.get(), true, (size_t) atoi(env) << 20);
-        }
+        ggml_backend_sched_set_upload_ahead(sched.get(), true, (size_t) atoi(env) << 20);
     }
 
     sched_params_cur = params;
@@ -3169,6 +3165,32 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     // the slot maps of the MoE cache
     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
+        return true;
+    }
+
+    // upload ahead: the ids are not computed yet, so all experts are copied, the cached ones from the MoE cache
+    if (graph == nullptr) {
+        if (!lctx->moe_cache) {
+            return false;
+        }
+        const int64_t n_expert    = src->ne[2];
+        const size_t  expert_size = src->nb[2];
+        int64_t next = 0;
+        for (int64_t e = 0; e < n_expert; ) {
+            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, n_expert - 1);
+            if (n == 0) {
+                e++;
+                continue;
+            }
+            if (next < e) {
+                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+            }
+            e   += n;
+            next = e;
+        }
+        if (next < n_expert) {
+            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, ggml_nbytes(src) - next*expert_size);
+        }
         return true;
     }
 

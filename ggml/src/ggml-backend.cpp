@@ -2486,7 +2486,10 @@ static void ggml_backend_sched_issue_uploads(ggml_backend_sched_t sched, int max
         if (up->wait >= 0) {
             ggml_backend_event_wait(sched->upload_backend, sched->uploads[up->wait].done);
         }
-        ggml_backend_tensor_set_async(sched->upload_backend, up->dst, up->src->data, 0, ggml_nbytes(up->src));
+        if (sched->callback_copy == NULL ||
+            !sched->callback_copy(sched->upload_backend, up->src, up->dst, NULL, sched->callback_copy_user_data)) {
+            ggml_backend_tensor_set_async(sched->upload_backend, up->dst, up->src->data, 0, ggml_nbytes(up->src));
+        }
         ggml_backend_event_record(up->ready, sched->upload_backend);
     }
 }
