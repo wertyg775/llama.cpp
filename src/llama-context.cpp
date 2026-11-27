@@ -3191,6 +3191,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         if (next < n_expert) {
             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, ggml_nbytes(src) - next*expert_size);
         }
+        lctx->moe_cache->warm_experts(backend, src, dst);
         return true;
     }
 
@@ -3265,6 +3266,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
 
         first = last + 1;
+    }
+
+    if (lctx->moe_cache) {
+        lctx->moe_cache->warm_experts(backend, src, dst, &st.used);
     }
 
     return true;

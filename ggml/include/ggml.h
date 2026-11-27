@@ -2557,7 +2557,9 @@ extern "C" {
     //   x = concat(past, cur) per sequence and channel
     //   y[c, t] = sum_k x[t + k]*weight[k, c] + sum_lag dynamic[lag, h, t]*x[t + K - 1 - lag]
     //   residual: [C, T] f32 or NULL, added after the scale
-    //   result:  1D, [C, T] of residual + (y + cur)*scale, then the new state [K - 1, C, n_seqs] = the last K - 1 x
+    //   n_slots: number of trailing rollback states to output (1 <= n_slots <= T/n_seqs)
+    //   result:  1D, [C, T] of residual + (y + cur)*scale, then n_slots states [K - 1, C, n_seqs, n_slots]
+    //            where slot r stores the last K - 1 inputs after T/n_seqs - r tokens
     //
     GGML_API struct ggml_tensor * ggml_inkling2_conv(
             struct ggml_context * ctx,
@@ -2568,7 +2570,8 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * ids,
             int64_t               offset,
-            float                 scale);
+            float                 scale,
+            int64_t               n_slots);
 
     enum ggml_inkling2_head_post {
         GGML_INKLING2_HEAD_POST_NONE,

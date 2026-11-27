@@ -36,13 +36,24 @@ struct moe_cache_lru {
     std::vector<int32_t *> slot_map;
     std::vector<int32_t>   key_of;   // [n_slots] key of the expert in the slot, -1 if empty
 
+    enum slot_state : uint8_t {
+        SLOT_EMPTY   = 0,
+        SLOT_WARMING = 1, // reserved during a large batch until all expert tensors of the layer are copied
+        SLOT_WARMED  = 2, // filled by a large batch, not yet hit by a small batch
+        SLOT_FILLED  = 3, // filled or hit by a small batch
+    };
+
     // one LRU list per class, the head is the least recently used end
     std::vector<int32_t> prev;    // [n_slots] -1 at the ends
     std::vector<int32_t> next;    // [n_slots]
     int32_t head[n_class];
     int32_t tail[n_class];
     std::vector<int8_t>  list_of; // [n_slots] class list of the slot
-    int32_t n_filled = 0;         // slots that hold an expert
+    std::vector<uint8_t> state;   // [n_slots] slot_state
+    int32_t n_filled  = 0;        // slots filled or hit by small batches
+    int32_t n_warmed  = 0;        // slots warmed by large batches, evicted before small-batch slots
+    int32_t n_warming = 0;        // slots currently reserved during a large batch
+    int32_t warm_cur  = 0;
 
     std::vector<float>   crf;      // [n_layer*n_expert]
     std::vector<int64_t> last_use; // [n_layer*n_expert] layer clock at the last use, -1 if not used
@@ -74,10 +85,51 @@ struct moe_cache_lru {
         head[0] = 0;
         tail[0] = n_slots - 1;
         list_of.assign(n_slots, 0);
+        state.assign(n_slots, SLOT_EMPTY);
+        n_filled  = 0;
+        n_warmed  = 0;
+        n_warming = 0;
+        warm_cur  = 0;
         crf.assign((size_t) n_layer*n_expert, 0.0f);
         last_use.assign((size_t) n_layer*n_expert, -1);
         clock.assign(n_layer, 0);
         seen.assign(n_expert, 0);
+    }
+
+    int32_t n_empty() const {
+        return n_slots - n_filled - n_warmed - n_warming;
+    }
+
+    int32_t reserve_empty() {
+        if (n_empty() == 0) {
+            return -1;
+        }
+        for (int32_t i = 0; i < n_slots; ++i) {
+            const int32_t s = (warm_cur + i) % n_slots;
+            if (state[s] == SLOT_EMPTY) {
+                state[s] = SLOT_WARMING;
+                n_warming++;
+                warm_cur = (s + 1) % n_slots;
+                return s;
+            }
+        }
+        return -1;
+    }
+
+    void release_warming(int32_t s) {
+        GGML_ASSERT(state[s] == SLOT_WARMING);
+        state[s] = SLOT_EMPTY;
+        n_warming--;
+    }
+
+    void commit_warm(int32_t il, int32_t e, int32_t s) {
+        GGML_ASSERT(state[s] == SLOT_WARMING);
+        GGML_ASSERT(slot_map[il][e] >= n_slots);
+        state[s]        = SLOT_WARMED;
+        key_of[s]       = make_key(il, e);
+        slot_map[il][e] = s;
+        n_warming--;
+        n_warmed++;
     }
 
     // move slot s to the most recently used end of list c
@@ -151,6 +203,20 @@ struct moe_cache_lru {
     }
 
     int32_t victim(int32_t il) const {
+        if (n_empty() > 0) {
+            for (int32_t s = head[0]; s >= 0; s = next[s]) {
+                if (state[s] == SLOT_EMPTY) {
+                    return s;
+                }
+            }
+        }
+        if (n_warmed > 0) {
+            for (int32_t s = head[0]; s >= 0; s = next[s]) {
+                if (state[s] == SLOT_WARMED && !is_selected(il, key_of[s])) {
+                    return s;
+                }
+            }
+        }
         int32_t res = -1;
         double res_score = -1.0;
         for (int c = 0; c < n_class; ++c) {
@@ -187,6 +253,7 @@ struct moe_cache_lru {
     template <typename F>
     bool plan(int32_t il, const int32_t * ids, size_t n_ids, int64_t n_tokens, int32_t n_used, int32_t n_zero, F && n_cpu,
             std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit) {
+        GGML_ASSERT(n_warming == 0);
         fills.clear();
         cpu.clear();
         n_hit = 0;
@@ -215,7 +282,13 @@ struct moe_cache_lru {
             const int32_t key = make_key(il, e);
             use(il, key);
             if (slots[e] < n_slots) {
-                move(slots[e], class_of(key));
+                const int32_t s = slots[e];
+                if (state[s] == SLOT_WARMED) {
+                    state[s] = SLOT_FILLED;
+                    n_warmed--;
+                    n_filled++;
+                }
+                move(s, class_of(key));
                 n_hit++;
             } else {
                 misses.push_back(e);
@@ -271,11 +344,16 @@ struct moe_cache_lru {
         std::sort(misses.begin(), misses.end());
         for (int32_t e : misses) {
             const int32_t s = victim(il);
-            if (key_of[s] >= 0) {
-                slot_map[key_layer(key_of[s])][key_expert(key_of[s])] = empty;
-            } else {
+            if (state[s] == SLOT_EMPTY) {
                 n_filled++;
+            } else {
+                slot_map[key_layer(key_of[s])][key_expert(key_of[s])] = empty;
+                if (state[s] == SLOT_WARMED) {
+                    n_warmed--;
+                    n_filled++;
+                }
             }
+            state[s] = SLOT_FILLED;
             const int32_t key = make_key(il, e);
             key_of[s] = key;
             slots[e]  = s;
@@ -351,6 +429,8 @@ struct llama_moe_cache::impl {
         std::vector<int32_t> cpu_experts;   // experts set in cpu_map
         uint32_t cpu_acc = 0;               // fraction of a miss carried over to the next plan, in 1/65536
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
+        std::vector<moe_cache_lru::fill> warm_fills;
+        uint32_t warm_mask = 0;
     };
 
     struct binding {
@@ -373,6 +453,7 @@ struct llama_moe_cache::impl {
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
     stats stats_copy;  // experts copied from the cache for large batches
+    stats stats_warm;  // experts warmed into empty slots during large batches
 
     std::vector<device> devices;
     std::vector<group> groups;
@@ -765,6 +846,122 @@ struct llama_moe_cache::impl {
         return n;
     }
 
+    void cancel_layer_warming(layer & l, group & g) {
+        for (const auto & f : l.warm_fills) {
+            g.lru.release_warming(f.slot);
+        }
+        l.warm_fills.clear();
+        l.warm_mask = 0;
+    }
+
+    void cancel_warming(group & g) {
+        if (g.lru.n_warming == 0) {
+            return;
+        }
+        for (int32_t il : g.layers) {
+            if (!layers[il].warm_fills.empty()) {
+                cancel_layer_warming(layers[il], g);
+            }
+        }
+    }
+
+    void warm_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, const std::vector<bool> * used) {
+        const auto it = bindings.find(w);
+        if (it == bindings.end()) {
+            return;
+        }
+        const binding & b = it->second;
+        layer & l = layers[b.il];
+        group & g = groups[l.ig];
+        if (ggml_backend_get_device(backend) != ggml_backend_get_device(devices[g.id].backend)) {
+            return;
+        }
+        if (l.warm_fills.empty() && g.lru.n_empty() == 0) {
+            return;
+        }
+        GGML_ASSERT(l.experts.size() <= 32);
+
+        if (l.warm_mask & (1u << b.ip)) {
+            cancel_layer_warming(l, g);
+        }
+
+        if (l.warm_mask == 0) {
+            const int32_t rem_slots = g.lru.n_empty();
+            if (rem_slots == 0) {
+                return;
+            }
+            // split the remaining empty slots evenly across this layer and the later layers of the group
+            int32_t rem_layers = 0;
+            bool seen_self = false;
+            for (int32_t il2 : g.layers) {
+                if (il2 == b.il) {
+                    seen_self = true;
+                }
+                if (seen_self) {
+                    rem_layers++;
+                }
+            }
+            const int32_t want = std::max<int32_t>(1, (rem_slots + rem_layers - 1)/rem_layers);
+            const int32_t * slots = g.lru.slot_map[b.il];
+            const int32_t n_expert = (int32_t) w->ne[2];
+            for (int32_t e = 0; e < n_expert && (int32_t) l.warm_fills.size() < want; ++e) {
+                if (slots[e] < g.n_slots) {
+                    continue;
+                }
+                if (used != nullptr && !(*used)[e]) {
+                    continue;
+                }
+                const int32_t s = g.lru.reserve_empty();
+                if (s < 0) {
+                    break;
+                }
+                l.warm_fills.push_back({ e, s });
+            }
+        }
+
+        if (l.warm_fills.empty()) {
+            return;
+        }
+        if (used != nullptr) {
+            for (const auto & f : l.warm_fills) {
+                if (!(*used)[f.expert]) {
+                    cancel_layer_warming(l, g);
+                    return;
+                }
+            }
+        }
+
+        ggml_tensor * bank = g.banks[b.ip];
+        GGML_ASSERT(dst->nb[2] == bank->nb[2]);
+        for (size_t i = 0; i < l.warm_fills.size(); ) {
+            size_t n = 1;
+            while (i + n < l.warm_fills.size() &&
+                   l.warm_fills[i + n].expert == l.warm_fills[i].expert + (int32_t) n &&
+                   l.warm_fills[i + n].slot   == l.warm_fills[i].slot   + (int32_t) n) {
+                n++;
+            }
+            ggml_reset(ctx_views.get());
+            ggml_tensor * src_view = ggml_view_3d(ctx_views.get(), dst,  dst->ne[0],  dst->ne[1],  n, dst->nb[1],  dst->nb[2],  l.warm_fills[i].expert*dst->nb[2]);
+            ggml_tensor * dst_view = ggml_view_3d(ctx_views.get(), bank, bank->ne[0], bank->ne[1], n, bank->nb[1], bank->nb[2], l.warm_fills[i].slot*bank->nb[2]);
+            ggml_backend_view_init(src_view);
+            ggml_backend_view_init(dst_view);
+            ggml_backend_tensor_copy_async(backend, backend, src_view, dst_view);
+            stats_warm.bytes += ggml_nbytes(src_view);
+            i += n;
+        }
+
+        l.warm_mask |= (1u << b.ip);
+        const uint32_t full_mask = l.experts.size() == 32 ? ~0u : ((1u << l.experts.size()) - 1u);
+        if (l.warm_mask == full_mask) {
+            for (const auto & f : l.warm_fills) {
+                g.lru.commit_warm(b.il, f.expert, f.slot);
+            }
+            stats_warm.hits += l.warm_fills.size();
+            l.warm_fills.clear();
+            l.warm_mask = 0;
+        }
+    }
+
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
@@ -777,6 +974,7 @@ struct llama_moe_cache::impl {
 
         GGML_ASSERT(graph != nullptr && "the slot maps cannot be uploaded ahead");
         GGML_ASSERT(backend == devices[g.id].backend);
+        cancel_warming(g);
 
         // the get_rows that looks up the slots of the selected experts
         const int n_nodes = ggml_graph_n_nodes(graph);
@@ -877,6 +1075,9 @@ struct llama_moe_cache::impl {
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
+        if (stats_warm.hits > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts warmed into empty slots, %.2f MiB\n", stats_warm.hits, stats_warm.bytes/1024.0/1024.0);
+        }
     }
 };
 
@@ -970,6 +1171,10 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
     return pimpl->copy_experts(backend, w, dst, e, last);
+}
+
+void llama_moe_cache::warm_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, const std::vector<bool> * used) {
+    pimpl->warm_experts(backend, w, dst, used);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {

@@ -1502,6 +1502,7 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
+    const ggml_tensor * situ = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;

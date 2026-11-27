@@ -247,6 +247,10 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     res &= has_rows == (h_rows != nullptr);
     res &= !has_rows || h_rows->ne[0] == params.ubatch.n_tokens;
 
+    if (dspark_greedy >= 0) {
+        res &= (dspark_greedy == 1) == llama_dspark_is_greedy_batch(params.ubatch, n_embd_state);
+    }
+
     return res;
 }
 
@@ -4630,9 +4634,6 @@ ggml_tensor * llm_graph_context::build_attn_inkling2_fused(
     }
 
     if (k_rot) {
-        if (prefill) {
-            q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
-        }
         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
     }
     if (v_rot) {
@@ -4649,14 +4650,9 @@ ggml_tensor * llm_graph_context::build_attn_inkling2_fused(
     ggml_tensor * cur;
     if (prefill) {
         ggml_tensor * cpos = is_swa ? inp->self_cell_pos_swa : inp->self_cell_pos;
-        cur = ggml_inkling2_attn(ctx0, q_cur, k, v, table, r, sinks, cpos, inp->self_q_pos, nullptr, false, kq_scale, 0, 0);
+        cur = ggml_inkling2_attn(ctx0, q_cur, k, v, table, r, sinks, cpos, inp->self_q_pos, gate, false, kq_scale, n_rot_q, n_rot_v);
         if (is_swa) {
             ggml_inkling2_attn_set_n_swa(cur, (int32_t) hparams.n_swa);
-        }
-        if (v_rot) {
-            cur = ggml_reshape_3d(ctx0, cur, q_cur->ne[0], q_cur->ne[1], n_tokens);
-            cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
-            cur = ggml_reshape_2d(ctx0, cur, q_cur->ne[0]*q_cur->ne[1], n_tokens);
         }
     } else {
         cur = ggml_inkling2_attn(ctx0, q_cur, k, v, table, r, sinks, rel_pos, attn_mask.raw, gate, v_trans, kq_scale, n_rot_q, n_rot_v);

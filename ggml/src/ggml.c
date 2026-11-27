@@ -6705,7 +6705,8 @@ struct ggml_tensor * ggml_inkling2_conv(
         struct ggml_tensor  * residual,
         struct ggml_tensor  * ids,
         int64_t               offset,
-        float                 scale) {
+        float                 scale,
+        int64_t               n_slots) {
     GGML_ASSERT(cur->type == GGML_TYPE_F32 && past->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32);
     GGML_ASSERT(cur->nb[0] == sizeof(float) && past->nb[0] == sizeof(float) && ggml_is_contiguous(weight));
 
@@ -6716,6 +6717,7 @@ struct ggml_tensor * ggml_inkling2_conv(
 
     GGML_ASSERT(K >= 2 && weight->ne[1] == C && ggml_nrows(weight) == C);
     GGML_ASSERT(ggml_nrows(cur) == T && T % n_seqs == 0);
+    GGML_ASSERT(n_slots >= 1 && n_slots <= T/n_seqs);
     if (ids) {
         GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids) && ggml_nrows(ids) == 1);
         GGML_ASSERT(ggml_nrows(past) == past->ne[1] && offset >= 0 && (offset + C)*(K - 1) <= past->ne[0]);
@@ -6732,10 +6734,11 @@ struct ggml_tensor * ggml_inkling2_conv(
         GGML_ASSERT(residual->type == GGML_TYPE_F32 && ggml_are_same_shape(residual, cur) && residual->nb[0] == sizeof(float));
     }
 
-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C*T + (K - 1)*C*n_seqs);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C*T + (K - 1)*C*n_seqs*n_slots);
 
     ggml_set_op_params_f32(result, 0, scale);
     ggml_set_op_params_i32(result, 1, (int32_t) offset);
+    ggml_set_op_params_i32(result, 5, (int32_t) n_slots);
 
     result->op     = GGML_OP_INKLING2_CONV;
     result->src[0] = cur;
@@ -6931,7 +6934,7 @@ struct ggml_tensor * ggml_inkling2_attn(
     if (compact) {
         GGML_ASSERT(rel_pos->type == GGML_TYPE_I32 && rel_pos->ne[0] == n_kv + 1 && ggml_nelements(rel_pos) == n_kv + 1);
         GGML_ASSERT(mask->ne[0] == T && ggml_nelements(mask) == T);
-        GGML_ASSERT(!gate || (gate->type == GGML_TYPE_F32 && ggml_nelements(gate) == d*n_head*T && ggml_is_contiguous(gate)));
+        GGML_ASSERT(!gate || (gate->type == GGML_TYPE_F32 && gate->nb[0] == sizeof(float) && gate->ne[0] == d*n_head && gate->ne[1] == T && gate->ne[2] == 1 && gate->ne[3] == 1));
     } else {
         GGML_ASSERT(rel_pos->type == GGML_TYPE_I32 && rel_pos->ne[0] == n_kv && ggml_nelements(rel_pos) == n_kv);
         GGML_ASSERT((mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16) && mask->ne[0] == n_kv && ggml_nrows(mask) == 1);

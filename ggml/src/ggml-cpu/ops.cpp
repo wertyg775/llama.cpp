@@ -11864,8 +11864,9 @@ static void ggml_compute_forward_inkling2_conv_f32(
     const ggml_tensor * residual = dst->src[4];
     const ggml_tensor * ids      = dst->src[5];
 
-    const float   scale  = ggml_get_op_params_f32(dst, 0);
-    const int64_t offset = ggml_get_op_params_i32(dst, 1);
+    const float   scale   = ggml_get_op_params_f32(dst, 0);
+    const int64_t offset  = ggml_get_op_params_i32(dst, 1);
+    const int64_t n_slots = ggml_get_op_params_i32(dst, 5) > 0 ? ggml_get_op_params_i32(dst, 5) : 1;
 
     const int64_t C      = cur->ne[0];
     const int64_t T      = cur->ne[1];
@@ -11916,8 +11917,10 @@ static void ggml_compute_forward_inkling2_conv_f32(
             y[t*C + c] = residual ? *(const float *) ((const char *) residual->data + c*sizeof(float) + t*residual->nb[1]) + out : out;
         }
 
-        for (int64_t k = 0; k < K - 1; ++k) {
-            s[(q*C + c)*(K - 1) + k] = x(c, q, n_st + k);
+        for (int64_t r = 0; r < n_slots; ++r) {
+            for (int64_t k = 0; k < K - 1; ++k) {
+                s[((r*n_seqs + q)*C + c)*(K - 1) + k] = x(c, q, n_st - r + k);
+            }
         }
     }
 

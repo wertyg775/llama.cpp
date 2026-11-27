@@ -4993,9 +4993,10 @@ struct test_inkling2_conv : public test_case {
     const bool    cells;   // read the past from cache cells by id
     const bool    store;   // copy the new state into a cache, as the model does (a backend can fuse the copy)
     const int     post;    // ggml_inkling2_head_post, heads of 64 channels
+    const int64_t n_slots; // trailing rollback state snapshots
 
     std::string vars() override {
-        return VARS_TO_STR8(C, K, n_seqs, n_seq_tokens, n_heads, residual, cells, store) + "," + VAR_TO_STR(post);
+        return VARS_TO_STR8(C, K, n_seqs, n_seq_tokens, n_heads, residual, cells, store) + "," + VAR_TO_STR(post) + "," + VAR_TO_STR(n_slots);
     }
 
     bool run_whole_graph() override { return store; }
@@ -5006,8 +5007,8 @@ struct test_inkling2_conv : public test_case {
     }
 
     test_inkling2_conv(int64_t C = 64, int64_t K = 4, int64_t n_seqs = 1, int64_t n_seq_tokens = 1, int64_t n_heads = 0, bool residual = false,
-            bool cells = false, bool store = false, int post = 0)
-        : C(C), K(K), n_seqs(n_seqs), n_seq_tokens(n_seq_tokens), n_heads(n_heads), residual(residual), cells(cells), store(store), post(post) {}
+            bool cells = false, bool store = false, int post = 0, int64_t n_slots = 1)
+        : C(C), K(K), n_seqs(n_seqs), n_seq_tokens(n_seq_tokens), n_heads(n_heads), residual(residual), cells(cells), store(store), post(post), n_slots(n_slots) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t T = n_seqs*n_seq_tokens;
@@ -5044,17 +5045,20 @@ struct test_inkling2_conv : public test_case {
             ggml_set_name(res, "residual");
         }
 
-        ggml_tensor * out = ggml_inkling2_conv(ctx, cur, past, weight, dynamic, res, ids, cells ? 5 : 0, 1.0f/sqrtf(2*K + 1));
+        ggml_tensor * out = ggml_inkling2_conv(ctx, cur, past, weight, dynamic, res, ids, cells ? 5 : 0, 1.0f/sqrtf(2*K + 1), n_slots);
         if (post) {
             // a small clip threshold, so that some heads are clipped and some are not
             ggml_inkling2_conv_set_head_post(out, (ggml_inkling2_head_post) post, 64, post == GGML_INKLING2_HEAD_POST_CLIP ? 4.0f : 1e-6f);
         }
 
         if (store) {
-            ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (K - 1)*(C + 9), n_seqs + 2);
+            const int64_t mem_size = n_seqs + 2;
+            ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (K - 1)*(C + 9), mem_size*n_slots);
             ggml_set_name(cache, "cache");
-            ggml_tensor * state = ggml_view_2d(ctx, out, (K - 1)*C, n_seqs, (K - 1)*C*sizeof(float), C*T*sizeof(float));
-            ggml_tensor * cell  = ggml_view_2d(ctx, cache, (K - 1)*C, n_seqs, cache->nb[1], 2*(K - 1)*sizeof(float) + cache->nb[1]);
+            ggml_tensor * state = ggml_view_3d(ctx, out, (K - 1)*C, n_seqs, n_slots,
+                    (K - 1)*C*sizeof(float), (K - 1)*C*n_seqs*sizeof(float), C*T*sizeof(float));
+            ggml_tensor * cell  = ggml_view_3d(ctx, cache, (K - 1)*C, n_seqs, n_slots,
+                    cache->nb[1], (size_t) mem_size*cache->nb[1], 2*(K - 1)*sizeof(float) + cache->nb[1]);
             out = ggml_scale(ctx, ggml_cpy(ctx, state, cell), 1.0f);
         }
 
@@ -5231,6 +5235,74 @@ struct test_inkling2_situ : public test_case {
     }
 };
 
+// Fused GGML_OP_INKLING2_SITU + GGML_OP_MUL_MAT_ID (+ optional per-expert NVFP4 scale)
+struct test_inkling2_situ_mul_mat_id : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool with_scale;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, n_mats, n_used, m, n, k, with_scale);
+    }
+
+    std::string op_desc(ggml_tensor *) override {
+        return "INKLING2_SITU_MUL_MAT_ID";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_inkling2_situ_mul_mat_id(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k, bool with_scale)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), with_scale(with_scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gu   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*k, n_used, n);
+        ggml_tensor * gate = ggml_view_3d(ctx, gu, k, n_used, n, gu->nb[1], gu->nb[2], 0);
+        ggml_tensor * up   = ggml_view_3d(ctx, gu, k, n_used, n, gu->nb[1], gu->nb[2], k*gu->nb[0]);
+        ggml_tensor * act  = ggml_inkling2_situ(ctx, gate, up, 4.0f, 25.0f);
+
+        ggml_tensor * as  = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, act, ids);
+
+        if (with_scale) {
+            ggml_tensor * w_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_mats);
+            ggml_tensor * s   = ggml_reshape_3d(ctx, w_s, 1, n_mats, 1);
+            s   = ggml_repeat_4d(ctx, s, 1, n_mats, n, 1);
+            s   = ggml_get_rows(ctx, s, ids);
+            out = ggml_mul(ctx, out, s);
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(4321);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> pool(n_mats);
+                std::iota(pool.begin(), pool.end(), 0);
+                std::shuffle(pool.begin(), pool.end(), rng);
+                const int hot = std::min(n_mats, std::max(n_used, 2*n_used));
+                for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                    std::vector<int32_t> row(pool.begin(), pool.begin() + hot);
+                    std::shuffle(row.begin(), row.end(), rng);
+                    ggml_backend_tensor_set(t, row.data(), r*t->nb[1], t->ne[0]*sizeof(int32_t));
+                }
+            } else {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            }
+        }
+    }
+};
+
 // GGML_OP_INKLING2_PROJ
 struct test_inkling2_proj : public test_case {
     const ggml_type            type;
@@ -5386,9 +5458,12 @@ struct test_inkling2_attn_compact : public test_case {
     const int32_t   n_swa;
     const int64_t   n_extent;
     const bool      holes; // every 11th cell empty (cell_pos -1); a model cache filled by one sequence has none
+    const int32_t   n_rot_q;
+    const int32_t   n_rot_v;
 
     std::string vars() override {
-        return VARS_TO_STR11(type, d, n_head, n_head_kv, n_kv, n_tokens, n_active, with_gate, n_swa, n_extent, holes);
+        return VARS_TO_STR11(type, d, n_head, n_head_kv, n_kv, n_tokens, n_active, with_gate, n_swa, n_extent, holes)
+            + "," + VARS_TO_STR2(n_rot_q, n_rot_v);
     }
 
     double max_nmse_err() override {
@@ -5396,9 +5471,11 @@ struct test_inkling2_attn_compact : public test_case {
     }
 
     test_inkling2_attn_compact(ggml_type type, int64_t d, int64_t n_head, int64_t n_head_kv, int64_t n_kv,
-            int64_t n_tokens, int64_t n_active, bool with_gate, int32_t n_swa = 0, int64_t n_extent = 100, bool holes = true)
+            int64_t n_tokens, int64_t n_active, bool with_gate, int32_t n_swa = 0, int64_t n_extent = 100, bool holes = true,
+            int32_t n_rot_q = 0, int32_t n_rot_v = 0)
         : type(type), d(d), n_head(n_head), n_head_kv(n_head_kv), n_kv(n_kv), n_tokens(n_tokens),
-          n_active(n_active), with_gate(with_gate), n_swa(n_swa), n_extent(n_extent), holes(holes) {}
+          n_active(n_active), with_gate(with_gate), n_swa(n_swa), n_extent(n_extent), holes(holes),
+          n_rot_q(n_rot_q), n_rot_v(n_rot_v) {}
 
     static constexpr int64_t n_rel = 16;
 
@@ -5430,7 +5507,7 @@ struct test_inkling2_attn_compact : public test_case {
             ggml_set_name(gate, "gate");
         }
 
-        ggml_tensor * out = ggml_inkling2_attn(ctx, q, k, v, table, r, sinks, cell_pos, q_pos, gate, false, 1.0f/sqrtf(d), 0, 0);
+        ggml_tensor * out = ggml_inkling2_attn(ctx, q, k, v, table, r, sinks, cell_pos, q_pos, gate, false, 1.0f/sqrtf(d), n_rot_q, n_rot_v);
         if (n_swa > 0) {
             ggml_inkling2_attn_set_n_swa(out, n_swa);
         }
@@ -6705,6 +6782,69 @@ struct test_mul_mat_id_dup : public test_mul_mat_id {
                 init_tensor_uniform(t);
             }
         }
+    }
+};
+
+// MUL_MAT_ID with realistic cross-token expert overlap (~19 unique of 32 for 4 tokens x top-8)
+struct test_mul_mat_id_overlap : public test_mul_mat_id {
+    mutable uint32_t iter_seed = 777;
+    using test_mul_mat_id::test_mul_mat_id;
+    std::string vars() override { return test_mul_mat_id::vars() + ",overlap=1"; }
+
+    void fill_overlap_ids(ggml_context * ctx) const {
+        std::default_random_engine rng(iter_seed++);
+        std::vector<int32_t> pool(n_mats);
+        std::iota(pool.begin(), pool.end(), 0);
+        std::shuffle(pool.begin(), pool.end(), rng);
+
+        // 4 tokens x top-8 pattern with 19 unique experts (1x4, 2x3, 6x2, 10x1 = 32)
+        static const int pat4x8[4][8] = {
+            { 0, 1, 2, 3, 4, 5, 6, 7 },
+            { 0, 1, 2, 3, 8, 9, 10, 11 },
+            { 0, 1, 4, 8, 12, 13, 14, 15 },
+            { 0, 2, 5, 9, 12, 16, 17, 18 },
+        };
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            const int off = ids_offset ? 1 : 0;
+            for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                std::vector<int32_t> data(t->ne[0], 0);
+                if (n_used == 8 && n == 4 && n_mats >= 19) {
+                    int idx[8];
+                    for (int i = 0; i < 8; ++i) {
+                        idx[i] = pool[pat4x8[r][i]];
+                    }
+                    std::shuffle(idx, idx + 8, rng);
+                    for (int i = 0; i < 8; ++i) {
+                        data[off + i] = idx[i];
+                    }
+                } else {
+                    const int hot = std::min(n_mats, std::max(n_used, (n_used * (int) n * 6 + 9) / 10));
+                    std::vector<int32_t> row(pool.begin(), pool.begin() + hot);
+                    std::shuffle(row.begin(), row.end(), rng);
+                    for (int i = 0; i < n_used; ++i) {
+                        data[off + i] = row[i];
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+            }
+        }
+        fill_overlap_ids(ctx);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        fill_overlap_ids(ctx);
     }
 };
 
@@ -11519,6 +11659,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_F16,  128, 24, 8, 1536, 35,  1000, false, 256));
     // long enough for the KV-split path of the GQA prefill kernel
     test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 8192, 65,  7000, true,  0, 1025));
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 512,   4,   300, true,  0, 100, true, 128, 64)); // verify FWHT + gate
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 8192,  4,  7000, true,  0, 1025, true, 128, 64)); // split combine FWHT + gate
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_F16,  128, 24, 8, 512,   4,   300, true,  0, 100, true, 128, 64));
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 16, 4, 512,   4,   300, true,  0, 100, true, 128, 64)); // prefill_tile FWHT + gate
+    // small-T (T=1..4) split-KV decode attention: SWA, global, 0-active, no-gate, Q8_0 and F16
+    for (int64_t nt : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 3072, nt, 3072, true,  1024, 1024, false, 128, 64));
+        test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 3072, nt,  300, true,  1024, 1024, true,  128, 64));
+        test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 2048, nt, 1500, false,    0, 1025, true,  128, 64));
+        test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_F16,  128, 24, 8, 3072, nt, 1500, true,  1024, 1024, true,  128, 64));
+    }
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 256,  4,    0, true,  1024, 1024, false, 128, 64));
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 64,   4,   32, true,     0,  100, true,  128, 64)); // n_split == 1 direct store
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_F16,  128, 24, 8, 64,   3,   32, false,    0,  100, true,    0,  0));
     test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_F16,  128, 24, 8, 6144, 40,  6144, false, 0, 100));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, 256, true,  GGML_TYPE_F16, 512, 128, 128));
     test_cases.emplace_back(new test_inkling2_attn(GGML_TYPE_F16,  128, 24, 4, 4096, true,  GGML_TYPE_F16, 4096));
@@ -11533,6 +11687,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool norm : {true, false}) {
             test_cases.emplace_back(new test_inkling2_proj(type, 64, {32, 5}, 1, norm));
             test_cases.emplace_back(new test_inkling2_proj(type, 2304, {3072, 384, 24, 3072, 512, 512}, 1, norm)); // Inkling 2 Mini SWA
+            test_cases.emplace_back(new test_inkling2_proj(type, 2304, {3072, 384, 24, 3072, 512, 512}, 4, norm)); // Inkling 2 Mini SWA verify
+            test_cases.emplace_back(new test_inkling2_proj(type, 2304, {512, 16}, 6, norm)); // multi-chunk verify
             test_cases.emplace_back(new test_inkling2_proj(type, 2304, {512, 16}, 3, norm));
             test_cases.emplace_back(new test_inkling2_proj(type, 37, {3, 17, 1, 2, 5, 7, 9, 11}, 2, norm));         // 8 weights, odd sizes
         }
@@ -11543,6 +11699,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_inkling2_situ({1152, 8, 1}, lb, merged)); // Inkling 2 Mini decode
             test_cases.emplace_back(new test_inkling2_situ({37, 3, 5}, lb, merged));
         }
+    }
+    for (int n : {1, 2, 3, 4}) {
+        for (bool with_scale : {false, true}) {
+            test_cases.emplace_back(new test_inkling2_situ_mul_mat_id(GGML_TYPE_NVFP4, 128, 8, 130, n, 1152, with_scale));
+        }
+        test_cases.emplace_back(new test_inkling2_situ_mul_mat_id(GGML_TYPE_Q5_0, 128, 8, 130, n, 1152, false));
     }
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_F16}) {
         test_cases.emplace_back(new test_inkling2_rel_bias(type, 16, 100, 4, 256, 1));
@@ -11582,8 +11744,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_inkling2_conv(2304, 4, 1, 1, 0, true, true, true)); // Inkling 2 Mini decode
+    test_cases.emplace_back(new test_inkling2_conv(2304, 4, 1, 4, 0, true, true, true, 0, 4)); // rollback state store
+    test_cases.emplace_back(new test_inkling2_conv(64, 4, 2, 70, 4, true, true, true, 0, 6));  // multi-chunk rollback
     for (int post : {GGML_INKLING2_HEAD_POST_CLIP, GGML_INKLING2_HEAD_POST_RMS_NORM}) {
         test_cases.emplace_back(new test_inkling2_conv(512, 4, 1, 1, 4, false, true, true, post));  // Inkling 2 Mini K / V decode
+        test_cases.emplace_back(new test_inkling2_conv(512, 4, 1, 4, 4, false, true, true, post, 4)); // rollback K / V verify
         test_cases.emplace_back(new test_inkling2_conv(512, 4, 1, 70, 4, false, true, false, post));
         test_cases.emplace_back(new test_inkling2_conv(192, 4, 2, 3, 3, true, false, false, post));
     }
@@ -13309,6 +13474,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 2050, 10, true, 64, 33, 256));
     }
 
+    // grouped multi-token NVFP4/Q5_0/Q4_K MoE cases (overlapping, duplicated, non-aligned, MoE-cache-like)
+    for (int n : {2, 3, 4, 8}) {
+        for (bool b : {true, false}) {
+            test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, b, 73, n, b ? 2304 : 1152));
+            test_cases.emplace_back(new test_mul_mat_id_dup(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 8, b, 65, n, 256));
+            test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_Q5_0, GGML_TYPE_F32, 128, 8, b, 73, n, b ? 2304 : 1152));
+            test_cases.emplace_back(new test_mul_mat_id_dup(GGML_TYPE_Q5_0, GGML_TYPE_F32, 16, 8, b, 65, n, 256));
+            test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 8, b, 73, n, 2304));
+            test_cases.emplace_back(new test_mul_mat_id_dup(GGML_TYPE_Q4_K, GGML_TYPE_F32, 16, 8, b, 65, n, 256));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_NVFP4, GGML_TYPE_F32, 600, 8, true,  128, 4, 2304, 160, true));
+    test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_NVFP4, GGML_TYPE_F32, 600, 8, false, 128, 4, 1152, 160, true));
+    test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_Q5_0,  GGML_TYPE_F32, 600, 8, true,  128, 4, 2304, 160, true));
+    test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_Q5_0,  GGML_TYPE_F32, 600, 8, false, 128, 4, 1152, 160, true));
+    test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_Q4_K,  GGML_TYPE_F32, 600, 8, true,  128, 4, 2304, 160, true));
+    test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_Q4_K,  GGML_TYPE_F32, 600, 8, false, 128, 4, 2304, 160, true));
+
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
     }
@@ -14595,6 +14778,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, false, 2304, n, k));
         }
     }
+    // Inkling2 DSpark verify (4 tokens, 128 experts, top-8): realistic ~19/32 overlap and uniform random
+    test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, true,  2304, 4, 2304));
+    test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, false, 2304, 4, 1152));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, true,  2304, 4, 2304));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, false, 2304, 4, 1152));
+    test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_Q4_K,  GGML_TYPE_F32, 128, 8, true,  2304, 4, 2304));
+    test_cases.emplace_back(new test_mul_mat_id_overlap(GGML_TYPE_Q5_0,  GGML_TYPE_F32, 128, 8, false, 2304, 4, 1152));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K,  GGML_TYPE_F32, 128, 8, true,  2304, 4, 2304));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0,  GGML_TYPE_F32, 128, 8, false, 2304, 4, 1152));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 8, false, 2304, 2048, 2304));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 128, 8, false, 2304, 2048, 1152));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 2304, 2048, 2304));
@@ -14647,9 +14839,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 2048, 1024, 2048, false, 1024, 1024, false));
 
-    // INKLING2_PROJ: Inkling 2 Mini projections of a SWA layer input, decode
-    test_cases.emplace_back(new test_inkling2_proj(GGML_TYPE_BF16, 2304, {3072, 384, 24, 3072, 512, 512}, 1, true));
+    // INKLING2_ATTN compact small-T DSpark verify (T=1..4, SWA shallow/deep + 64k global shallow/62k needle)
+    for (int64_t nt : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 3072,  nt,   512, true, 1024, 1024, false, 128, 64));
+        test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 3072,  nt,  3072, true, 1024, 1024, false, 128, 64));
+        test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 65536, nt, 62252, true,    0, 1025, false, 128, 64));
+    }
+    test_cases.emplace_back(new test_inkling2_attn_compact(GGML_TYPE_Q8_0, 128, 24, 8, 65536, 4, 512, true, 0, 1025, false, 128, 64));
+
+    // INKLING2_PROJ: Inkling 2 Mini projections of a SWA layer input, decode and DSpark verify
+    for (int64_t nt : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_inkling2_proj(GGML_TYPE_BF16, 2304, {3072, 384, 24, 3072, 512, 512}, nt, true));
+    }
     test_cases.emplace_back(new test_inkling2_proj(GGML_TYPE_BF16, 2304, {3072}, 1, true));
+    // Inkling 2 Mini attn_output (2304x3072) and lm_head (201024x2304) BF16 decode/verify
+    for (int64_t bs : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 2304, bs, 3072, {1, 1}, {1, 1}));
+    }
+    for (int64_t bs : {1, 3, 4}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 201024, bs, 2304, {1, 1}, {1, 1}));
+    }
 
     // INKLING2_MIX: Inkling 2 Mini depth mix, decode
     test_cases.emplace_back(new test_inkling2_mix(GGML_TYPE_F32, 2304, 5, 1, 1));

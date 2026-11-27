@@ -60,6 +60,9 @@ public:
     // returns the number of experts copied, 0 if expert e is not in the cache
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
+    // for large batches: copy uploaded experts from dst into empty cache slots without evicting cached experts
+    void warm_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, const std::vector<bool> * used = nullptr);
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
 private:

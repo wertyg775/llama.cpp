@@ -238,20 +238,26 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     // history is either the gathered states [n_conv - 1, n_channels_all, n_seqs], or all cache cells [n_embd_r, n_cells]
     const bool cells = history->ne[0] == (int64_t) hparams.n_embd_r();
 
-    // the fused op also returns the last n_conv - 1 inputs, the new state
-    if (cparams.fused_inkling2 && cparams.n_rs_seq == 0 && weight->type == GGML_TYPE_F32) {
+    // the fused op also returns the trailing rollback states (1 when n_rs_seq == 0)
+    if (cparams.fused_inkling2 && weight->type == GGML_TYPE_F32) {
+        const int64_t n_slots = cparams.n_rs_seq > 0 ? std::min<int64_t>(n_seq_tokens, (int64_t) cparams.n_rs_seq + 1) : 1;
         ggml_tensor * past = cells ? history :
             ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
-        ggml_tensor * res_conv = ggml_inkling2_conv(ctx0, cur, past, weight, dynamic, residual, cells ? inp->s_copy_main : nullptr, cells ? offset : 0, scale);
+        ggml_tensor * res_conv = ggml_inkling2_conv(ctx0, cur, past, weight, dynamic, residual, cells ? inp->s_copy_main : nullptr, cells ? offset : 0, scale, n_slots);
         if (post != GGML_INKLING2_HEAD_POST_NONE) {
             ggml_inkling2_conv_set_head_post(res_conv, (ggml_inkling2_head_post) post, head_dim, post_param);
         }
         res->add_fused_node({LLM_FUSED_OP_INKLING2, res_conv, il});
 
-        ggml_tensor * x_new = ggml_view_3d(ctx0, res_conv, n_conv - 1, n_channels, n_seqs,
-                (n_conv - 1)*sizeof(float), (n_conv - 1)*n_channels*sizeof(float), n_channels*n_tokens*sizeof(float));
-        build_conv_state_store(inp, state, x_new, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
+        const auto * mctx_cur  = inp->mctx;
+        const size_t row_size  = state->nb[1];
+        const size_t cell_offs = mctx_cur->get_head()*row_size + offset*(n_conv - 1)*ggml_element_size(state);
+        ggml_tensor * x_new = ggml_view_3d(ctx0, res_conv, (n_conv - 1)*n_channels, n_seqs, n_slots,
+                (n_conv - 1)*n_channels*sizeof(float), (n_conv - 1)*n_channels*n_seqs*sizeof(float), n_channels*n_tokens*sizeof(float));
+        ggml_tensor * cell = ggml_view_3d(ctx0, state, (n_conv - 1)*n_channels, n_seqs, n_slots,
+                row_size, (size_t) mctx_cur->get_size()*row_size, cell_offs);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, x_new, cell));
 
         return ggml_view_2d(ctx0, res_conv, n_channels, n_tokens, n_channels*sizeof(float), 0);
     }
@@ -401,7 +407,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     ggml_tensor * state = recr->mctx->get_r_l(il);
 
     // the fused convolutions of a single sequence read the past straight from its cache cell, so nothing is gathered
-    bool conv_cells = cparams.fused_inkling2 && cparams.n_rs_seq == 0 && ubatch.n_seqs == 1;
+    bool conv_cells = cparams.fused_inkling2 && ubatch.n_seqs == 1;
     for (ggml_tensor * w : {layer.attn_k_conv, layer.attn_v_conv, layer.attn_post_conv, layer.ffn_post_conv}) {
         conv_cells = conv_cells && w->type == GGML_TYPE_F32;
     }
@@ -447,7 +453,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     {
         ggml_tensor * ws_all[8] = { layer.wq, layer.wk, layer.wv, layer.attn_k_conv_proj, layer.attn_v_conv_proj, layer.attn_rel, layer.attn_sink_proj, layer.wqkv_gate };
 
-        bool fused_proj = cparams.fused_inkling2 && n_tokens == 1;
+        bool fused_proj = cparams.fused_inkling2 && n_tokens <= 8;
         for (ggml_tensor * w : ws_all) {
             fused_proj = fused_proj && (!w || (plain_weight(w) && w->type == layer.wq->type));
         }
@@ -532,8 +538,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         // Q and R are clipped in one op when fused
         if (cparams.fused_inkling2) {
             ggml_tensor * qr = ggml_inkling2_clip2(ctx0,
-                    ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), layer.attn_q_clip, hparams.f_qk_clip,
-                    ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip, tau_l, 1e-6f);
+                    ggml_view_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens, n_embd_head*sizeof(float), Qcur->nb[1], 0), layer.attn_q_clip, hparams.f_qk_clip,
+                    ggml_view_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens, hparams.n_relative*sizeof(float), Rcur->nb[1], 0), layer.attn_rel_clip, hparams.f_relative_clip, tau_l, 1e-6f);
             ggml_build_forward_expand(gf, qr);
             res->add_fused_node({LLM_FUSED_OP_INKLING2, qr, ip});
 
@@ -651,6 +657,9 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, ggml_tensor * 
     cur = ggml_reshape_2d(ctx0, mix(blocks, cur, nullptr, model.output_res_query, -1), n_embd, n_tokens);
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
+    // DSpark target features: the last one is the final norm output of every token
+    res->t_layer_inp[n_layer] = cur;
+
     if (inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
@@ -680,6 +689,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
 
     ggml_tensor * blocks = nullptr;
     for (int il = 0; il < n_layer; ++il) {
+        // DSpark target features: the partial block at the layer input
+        res->t_layer_inp[il] = cur;
         cur = build_layer(il, il, cur, blocks);
     }
 

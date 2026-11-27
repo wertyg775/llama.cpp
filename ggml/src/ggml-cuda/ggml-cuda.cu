@@ -4525,6 +4525,28 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+struct ggml_cuda_concat_dim0_args {
+    const float * src[4];
+    int64_t       off[4];
+    int64_t       s1[4];
+    int           n;
+};
+
+static __global__ void concat_dim0_multi_f32(
+        const ggml_cuda_concat_dim0_args a, float * __restrict__ dst,
+        const int64_t dst_ne0, const int64_t dst_s1, const int64_t nrows) {
+    const int64_t col = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t row = blockIdx.y;
+    if (col >= dst_ne0 || row >= nrows) {
+        return;
+    }
+    int k = 0;
+    while (k + 1 < a.n && col >= a.off[k + 1]) {
+        ++k;
+    }
+    dst[row * dst_s1 + col] = a.src[k][row * a.s1[k] + (col - a.off[k])];
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4580,6 +4602,137 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // inkling2 situ -> mul_mat_id (+ optional nvfp4 scale): fuse situ into q8_1 quantization
+    // memory range check starts at i+1 because quantize_inkling2_situ_q8_1 consumes situ's inputs into pool memory before mul_mat_vec_q writes dst
+#if defined(GGML_USE_HIP)
+    if (node->op == GGML_OP_INKLING2_SITU && ggml_is_contiguous(node) &&
+            node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32 &&
+            node->src[0]->nb[0] == sizeof(float) && node->src[1]->nb[0] == sizeof(float)) {
+        // 6-node pattern: situ + mul_mat_id + nvfp4 scale
+        const ggml_op ops6[6] = { GGML_OP_INKLING2_SITU, GGML_OP_MUL_MAT_ID, GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL };
+        const int out6[1] = { i + 5 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 6, ops6, out6, 1) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i + 1, 5, out6, 1)) {
+            ggml_tensor * mm_node    = cgraph->nodes[i + 1];
+            ggml_tensor * scale_node = cgraph->nodes[i + 5];
+            const ggml_tensor * scale = ggml_cuda_get_mul_mat_id_scale(
+                cgraph->nodes[i + 2], cgraph->nodes[i + 3], cgraph->nodes[i + 4], scale_node, mm_node);
+            if (scale && mm_node->src[1] == node && ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.x_scale = scale;
+                fusion_data.situ    = node;
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm_node->src[0], node, mm_node->src[2], scale_node, &fusion_data);
+                return 5;
+            }
+        }
+        // 2-node pattern: situ + mul_mat_id (only when not followed by a fusable nvfp4 scale)
+        const ggml_op ops2[2] = { GGML_OP_INKLING2_SITU, GGML_OP_MUL_MAT_ID };
+        const int out2[1] = { i + 1 };
+        const bool has_trailing_scale = i + 5 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID &&
+            cgraph->nodes[i + 2]->op == GGML_OP_RESHAPE &&
+            cgraph->nodes[i + 3]->op == GGML_OP_REPEAT &&
+            cgraph->nodes[i + 4]->op == GGML_OP_GET_ROWS &&
+            cgraph->nodes[i + 5]->op == GGML_OP_MUL &&
+            ggml_cuda_get_mul_mat_id_scale(cgraph->nodes[i + 2], cgraph->nodes[i + 3], cgraph->nodes[i + 4], cgraph->nodes[i + 5], cgraph->nodes[i + 1]) != nullptr;
+        if (!has_trailing_scale &&
+                ggml_can_fuse_subgraph(cgraph, i, 2, ops2, out2, 1) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i + 1, 1, out2, 1)) {
+            ggml_tensor * mm_node = cgraph->nodes[i + 1];
+            if (mm_node->src[1] == node && ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.situ = node;
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm_node->src[0], node, mm_node->src[2], mm_node, &fusion_data);
+                return 1;
+            }
+        }
+    }
+#endif
+
+    // chain of dim-0 F32 concats (up to 4 inputs, allowing interleaved VIEW nodes)
+    if (node->op == GGML_OP_CONCAT && ggml_get_op_params_i32(node, 0) == 0 &&
+            node->type == GGML_TYPE_F32 && node->ne[2] == 1 && node->ne[3] == 1 &&
+            ggml_is_contiguous(node) &&
+            node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32 &&
+            node->src[0]->nb[0] == sizeof(float) && node->src[1]->nb[0] == sizeof(float)) {
+        int idxs[6];
+        ggml_op ops[6];
+        const ggml_tensor * inputs[4] = { node->src[0], node->src[1], nullptr, nullptr };
+        int n_in = 2;
+        int n_nodes = 1;
+        idxs[0] = i;
+        ops[0]  = GGML_OP_CONCAT;
+        ggml_tensor * cur_cat = node;
+        int k = i + 1;
+        while (n_in < 4 && k < cgraph->n_nodes && n_nodes < 6) {
+            int j = k;
+            while (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_VIEW && n_nodes + (j - k) < 5) {
+                ++j;
+            }
+            if (j >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_CONCAT ||
+                    ggml_get_op_params_i32(cgraph->nodes[j], 0) != 0) {
+                break;
+            }
+            ggml_tensor * nxt = cgraph->nodes[j];
+            if (nxt->src[0] != cur_cat || nxt->type != GGML_TYPE_F32 ||
+                    nxt->ne[2] != 1 || nxt->ne[3] != 1 || !ggml_is_contiguous(nxt) ||
+                    nxt->src[1]->type != GGML_TYPE_F32 || nxt->src[1]->nb[0] != sizeof(float)) {
+                break;
+            }
+            for (int v = k; v < j; ++v) {
+                idxs[n_nodes] = v;
+                ops[n_nodes]  = GGML_OP_VIEW;
+                ++n_nodes;
+            }
+            idxs[n_nodes] = j;
+            ops[n_nodes]  = GGML_OP_CONCAT;
+            ++n_nodes;
+            inputs[n_in++] = nxt->src[1];
+            cur_cat = nxt;
+            k = j + 1;
+        }
+        if (n_in >= 3 && k - i == n_nodes) {
+            const int out[1] = { idxs[n_nodes - 1] };
+            // only fuse if no intermediate node (including views) is consumed outside the chain
+            if (ggml_can_fuse_subgraph(cgraph, i, n_nodes, ops, out, 1) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_nodes, out, 1)) {
+                ggml_cuda_concat_dim0_args a{};
+                a.n = n_in;
+                int64_t off = 0;
+                for (int m = 0; m < n_in; ++m) {
+                    a.src[m] = (const float *) inputs[m]->data;
+                    a.off[m] = off;
+                    a.s1[m]  = inputs[m]->nb[1] / sizeof(float);
+                    off += inputs[m]->ne[0];
+                }
+                const int64_t dst_ne0 = cur_cat->ne[0];
+                const int64_t nrows   = cur_cat->ne[1];
+                const int64_t dst_s1  = cur_cat->nb[1] / sizeof(float);
+                const dim3 grid((dst_ne0 + 255) / 256, nrows, 1);
+                concat_dim0_multi_f32<<<grid, 256, 0, cuda_ctx->stream()>>>(a, (float *) cur_cat->data, dst_ne0, dst_s1, nrows);
+                return n_nodes - 1;
+            }
+        }
+    }
+
+    // add + argmax on wide rows (e.g. DSpark base + markov bias -> argmax)
+    if (node->op == GGML_OP_ADD && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_ARGMAX) {
+        const ggml_op ops[2] = { GGML_OP_ADD, GGML_OP_ARGMAX };
+        const int out[1] = { i + 1 };
+        ggml_tensor * am = cgraph->nodes[i + 1];
+        const ggml_tensor * a = node->src[0];
+        const ggml_tensor * b = node->src[1];
+        if (am->src[0] == node && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+                ggml_are_same_shape(a, b) && a->ne[2] == 1 && a->ne[3] == 1 &&
+                a->ne[1] <= 16 && a->ne[0] >= 16384 &&
+                a->nb[0] == sizeof(float) && b->nb[0] == sizeof(float) &&
+                ggml_can_fuse_subgraph(cgraph, i, 2, ops, out, 1) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out, 1)) {
+            ggml_cuda_argmax_add(*cuda_ctx, node, am);
+            return 1;
+        }
+    }
+
     // inkling2 ctrl ops of independent inputs: one launch each for the down and up halves
     if (node->op == GGML_OP_INKLING2_CTRL) {
         const int ctrl_skip = ggml_cuda_inkling2_ctrl_batch_fusion(*cuda_ctx, cgraph, i);
@@ -4608,9 +4761,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
         float * state_dst = nullptr;
         int64_t s_state_q = 0;
-        const int nodes_to_skip = ggml_cuda_inkling2_conv_state_fusion(cgraph, i, &state_dst, &s_state_q);
+        int64_t s_state_r = 0;
+        const int nodes_to_skip = ggml_cuda_inkling2_conv_state_fusion(cgraph, i, &state_dst, &s_state_q, &s_state_r);
         if (nodes_to_skip > 0) {
-            ggml_cuda_op_inkling2_conv(*cuda_ctx, node, state_dst, s_state_q);
+            ggml_cuda_op_inkling2_conv(*cuda_ctx, node, state_dst, s_state_q, s_state_r);
             return nodes_to_skip;
         }
     }

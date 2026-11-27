@@ -171,7 +171,28 @@ public:
 
     const int64_t n_embd       = 0;
     const int64_t n_embd_state = 0;
+
+    // -1: unused, 0: sampled DSpark draw, 1: greedy-only DSpark draw
+    int dspark_greedy = -1;
 };
+
+// true when every DSpark block's first draft row has inv_temp <= 0 (greedy in-graph draw)
+static inline bool llama_dspark_is_greedy_batch(const llama_ubatch & ubatch, int64_t n_embd_state) {
+    if (!ubatch.embd_state || ubatch.n_seqs_unq <= 0 || ubatch.n_tokens % ubatch.n_seqs_unq != 0) {
+        return false;
+    }
+    const int64_t n_blocks     = ubatch.n_seqs_unq;
+    const int64_t block_drafts = ubatch.n_tokens / n_blocks;
+    if (block_drafts <= 1) {
+        return true;
+    }
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        if (ubatch.embd_state[((size_t) b * block_drafts + 1) * n_embd_state + 1] > 0.0f) {
+            return false;
+        }
+    }
+    return true;
+}
 
 // original batch index of each ubatch token, used as set_rows destination rows
 class llm_graph_input_batch_idxs : public llm_graph_input_i {

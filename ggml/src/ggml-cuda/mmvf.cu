@@ -476,16 +476,19 @@ static __host__ __device__ __forceinline__ int mmvf_ys_idx(int i) {
     return i + ((i >> 5) << 2);
 }
 
-// vectorized BF16 single-column mat-vec: y in bank-conflict-free LDS, 16-byte weight loads, 2 rows per logical warp
-template <int nw>
+// vectorized BF16 mat-vec (1..4 columns): y tiled in K_TILE chunks in bank-conflict-free LDS for high CU occupancy and arbitrary ncols
+template <int nw, int n_cols, int K_TILE = 1024>
 static __global__ void mul_mat_vec_f_bf16_vec(
-        const nv_bfloat16 * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
+        const nv_bfloat16 * __restrict__ x, const float * __restrict__ y, const float * __restrict__ x_bias, float * __restrict__ dst,
         const int ncols, const int nrows, const int stride_row,
+        const int stride_col_y, const int stride_col_dst,
         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
-    constexpr int rpb = 2*nw;
+    typedef float f32x4_u __attribute__((ext_vector_type(4), aligned(4)));
+    constexpr int rpb       = 2*nw;
+    constexpr int YS_STRIDE = K_TILE + ((K_TILE >> 5) << 2);
 
-    extern __shared__ float ys[];
+    __shared__ float ys[n_cols * YS_STRIDE];
 
     const int warp = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
@@ -498,60 +501,313 @@ static __global__ void mul_mat_vec_f_bf16_vec(
     x   += int64_t(sample_x)  *stride_sample_x   + int64_t(channel_x)  *stride_channel_x;
     y   += int64_t(sample_dst)*stride_sample_y   + int64_t(channel_dst)*stride_channel_y;
     dst += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_dst)*stride_channel_dst;
-
-    for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
-        ys[mmvf_ys_idx(i)] = y[i];
+    if (x_bias) {
+        x_bias += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_dst)*stride_channel_dst;
     }
-    __syncthreads();
 
     const int r0 = blockIdx.x*rpb + warp;
     const int r1 = r0 + nw;
+    const nv_bfloat16 * x0 = r0 < nrows ? x + int64_t(r0)*stride_row : nullptr;
+    const nv_bfloat16 * x1 = r1 < nrows ? x + int64_t(r1)*stride_row : nullptr;
+
+    float acc0[n_cols];
+    float acc1[n_cols];
+#pragma unroll
+    for (int col = 0; col < n_cols; ++col) {
+        acc0[col] = 0.0f;
+        acc1[col] = 0.0f;
+    }
+
+    for (int c0 = 0; c0 < ncols; c0 += K_TILE) {
+        const int tile_len = min(K_TILE, ncols - c0);
+        const int tile_v4  = tile_len >> 2;
+#pragma unroll
+        for (int col = 0; col < n_cols; ++col) {
+            const float * yc  = y + int64_t(col)*stride_col_y + c0;
+            float       * ysc = ys + col*YS_STRIDE;
+            for (int iv = threadIdx.x; iv < tile_v4; iv += blockDim.x) {
+                const int i = iv << 2;
+                const f32x4_u v4 = *(const f32x4_u *) (yc + i);
+                *(float4 *) (ysc + mmvf_ys_idx(i)) = make_float4(v4.x, v4.y, v4.z, v4.w);
+            }
+        }
+        __syncthreads();
+
+        if (r1 < nrows) {
+            for (int c = lane*8; c < tile_len; c += WARP_SIZE*8) {
+                const int4 raw0 = *(const int4 *) (x0 + c0 + c);
+                const int4 raw1 = *(const int4 *) (x1 + c0 + c);
+                const nv_bfloat16 * w0 = (const nv_bfloat16 *) &raw0;
+                const nv_bfloat16 * w1 = (const nv_bfloat16 *) &raw1;
+                const int yidx = mmvf_ys_idx(c);
+                float wf0[4], wf1[4];
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    wf0[q] = ggml_cuda_cast<float>(w0[q]);
+                    wf1[q] = ggml_cuda_cast<float>(w1[q]);
+                }
+#pragma unroll
+                for (int col = 0; col < n_cols; ++col) {
+                    const float4 y0 = ((const float4 *) (ys + col*YS_STRIDE + yidx))[0];
+                    acc0[col] += wf0[0]*y0.x + wf0[1]*y0.y + wf0[2]*y0.z + wf0[3]*y0.w;
+                    acc1[col] += wf1[0]*y0.x + wf1[1]*y0.y + wf1[2]*y0.z + wf1[3]*y0.w;
+                }
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    wf0[q] = ggml_cuda_cast<float>(w0[q + 4]);
+                    wf1[q] = ggml_cuda_cast<float>(w1[q + 4]);
+                }
+#pragma unroll
+                for (int col = 0; col < n_cols; ++col) {
+                    const float4 y1 = ((const float4 *) (ys + col*YS_STRIDE + yidx))[1];
+                    acc0[col] += wf0[0]*y1.x + wf0[1]*y1.y + wf0[2]*y1.z + wf0[3]*y1.w;
+                    acc1[col] += wf1[0]*y1.x + wf1[1]*y1.y + wf1[2]*y1.z + wf1[3]*y1.w;
+                }
+            }
+        } else if (r0 < nrows) {
+            for (int c = lane*8; c < tile_len; c += WARP_SIZE*8) {
+                const int4 raw0 = *(const int4 *) (x0 + c0 + c);
+                const nv_bfloat16 * w0 = (const nv_bfloat16 *) &raw0;
+                const int yidx = mmvf_ys_idx(c);
+                float wf0[4];
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    wf0[q] = ggml_cuda_cast<float>(w0[q]);
+                }
+#pragma unroll
+                for (int col = 0; col < n_cols; ++col) {
+                    const float4 y0 = ((const float4 *) (ys + col*YS_STRIDE + yidx))[0];
+                    acc0[col] += wf0[0]*y0.x + wf0[1]*y0.y + wf0[2]*y0.z + wf0[3]*y0.w;
+                }
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    wf0[q] = ggml_cuda_cast<float>(w0[q + 4]);
+                }
+#pragma unroll
+                for (int col = 0; col < n_cols; ++col) {
+                    const float4 y1 = ((const float4 *) (ys + col*YS_STRIDE + yidx))[1];
+                    acc0[col] += wf0[0]*y1.x + wf0[1]*y1.y + wf0[2]*y1.z + wf0[3]*y1.w;
+                }
+            }
+        }
+        if (c0 + K_TILE < ncols) {
+            __syncthreads();
+        }
+    }
 
     if (r1 < nrows) {
-        const nv_bfloat16 * x0 = x + int64_t(r0)*stride_row;
-        const nv_bfloat16 * x1 = x + int64_t(r1)*stride_row;
-        float acc0 = 0.0f;
-        float acc1 = 0.0f;
-        for (int c = lane*8; c < ncols; c += WARP_SIZE*8) {
-            const int4   raw0 = *(const int4 *) (x0 + c);
-            const int4   raw1 = *(const int4 *) (x1 + c);
-            const float * ysp = ys + mmvf_ys_idx(c);
-            const float4 y0   = ((const float4 *) ysp)[0];
-            const float4 y1   = ((const float4 *) ysp)[1];
-            const nv_bfloat16 * w0 = (const nv_bfloat16 *) &raw0;
-            const nv_bfloat16 * w1 = (const nv_bfloat16 *) &raw1;
-            const float yv[8] = { y0.x, y0.y, y0.z, y0.w, y1.x, y1.y, y1.z, y1.w };
+        const float b0 = x_bias ? x_bias[r0] : 0.0f;
+        const float b1 = x_bias ? x_bias[r1] : 0.0f;
 #pragma unroll
-            for (int q = 0; q < 8; ++q) {
-                acc0 += ggml_cuda_cast<float>(w0[q])*yv[q];
-                acc1 += ggml_cuda_cast<float>(w1[q])*yv[q];
+        for (int col = 0; col < n_cols; ++col) {
+            acc0[col] = warp_reduce_sum(acc0[col]);
+            acc1[col] = warp_reduce_sum(acc1[col]);
+            if (lane == 0) {
+                dst[int64_t(col)*stride_col_dst + r0] = acc0[col] + b0;
+                dst[int64_t(col)*stride_col_dst + r1] = acc1[col] + b1;
             }
-        }
-        acc0 = warp_reduce_sum(acc0);
-        acc1 = warp_reduce_sum(acc1);
-        if (lane == 0) {
-            dst[r0] = acc0;
-            dst[r1] = acc1;
         }
     } else if (r0 < nrows) {
-        const nv_bfloat16 * x0 = x + int64_t(r0)*stride_row;
-        float acc0 = 0.0f;
-        for (int c = lane*8; c < ncols; c += WARP_SIZE*8) {
-            const int4   raw0 = *(const int4 *) (x0 + c);
-            const float * ysp = ys + mmvf_ys_idx(c);
-            const float4 y0   = ((const float4 *) ysp)[0];
-            const float4 y1   = ((const float4 *) ysp)[1];
-            const nv_bfloat16 * w0 = (const nv_bfloat16 *) &raw0;
-            const float yv[8] = { y0.x, y0.y, y0.z, y0.w, y1.x, y1.y, y1.z, y1.w };
+        const float b0 = x_bias ? x_bias[r0] : 0.0f;
 #pragma unroll
-            for (int q = 0; q < 8; ++q) {
-                acc0 += ggml_cuda_cast<float>(w0[q])*yv[q];
+        for (int col = 0; col < n_cols; ++col) {
+            acc0[col] = warp_reduce_sum(acc0[col]);
+            if (lane == 0) {
+                dst[int64_t(col)*stride_col_dst + r0] = acc0[col] + b0;
             }
         }
-        acc0 = warp_reduce_sum(acc0);
-        if (lane == 0) {
-            dst[r0] = acc0;
+    }
+}
+
+// 64-lane physical-wave BF16 mat-vec (2..4 cols) for medium nrows (e.g. 2304x3072): doubles physical waves/CU vs 32-lane logical warps while keeping NR=2 LDS reuse.
+template <int nw_phys, int n_cols, int K_TILE = 1024>
+static __global__ void mul_mat_vec_f_bf16_vec64(
+        const nv_bfloat16 * __restrict__ x, const float * __restrict__ y, const float * __restrict__ x_bias, float * __restrict__ dst,
+        const int ncols, const int nrows, const int stride_row,
+        const int stride_col_y, const int stride_col_dst,
+        const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
+    typedef float f32x4_u __attribute__((ext_vector_type(4), aligned(4)));
+    constexpr int rpb       = 2 * nw_phys;
+    constexpr int YS_STRIDE = K_TILE + ((K_TILE >> 5) << 2);
+
+    __shared__ float ys[n_cols * YS_STRIDE];
+
+    const int wave = threadIdx.x >> 6;
+    const int lane = threadIdx.x & 63;
+
+    const int channel_dst = blockIdx.y;
+    const int sample_dst  = blockIdx.z;
+    const int channel_x   = fastdiv((uint32_t) channel_dst, channel_ratio);
+    const int sample_x    = fastdiv((uint32_t) sample_dst,  sample_ratio);
+
+    x   += int64_t(sample_x)  *stride_sample_x   + int64_t(channel_x)  *stride_channel_x;
+    y   += int64_t(sample_dst)*stride_sample_y   + int64_t(channel_dst)*stride_channel_y;
+    dst += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_dst)*stride_channel_dst;
+    if (x_bias) {
+        x_bias += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_dst)*stride_channel_dst;
+    }
+
+    const int r0 = blockIdx.x * rpb + wave;
+    const int r1 = r0 + nw_phys;
+    const nv_bfloat16 * x0 = r0 < nrows ? x + int64_t(r0) * stride_row : nullptr;
+    const nv_bfloat16 * x1 = r1 < nrows ? x + int64_t(r1) * stride_row : nullptr;
+
+    float acc0[n_cols];
+    float acc1[n_cols];
+#pragma unroll
+    for (int col = 0; col < n_cols; ++col) {
+        acc0[col] = 0.0f;
+        acc1[col] = 0.0f;
+    }
+
+    for (int c0 = 0; c0 < ncols; c0 += K_TILE) {
+        const int tile_len = min(K_TILE, ncols - c0);
+        const int tile_v4  = tile_len >> 2;
+#pragma unroll
+        for (int col = 0; col < n_cols; ++col) {
+            const float * yc  = y + int64_t(col) * stride_col_y + c0;
+            float       * ysc = ys + col * YS_STRIDE;
+            for (int iv = threadIdx.x; iv < tile_v4; iv += nw_phys * 64) {
+                const int i = iv << 2;
+                const f32x4_u v4 = *(const f32x4_u *) (yc + i);
+                *(float4 *) (ysc + mmvf_ys_idx(i)) = make_float4(v4.x, v4.y, v4.z, v4.w);
+            }
         }
+        __syncthreads();
+
+        if (r1 < nrows) {
+            for (int c = lane * 8; c < tile_len; c += 64 * 8) {
+                const int4 raw0 = *(const int4 *) (x0 + c0 + c);
+                const int4 raw1 = *(const int4 *) (x1 + c0 + c);
+                const nv_bfloat16 * w0 = (const nv_bfloat16 *) &raw0;
+                const nv_bfloat16 * w1 = (const nv_bfloat16 *) &raw1;
+                const int yidx = mmvf_ys_idx(c);
+                float wf0[4], wf1[4];
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    wf0[q] = ggml_cuda_cast<float>(w0[q]);
+                    wf1[q] = ggml_cuda_cast<float>(w1[q]);
+                }
+#pragma unroll
+                for (int col = 0; col < n_cols; ++col) {
+                    const float4 y0 = ((const float4 *) (ys + col * YS_STRIDE + yidx))[0];
+                    acc0[col] += wf0[0]*y0.x + wf0[1]*y0.y + wf0[2]*y0.z + wf0[3]*y0.w;
+                    acc1[col] += wf1[0]*y0.x + wf1[1]*y0.y + wf1[2]*y0.z + wf1[3]*y0.w;
+                }
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    wf0[q] = ggml_cuda_cast<float>(w0[q + 4]);
+                    wf1[q] = ggml_cuda_cast<float>(w1[q + 4]);
+                }
+#pragma unroll
+                for (int col = 0; col < n_cols; ++col) {
+                    const float4 y1 = ((const float4 *) (ys + col * YS_STRIDE + yidx))[1];
+                    acc0[col] += wf0[0]*y1.x + wf0[1]*y1.y + wf0[2]*y1.z + wf0[3]*y1.w;
+                    acc1[col] += wf1[0]*y1.x + wf1[1]*y1.y + wf1[2]*y1.z + wf1[3]*y1.w;
+                }
+            }
+        } else if (r0 < nrows) {
+            for (int c = lane * 8; c < tile_len; c += 64 * 8) {
+                const int4 raw0 = *(const int4 *) (x0 + c0 + c);
+                const nv_bfloat16 * w0 = (const nv_bfloat16 *) &raw0;
+                const int yidx = mmvf_ys_idx(c);
+                float wf0[4];
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    wf0[q] = ggml_cuda_cast<float>(w0[q]);
+                }
+#pragma unroll
+                for (int col = 0; col < n_cols; ++col) {
+                    const float4 y0 = ((const float4 *) (ys + col * YS_STRIDE + yidx))[0];
+                    acc0[col] += wf0[0]*y0.x + wf0[1]*y0.y + wf0[2]*y0.z + wf0[3]*y0.w;
+                }
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    wf0[q] = ggml_cuda_cast<float>(w0[q + 4]);
+                }
+#pragma unroll
+                for (int col = 0; col < n_cols; ++col) {
+                    const float4 y1 = ((const float4 *) (ys + col * YS_STRIDE + yidx))[1];
+                    acc0[col] += wf0[0]*y1.x + wf0[1]*y1.y + wf0[2]*y1.z + wf0[3]*y1.w;
+                }
+            }
+        }
+        if (c0 + K_TILE < ncols) {
+            __syncthreads();
+        }
+    }
+
+    if (r1 < nrows) {
+        const float b0 = x_bias ? x_bias[r0] : 0.0f;
+        const float b1 = x_bias ? x_bias[r1] : 0.0f;
+#pragma unroll
+        for (int col = 0; col < n_cols; ++col) {
+            acc0[col] = warp_reduce_sum<64>(acc0[col]);
+            acc1[col] = warp_reduce_sum<64>(acc1[col]);
+            if (lane == 0) {
+                dst[int64_t(col) * stride_col_dst + r0] = acc0[col] + b0;
+                dst[int64_t(col) * stride_col_dst + r1] = acc1[col] + b1;
+            }
+        }
+    } else if (r0 < nrows) {
+        const float b0 = x_bias ? x_bias[r0] : 0.0f;
+#pragma unroll
+        for (int col = 0; col < n_cols; ++col) {
+            acc0[col] = warp_reduce_sum<64>(acc0[col]);
+            if (lane == 0) {
+                dst[int64_t(col) * stride_col_dst + r0] = acc0[col] + b0;
+            }
+        }
+    }
+}
+
+template <int n_cols>
+static void launch_mul_mat_vec_f_bf16_vec(
+        const nv_bfloat16 * x, const float * y, const float * x_bias, float * dst,
+        const int64_t ncols, const int64_t nrows, const int64_t stride_row,
+        const int64_t stride_col_y, const int64_t stride_col_dst,
+        const uint3 channel_ratio_fd, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
+        const uint3 sample_ratio_fd, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
+        const int64_t nchannels_dst, const int64_t nsamples_or_ntokens, cudaStream_t stream) {
+    if constexpr (n_cols >= 2) {
+        if (nrows > 512 && nrows <= 4096 && ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == 64) {
+            constexpr int nw_phys = 8;
+            constexpr int rpb     = 2 * nw_phys;
+            const dim3 grid((nrows + rpb - 1)/rpb, nchannels_dst, nsamples_or_ntokens);
+            mul_mat_vec_f_bf16_vec64<nw_phys, n_cols, 1024><<<grid, nw_phys*64, 0, stream>>>(
+                    x, y, x_bias, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
+                    channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio_fd,  stride_sample_x,  stride_sample_y,  stride_sample_dst);
+            return;
+        }
+        if (nrows > 4096) {
+            constexpr int nw  = 16;
+            constexpr int rpb = 2*nw;
+            const dim3 grid((nrows + rpb - 1)/rpb, nchannels_dst, nsamples_or_ntokens);
+            mul_mat_vec_f_bf16_vec<nw, n_cols, 1152><<<grid, nw*WARP_SIZE, 0, stream>>>(
+                    x, y, x_bias, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
+                    channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio_fd,  stride_sample_x,  stride_sample_y,  stride_sample_dst);
+            return;
+        }
+    }
+    if (nrows <= 512) {
+        constexpr int nw  = 2;
+        constexpr int rpb = 2*nw;
+        const dim3 grid((nrows + rpb - 1)/rpb, nchannels_dst, nsamples_or_ntokens);
+        mul_mat_vec_f_bf16_vec<nw, n_cols, 1024><<<grid, nw*WARP_SIZE, 0, stream>>>(
+                x, y, x_bias, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
+                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio_fd,  stride_sample_x,  stride_sample_y,  stride_sample_dst);
+    } else {
+        constexpr int nw  = 16;
+        constexpr int rpb = 2*nw;
+        const dim3 grid((nrows + rpb - 1)/rpb, nchannels_dst, nsamples_or_ntokens);
+        mul_mat_vec_f_bf16_vec<nw, n_cols, 1024><<<grid, nw*WARP_SIZE, 0, stream>>>(
+                x, y, x_bias, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
+                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio_fd,  stride_sample_x,  stride_sample_y,  stride_sample_dst);
     }
 }
 #endif // GGML_USE_HIP
@@ -577,27 +833,41 @@ void launch_mul_mat_vec_f_cuda(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
 #if defined(GGML_USE_HIP)
-    if constexpr (std::is_same_v<T, nv_bfloat16> && ncols_dst == 1 && !is_multi_token_id) {
-        const size_t smem = (size_t) mmvf_ys_idx((int) ncols)*sizeof(float);
-        if (!has_fusion && !ids && ncols % 8 == 0 && stride_row % 8 == 0 &&
-                ((uintptr_t) x % 16 == 0) && smem <= 48*1024 &&
-                stride_channel_x % 8 == 0 && stride_sample_x % 8 == 0) {
-            if (nrows <= 512) {
-                constexpr int nw  = 2;
-                constexpr int rpb = 2*nw;
-                const dim3 grid((nrows + rpb - 1)/rpb, nchannels_dst, nsamples_or_ntokens);
-                mul_mat_vec_f_bf16_vec<nw><<<grid, nw*WARP_SIZE, smem, stream>>>(
-                        x, y, dst, ncols, nrows, stride_row,
+    if constexpr (std::is_same_v<T, nv_bfloat16> && !is_multi_token_id) {
+        const bool   only_bias = fusion.gate == nullptr && fusion.gate_bias == nullptr;
+        const float * x_bias   = (const float *) fusion.x_bias;
+        if (only_bias && !ids && ncols % 8 == 0 && stride_row % 8 == 0 &&
+                ((uintptr_t) x % 16 == 0) &&
+                stride_channel_x % 8 == 0 && stride_sample_x % 8 == 0 &&
+                (ncols_dst == 1 || nrows > 512)) {
+            if constexpr (ncols_dst <= 4) {
+                launch_mul_mat_vec_f_bf16_vec<ncols_dst>(
+                        x, y, x_bias, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
                         channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                        sample_ratio_fd,  stride_sample_x,  stride_sample_y,  stride_sample_dst);
-            } else {
-                constexpr int nw  = 16;
-                constexpr int rpb = 2*nw;
-                const dim3 grid((nrows + rpb - 1)/rpb, nchannels_dst, nsamples_or_ntokens);
-                mul_mat_vec_f_bf16_vec<nw><<<grid, nw*WARP_SIZE, smem, stream>>>(
-                        x, y, dst, ncols, nrows, stride_row,
-                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                        sample_ratio_fd,  stride_sample_x,  stride_sample_y,  stride_sample_dst);
+                        sample_ratio_fd,  stride_sample_x,  stride_sample_y,  stride_sample_dst,
+                        nchannels_dst, nsamples_or_ntokens, stream);
+                return;
+            }
+            int col_off = 0;
+            while (col_off < ncols_dst) {
+                const int chunk = std::min(4, ncols_dst - col_off);
+                const float * yc = y   + int64_t(col_off)*stride_col_y;
+                float       * dc = dst + int64_t(col_off)*stride_col_dst;
+                switch (chunk) {
+                    case 4: launch_mul_mat_vec_f_bf16_vec<4>(x, yc, x_bias, dc, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
+                                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                                sample_ratio_fd,  stride_sample_x,  stride_sample_y,  stride_sample_dst, nchannels_dst, nsamples_or_ntokens, stream); break;
+                    case 3: launch_mul_mat_vec_f_bf16_vec<3>(x, yc, x_bias, dc, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
+                                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                                sample_ratio_fd,  stride_sample_x,  stride_sample_y,  stride_sample_dst, nchannels_dst, nsamples_or_ntokens, stream); break;
+                    case 2: launch_mul_mat_vec_f_bf16_vec<2>(x, yc, x_bias, dc, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
+                                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                                sample_ratio_fd,  stride_sample_x,  stride_sample_y,  stride_sample_dst, nchannels_dst, nsamples_or_ntokens, stream); break;
+                    default: launch_mul_mat_vec_f_bf16_vec<1>(x, yc, x_bias, dc, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
+                                channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                                sample_ratio_fd,  stride_sample_x,  stride_sample_y,  stride_sample_dst, nchannels_dst, nsamples_or_ntokens, stream); break;
+                }
+                col_off += chunk;
             }
             return;
         }
