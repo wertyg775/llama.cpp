@@ -1489,13 +1489,34 @@ void llama_context::set_embeddings_layer_inp_dev(bool value) {
     layer_inp_dev_alloc();
 }
 
+ggml_tensor * llama_context::get_layer_inp_src() const {
+    ggml_tensor * src = cparams.ctx_other ? cparams.ctx_other->get_layer_inp_dev() : nullptr;
+    if (src == nullptr) {
+        return nullptr;
+    }
+
+    // expose a mirrored Meta layer_inp_dev via its local shard so a single-GPU draft stays on its own device
+    if (llama_get_model(cparams.ctx_other)->split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+            model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+        for (const auto & backend : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            if (ggml_tensor * simple = ggml_backend_meta_buffer_get_simple_tensor(src, dev)) {
+                return simple;
+            }
+        }
+        return nullptr;
+    }
+
+    return src;
+}
+
 bool llama_context::supports_embd_row() const {
     // the DFlash/DSpark decoder graphs read the device buffer
     if (model.arch != LLM_ARCH_DFLASH) {
         return false;
     }
 
-    const ggml_tensor * src = cparams.ctx_other ? cparams.ctx_other->get_layer_inp_dev() : nullptr;
+    const ggml_tensor * src = get_layer_inp_src();
     if (src == nullptr) {
         return false;
     }
@@ -3100,7 +3121,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
         /*.layer_inp_dev =*/ layer_inp_dev,
-        /*.layer_inp_src =*/ supports_embd_row() ? cparams.ctx_other->get_layer_inp_dev() : nullptr,
+        /*.layer_inp_src =*/ supports_embd_row() ? get_layer_inp_src() : nullptr,
         /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
         /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,
         /*.samplers    =*/ sampling.samplers,

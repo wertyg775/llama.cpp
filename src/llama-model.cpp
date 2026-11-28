@@ -433,6 +433,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
     const bool is_glm5_next = ud->model->arch == LLM_ARCH_GLM5_NEXT;
+    const bool is_inkling2  = ud->model->arch == LLM_ARCH_INKLING2 || ud->model->arch == LLM_ARCH_INKLING2_LOOP;
+    const auto * lm_loop    = dynamic_cast<const llama_model_inkling2_loop *>(ud->model);
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
@@ -455,6 +457,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_q_b_weight ("blk\\.\\d*\\.attn_q_b\\.weight");
     static const std::regex pattern_attn_kv_b_weight("blk\\.\\d*\\.attn_(k|v)_b\\.weight");
     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
+    static const std::regex pattern_attn_q_clip     ("blk\\.\\d*\\.attn_q_clip\\.weight");
+    static const std::regex pattern_attn_sink_proj  ("blk\\.\\d*\\.attn_sink_proj\\.weight");
+    static const std::regex pattern_attn_rel        ("blk\\.\\d*\\.attn_rel\\.weight");
+    static const std::regex pattern_attn_rel_clip   ("blk\\.\\d*\\.attn_rel_clip\\.weight");
+    static const std::regex pattern_attn_kv_conv    ("blk\\.\\d*\\.attn_(k|v)_conv\\.weight");
+    static const std::regex pattern_attn_kv_conv_proj("blk\\.\\d*\\.attn_(k|v)_conv_proj\\.weight");
 
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
@@ -523,6 +531,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const size_t layer_index_start = tensor_name.find("_l", 6);
             GGML_ASSERT(layer_index_start != std::string::npos);
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
+            if (lm_loop) {
+                il = (uint32_t) lm_loop->layer_phys(il);
+            }
             prefix = "blk." + std::to_string(il) + ".";
             rotation = get_il_eff(il) % ud->n_devices;
         } else {
@@ -585,6 +596,22 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
+            }
+        }
+        if (is_inkling2) {
+            if (std::regex_match(tensor_name, pattern_s_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            if (std::regex_match(tensor_name, pattern_r_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_attn_q_clip) ||
+                    std::regex_match(tensor_name, pattern_attn_sink_proj) ||
+                    std::regex_match(tensor_name, pattern_attn_rel) ||
+                    std::regex_match(tensor_name, pattern_attn_rel_clip) ||
+                    std::regex_match(tensor_name, pattern_attn_kv_conv) ||
+                    std::regex_match(tensor_name, pattern_attn_kv_conv_proj)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
             }
         }
 
@@ -697,6 +724,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t conv_state_size = (hparams.ssm_d_conv - 1) * hparams.n_head(il) * hparams.n_embd_head_kda;
             GGML_ASSERT(tensor->ne[axis] == 3*conv_state_size);
             return {{conv_state_size, 3}};
+        }
+        if (is_inkling2 && std::regex_match(tensor_name, pattern_r_cache)) {
+            const int64_t kv_conv_size = (hparams.n_shortconv_l_cache - 1) * hparams.n_embd_k_gqa(il);
+            GGML_ASSERT(tensor->ne[axis] == 2*kv_conv_size);
+            return {{kv_conv_size, 2}};
         }
         // TODO: deduplicate condition [TAG_SPLIT_QGATE_QWEN]
         // zonos3 has the qwen35 GDN layout, its attention layers have no fused qkv
@@ -830,7 +862,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
                 return {granularity_head * hparams.n_embd_head_v_mla()};
             }
-        } else if (hparams.is_recr(il)) {
+        } else if (hparams.is_recr(il) && !is_inkling2) {
             // linear attention
             const int64_t head_dim        = hparams.ssm_d_state;
             const int64_t blck_size_perf  = std::lcm(blck_size, 128);
@@ -920,6 +952,30 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
 
             const int64_t granularity_kv = granularity_q / n_gqa;
+            if (is_inkling2) {
+                if (std::regex_match(tensor_name, pattern_attn_q_clip) ||
+                        std::regex_match(tensor_name, pattern_attn_sink_proj) ||
+                        std::regex_match(tensor_name, pattern_attn_rel_clip)) {
+                    GGML_ASSERT(segments.size() == 1);
+                    return {granularity_head};
+                }
+                if (std::regex_match(tensor_name, pattern_attn_rel)) {
+                    GGML_ASSERT(segments.size() == 1);
+                    return {granularity_head * hparams.n_relative};
+                }
+                if (std::regex_match(tensor_name, pattern_attn_kv_conv)) {
+                    GGML_ASSERT(segments.size() == 1);
+                    return {granularity_kv};
+                }
+                if (std::regex_match(tensor_name, pattern_attn_kv_conv_proj)) {
+                    GGML_ASSERT(segments.size() == 1);
+                    return {(granularity_head / n_gqa) * hparams.n_shortconv_l_cache};
+                }
+                if (std::regex_match(tensor_name, pattern_r_cache)) {
+                    GGML_ASSERT(segments.size() == 1);
+                    return {granularity_kv * (hparams.n_shortconv_l_cache - 1)};
+                }
+            }
             // the V head size can differ from the K head size (e.g. MiMo d_k=192 d_v=128):
             // align V tensors to whole V heads at the same head-index scale as Q and K so all
             // three stay in lockstep per device
@@ -956,7 +1012,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
-            const int64_t blck_size_perf = std::lcm(blck_size, 128);
+            const int64_t blck_size_perf = is_inkling2 ? std::lcm(blck_size, int64_t(64)) : std::lcm(blck_size, int64_t(128));
             GGML_ASSERT(segments.size() == 1);
             return {blck_size_perf};
         }
@@ -1812,8 +1868,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] = split_sum != 0.0f ? splits[i] / split_sum : float(i + 1) / n_devices();
     }
 
-    const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+    // looped models share physical weights across cache slots, so split physical layers and co-locate each slot with its layer
+    const auto * lm_loop = dynamic_cast<const llama_model_inkling2_loop *>(this);
+    const int n_layer_split = lm_loop ? lm_loop->n_phys : n_layer_all;
+    const int i_gpu_start = std::max(n_layer_split + 1 - n_gpu_layers, 0);
+    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_split + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
@@ -1833,11 +1892,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
     for (int il = 0; il < n_layer_all; ++il) {
-        pimpl->dev_layer[il] = get_layer_buft_list(il);
+        pimpl->dev_layer[il] = lm_loop && il >= n_layer_split ? pimpl->dev_layer[lm_loop->layer_phys(il)] : get_layer_buft_list(il);
     }
 
     // assign the output layer
-    pimpl->dev_output = get_layer_buft_list(n_layer_all);
+    pimpl->dev_output = get_layer_buft_list(n_layer_split);
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -2107,6 +2166,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             auto register_host_range = [&](void * ptr, size_t size) {
                 for (const auto & d : devices) {
                     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d.dev);
+                    if (!reg) {
+                        continue;
+                    }
                     auto reg_fn   = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
                     auto unreg_fn = (void (*)(void *))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
                     if (reg_fn && unreg_fn && reg_fn(ptr, size)) {

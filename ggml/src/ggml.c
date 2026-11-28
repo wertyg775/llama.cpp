@@ -6734,7 +6734,8 @@ struct ggml_tensor * ggml_inkling2_conv(
         GGML_ASSERT(residual->type == GGML_TYPE_F32 && ggml_are_same_shape(residual, cur) && residual->nb[0] == sizeof(float));
     }
 
-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C*T + (K - 1)*C*n_seqs*n_slots);
+    // 2D [C, T + (K - 1)*n_seqs*n_slots] keeps dim 0 = C so channel-split views stay on axis 0 for any T
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T + (K - 1)*n_seqs*n_slots);
 
     ggml_set_op_params_f32(result, 0, scale);
     ggml_set_op_params_i32(result, 1, (int32_t) offset);

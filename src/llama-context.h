@@ -261,6 +261,9 @@ private:
     // (re)allocate the device buffer for cparams.embeddings_layer_inp_dev
     void layer_inp_dev_alloc();
 
+    // resolve ctx_other's layer_inp_dev to a local device tensor when ctx_other uses Meta
+    ggml_tensor * get_layer_inp_src() const;
+
     // (re)allocate the device buffer for cparams.embeddings_nextn_dev, false if it does not fit
     bool h_nextn_dev_alloc();
 

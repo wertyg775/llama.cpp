@@ -918,6 +918,11 @@ void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
             return;
         }
     }
+    if (backend_src != NULL && ggml_backend_is_meta(backend_src) && backend_src->iface.cpy_tensor_async != NULL) {
+        if (backend_src->iface.cpy_tensor_async(backend_src, backend_dst, src, dst)) {
+            return;
+        }
+    }
 
     // an async copy would normally happen after all the queued operations on both backends are completed
     // to simulate the same behavior, we need to synchronize both backends first, and do a blocking copy
@@ -2226,7 +2231,12 @@ static void ggml_backend_sched_copy_input(
 
     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+    bool copied = split_backend->iface.cpy_tensor_async &&
+        split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
+    if (!copied && ggml_backend_is_meta(input_backend) && input_backend->iface.cpy_tensor_async) {
+        copied = input_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
+    }
+    if (!copied) {
         ggml_backend_synchronize(input_backend);
         async_host_read[ggml_backend_sched_backend_id(sched, input_backend)] = false;
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2325,7 +2335,8 @@ static void ggml_backend_sched_place_uploads(ggml_backend_sched_t sched) {
         // only from pinned memory (the host buffer type of the device, or registered memory): copies from pageable memory do not run in parallel with the compute
         ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[split->backend_id]);
         ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
-        auto host_ptr_is_pinned = (bool (*)(const void *)) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_host_ptr_is_pinned");
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto host_ptr_is_pinned = reg ? (bool (*)(const void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_ptr_is_pinned") : NULL;
         for (int i = 0; i < split->n_inputs; i++) {
             struct ggml_tensor * input = split->inputs[i];
             if (!ggml_backend_sched_is_host_weight(input) || input->view_src != NULL || !sched->hv_tensor_requires_copy[hash_id(input)]) {

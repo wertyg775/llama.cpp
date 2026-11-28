@@ -1395,7 +1395,29 @@ struct ggml_backend_cuda_comm_context {
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
 
+#ifdef USE_CUDA_GRAPH
+    struct comm_graph_entry {
+        std::vector<ggml_cuda_graph::node_properties> node_props[2];
+        ggml_cuda_graph_instance                      instances[2];
+        uint64_t                                      uid = 0;
+        bool                                          warmup_complete = false;
+    };
+    std::unordered_map<const void *, std::unique_ptr<comm_graph_entry>> comm_graphs;
+#endif // USE_CUDA_GRAPH
+
     ~ggml_backend_cuda_comm_context() {
+#ifdef USE_CUDA_GRAPH
+        for (auto & [key, entry] : comm_graphs) {
+            for (int j = 0; j < 2; ++j) {
+                if (entry->instances[j].handle != nullptr) {
+                    ggml_cuda_set_device(dev_ids[j]);
+                    CUDA_CHECK(cudaGraphExecDestroy(entry->instances[j]));
+                    entry->instances[j].handle = nullptr;
+                }
+            }
+        }
+        comm_graphs.clear();
+#endif // USE_CUDA_GRAPH
 #ifdef GGML_USE_NCCL
         for (ncclComm_t comm : comms) {
             NCCL_CHECK(ncclCommDestroy(comm));
@@ -3308,6 +3330,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(cuda_ctx_src->device);
         const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
+        ggml_cuda_set_device(cuda_ctx_src->device);
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         } else {
@@ -3320,13 +3343,13 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 
         // record event on src stream after the copy
         if (!cuda_ctx_src->copy_event) {
-            ggml_cuda_set_device(cuda_ctx_src->device);
             CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
         }
 
         CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
 
         // wait on dst stream for the copy to complete
+        ggml_cuda_set_device(cuda_ctx_dst->device);
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
     } else {
         // src and dst are on the same backend
@@ -5891,6 +5914,214 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     return GGML_STATUS_SUCCESS;
 }
 
+// Capture and replay a full 2-GPU tensor-parallel graph (all subgraphs + chunked AllReduces)
+// as one CUDA/HIP graph per device to eliminate per-subgraph launch and event gaps.
+static bool ggml_backend_cuda_comm_graph_compute(
+        void * comm_ctx_v, struct ggml_cgraph ** subgraphs, size_t n_subgraphs, uint64_t uid) {
+#ifdef USE_CUDA_GRAPH
+    if (comm_ctx_v == nullptr || subgraphs == nullptr || n_subgraphs < 3) {
+        return false;
+    }
+    static const bool disable_graphs =
+        getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr ||
+        getenv("GGML_CUDA_DISABLE_COMM_GRAPHS") != nullptr;
+    if (disable_graphs || ggml_cuda_pool_debug_enabled()) {
+        return false;
+    }
+
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->ar_pipeline == nullptr ||
+            comm_ctx->try_allreduce != ggml_backend_cuda_comm_try_allreduce_internal ||
+            comm_ctx->backends.size() != 2) {
+        return false;
+    }
+
+    ggml_backend_cuda_context * cuda_ctx[2] = {
+        static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[0]->context),
+        static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[1]->context),
+    };
+    for (int j = 0; j < 2; ++j) {
+        if (ggml_cuda_info().devices[comm_ctx->dev_ids[j]].cc < GGML_CUDA_CC_VOLTA) {
+            return false;
+        }
+        if (subgraphs[j * n_subgraphs]->n_nodes == 0) {
+            return false;
+        }
+    }
+
+    ggml_cuda_ar_pipeline * p = comm_ctx->ar_pipeline;
+    const void * graph_key = subgraphs[0]->nodes[0];
+
+    auto & entry_ptr = comm_ctx->comm_graphs[graph_key];
+    if (!entry_ptr) {
+        entry_ptr = std::make_unique<ggml_backend_cuda_comm_context::comm_graph_entry>();
+    }
+    auto * entry = entry_ptr.get();
+
+    // Fast path: unchanged graph UID after warmup replays both monolithic graphs directly.
+    if (uid != 0 && uid == entry->uid && entry->warmup_complete &&
+            entry->instances[0].handle != nullptr && entry->instances[1].handle != nullptr) {
+        ggml_cuda_ar_sync_before_mode_switch(p, comm_ctx->backends.data(), true, graph_key);
+        for (int j = 0; j < 2; ++j) {
+            ggml_cuda_set_device(comm_ctx->dev_ids[j]);
+            CUDA_CHECK(cudaGraphLaunch(entry->instances[j], cuda_ctx[j]->stream()));
+        }
+        return true;
+    }
+
+    // Verify all AllReduce tensors fit in the capturable single-chunk kernel path.
+    const size_t n_ar = n_subgraphs - 1;
+    for (size_t i = 0; i < n_ar; ++i) {
+        ggml_cgraph * sg0 = subgraphs[0 * n_subgraphs + i];
+        ggml_cgraph * sg1 = subgraphs[1 * n_subgraphs + i];
+        if (sg0->n_nodes == 0 || sg1->n_nodes == 0) {
+            return false;
+        }
+        ggml_tensor * t0 = sg0->nodes[sg0->n_nodes - 1];
+        ggml_tensor * t1 = sg1->nodes[sg1->n_nodes - 1];
+        if (!ggml_cuda_ar_can_capture(p, t0) || !ggml_cuda_ar_can_capture(p, t1)) {
+            return false;
+        }
+        if (ggml_nelements(t0) != ggml_nelements(t1) || t0->type != t1->type) {
+            return false;
+        }
+    }
+
+    for (int j = 0; j < 2; ++j) {
+        ggml_cuda_set_device(comm_ctx->dev_ids[j]);
+        for (size_t i = 0; i < n_subgraphs; ++i) {
+            if (!ggml_cuda_graph_check_compability(subgraphs[j * n_subgraphs + i])) {
+                return false;
+            }
+        }
+    }
+
+    // Check if any node property changed across all subgraphs on either device.
+    bool properties_changed = false;
+    for (int j = 0; j < 2; ++j) {
+        size_t total_nodes = 0;
+        for (size_t i = 0; i < n_subgraphs; ++i) {
+            total_nodes += (size_t) subgraphs[j * n_subgraphs + i]->n_nodes;
+        }
+        auto & props = entry->node_props[j];
+        if (props.size() != total_nodes) {
+            properties_changed = true;
+            props.resize(total_nodes);
+        }
+        size_t idx = 0;
+        for (size_t i = 0; i < n_subgraphs; ++i) {
+            ggml_cgraph * sg = subgraphs[j * n_subgraphs + i];
+            for (int k = 0; k < sg->n_nodes; ++k, ++idx) {
+                ggml_cuda_graph::node_properties prop = {};
+                memcpy(&prop.node, sg->nodes[k], sizeof(ggml_tensor));
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    if (sg->nodes[k]->src[s]) {
+                        prop.node_src_data_ptrs[s] = sg->nodes[k]->src[s]->data;
+                        memcpy(prop.node_src_ne[s], sg->nodes[k]->src[s]->ne, sizeof(prop.node_src_ne[s]));
+                        memcpy(prop.node_src_nb[s], sg->nodes[k]->src[s]->nb, sizeof(prop.node_src_nb[s]));
+                    }
+                }
+                if (properties_changed || memcmp(&props[idx], &prop, sizeof(prop)) != 0) {
+                    props[idx] = prop;
+                    properties_changed = true;
+                }
+            }
+        }
+    }
+    entry->uid = uid;
+
+    bool use_capture = false;
+    bool need_update = false;
+    if (!entry->warmup_complete) {
+        if (!properties_changed) {
+            entry->warmup_complete = true;
+            use_capture = true;
+            need_update = true;
+        }
+    } else if (properties_changed) {
+        entry->warmup_complete = false;
+    } else {
+        use_capture = true;
+        need_update = (entry->instances[0].handle == nullptr || entry->instances[1].handle == nullptr);
+    }
+
+    if (!use_capture) {
+        for (size_t i = 0; i < n_subgraphs; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                ggml_cuda_set_device(comm_ctx->dev_ids[j]);
+                ggml_cuda_graph_evaluate_and_capture(cuda_ctx[j], subgraphs[j * n_subgraphs + i], false, false, nullptr);
+            }
+            if (i < n_ar) {
+                ggml_tensor * ar_nodes[2] = {
+                    subgraphs[0 * n_subgraphs + i]->nodes[subgraphs[0 * n_subgraphs + i]->n_nodes - 1],
+                    subgraphs[1 * n_subgraphs + i]->nodes[subgraphs[1 * n_subgraphs + i]->n_nodes - 1],
+                };
+                GGML_ASSERT(ggml_cuda_ar_allreduce(p, comm_ctx->backends.data(), ar_nodes));
+            }
+        }
+        return true;
+    }
+
+    if (need_update) {
+        for (int j = 0; j < 2; ++j) {
+            ggml_cuda_set_device(comm_ctx->dev_ids[j]);
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx[j]->stream()));
+        }
+        ggml_cuda_ar_sync_before_mode_switch(p, comm_ctx->backends.data(), true, graph_key);
+
+        {
+            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+            ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        for (int j = 0; j < 2; ++j) {
+            ggml_cuda_set_device(comm_ctx->dev_ids[j]);
+            CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx[j]->stream(), cudaStreamCaptureModeRelaxed));
+            for (size_t i = 0; i < n_subgraphs; ++i) {
+                ggml_cgraph * sg = subgraphs[j * n_subgraphs + i];
+                ggml_cuda_graph_evaluate_and_capture(cuda_ctx[j], sg, false, false, nullptr);
+                if (i < n_ar) {
+                    const int slot = (i == n_ar - 1 && (n_ar & 1)) ? 2 : (int)(i & 1);
+                    GGML_ASSERT(ggml_cuda_ar_enqueue_rank(p, cuda_ctx[j], j, slot, sg->nodes[sg->n_nodes - 1]));
+                }
+            }
+            cudaGraph_t cg = nullptr;
+            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx[j]->stream(), &cg));
+            if (entry->instances[j].handle != nullptr) {
+                ggml_cuda_graph_update_executable(entry->instances[j], cg, comm_ctx->dev_ids[j]);
+            } else {
+                CUDA_CHECK(cudaGraphInstantiate(&entry->instances[j].handle, cg, nullptr, nullptr, 0));
+#ifdef USE_CUDA_GRAPH_CLUSTER_CHECK
+                entry->instances[j].clusters = ggml_cuda_graph_get_clusters(cg, comm_ctx->dev_ids[j]);
+#endif // USE_CUDA_GRAPH_CLUSTER_CHECK
+            }
+            CUDA_CHECK(cudaGraphDestroy(cg));
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                ggml_cuda_lock_cv.notify_all();
+            }
+        }
+    } else {
+        ggml_cuda_ar_sync_before_mode_switch(p, comm_ctx->backends.data(), true, graph_key);
+    }
+
+    for (int j = 0; j < 2; ++j) {
+        ggml_cuda_set_device(comm_ctx->dev_ids[j]);
+        CUDA_CHECK(cudaGraphLaunch(entry->instances[j], cuda_ctx[j]->stream()));
+    }
+    return true;
+#else
+    GGML_UNUSED(comm_ctx_v);
+    GGML_UNUSED(subgraphs);
+    GGML_UNUSED(n_subgraphs);
+    GGML_UNUSED(uid);
+    return false;
+#endif // USE_CUDA_GRAPH
+}
+
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
@@ -7380,6 +7611,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_graph_compute") == 0) {
+        return (void *)ggml_backend_cuda_comm_graph_compute;
     }
 #ifdef GGML_USE_NCCL
     if (strcmp(name, "ggml_backend_comm_init_rank") == 0) {

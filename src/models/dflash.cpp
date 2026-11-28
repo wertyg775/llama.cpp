@@ -555,8 +555,29 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
 }
 
 ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur) {
-    const auto [output, output_s] = get_lm_head(*this, model);
+    auto [output, output_s] = get_lm_head(*this, model);
+    ggml_backend_t output_backend = nullptr;
+    if (sched != nullptr && output->buffer != nullptr) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
+        const int n_b = ggml_backend_sched_get_n_backends(sched);
+        for (int b = 0; b < n_b; ++b) {
+            ggml_backend_t bk = ggml_backend_sched_get_backend(sched, b);
+            if (ggml_backend_supports_buft(bk, buft)) {
+                output_backend = bk;
+                break;
+            }
+        }
+    }
+    const bool slice_output = !model.d2t && output->ne[1] > (int64_t) model.vocab.n_tokens() &&
+            loras->empty() && !hdmd && output_backend != nullptr;
+    if (slice_output) {
+        output = ggml_view_2d(ctx0, output, output->ne[0], model.vocab.n_tokens(), output->nb[1], 0);
+        ggml_backend_sched_set_tensor_backend(sched, output, output_backend);
+    }
     cur = build_lora_mm(output, cur, output_s);
+    if (slice_output) {
+        ggml_backend_sched_set_tensor_backend(sched, cur, output_backend);
+    }
 
     // a padded lm head (e.g. shared from the target): drop the rows past the vocabulary
     if (!model.d2t && cur->ne[0] > (int64_t) model.vocab.n_tokens()) {

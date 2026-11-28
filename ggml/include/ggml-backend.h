@@ -225,6 +225,7 @@ extern "C" {
 
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    typedef bool   (*ggml_backend_comm_graph_compute_t)(void * comm_ctx, struct ggml_cgraph ** subgraphs, size_t n_subgraphs, uint64_t uid);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
@@ -449,6 +450,9 @@ extern "C" {
     //       express this as a backend registry functionality instead
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+
+    // Return the concrete simple tensor on dev for a mirrored tensor in a Meta buffer, or NULL.
+    GGML_API struct ggml_tensor * ggml_backend_meta_buffer_get_simple_tensor(const struct ggml_tensor * tensor, ggml_backend_dev_t dev);
 
     //
     // Utils

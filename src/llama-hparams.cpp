@@ -249,6 +249,11 @@ uint32_t llama_hparams::n_embd_s() const {
         return n_embd * wkv_head_size;
     }
 
+    if (n_sconv_channels != 0) {
+        // Inkling2 attn_post_conv and ffn_post_conv states (kept separate from head-split K/V conv states in cache_r)
+        return 2 * n_embd * (n_shortconv_l_cache - 1);
+    }
+
     if (n_cca_qk != 0) {
         // for ZAYA CCA layers: the delayed value of the previous token
         return n_embd_v_gqa() / 2;

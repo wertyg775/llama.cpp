@@ -27,3 +27,20 @@ bool ggml_cuda_ar_allreduce(
     ggml_backend_t        * backends,
     ggml_tensor           ** tensors);
 
+bool ggml_cuda_ar_can_capture(
+    const ggml_cuda_ar_pipeline * pipeline,
+    const ggml_tensor           * tensor);
+
+bool ggml_cuda_ar_enqueue_rank(
+    ggml_cuda_ar_pipeline     * pipeline,
+    ggml_backend_cuda_context * cuda_ctx,
+    int                         rank,
+    int                         slot,
+    ggml_tensor               * tensor);
+
+void ggml_cuda_ar_sync_before_mode_switch(
+    ggml_cuda_ar_pipeline * pipeline,
+    ggml_backend_t        * backends,
+    bool                    captured,
+    const void            * graph_key);
+
