@@ -125,6 +125,12 @@ struct common_sampler {
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
+    // the chain always picks the argmax of the raw logits, so sampling can skip the candidate array
+    bool greedy_fast = false;
+
+    // tokens the logit bias bans; the greedy fast path falls back to the chain if one of them wins
+    std::vector<llama_token> greedy_ban;
+
     void reset() {
         prev.clear();
 
@@ -186,6 +192,44 @@ std::string common_params_sampling::print() const {
             mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay);
 
     return std::string(result);
+}
+
+// true if no sampler in the chain can move the argmax of the raw logits
+static bool common_sampler_keeps_argmax(const common_params_sampling & params) {
+    for (const auto & cnstr : params.samplers) {
+        switch (cnstr) {
+            case COMMON_SAMPLER_TYPE_TOP_K:
+            case COMMON_SAMPLER_TYPE_TOP_P:
+            case COMMON_SAMPLER_TYPE_MIN_P:
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                break;
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                if (params.typ_p < 1.0f) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_XTC:
+                if (params.xtc_probability > 0.0f) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (params.dry_multiplier != 0.0f) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (params.penalty_last_n != 0 &&
+                        (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
+                    return false;
+                }
+                break;
+            default:
+                return false;
+        }
+    }
+    return true;
 }
 
 struct common_sampler * common_sampler_init(
@@ -349,6 +393,8 @@ struct common_sampler * common_sampler_init(
         }
     }
 
+    bool greedy = false;
+
     if (params.mirostat == 0) {
 
         bool use_adaptive_p = false; // see below
@@ -408,7 +454,7 @@ struct common_sampler * common_sampler_init(
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
         } else {
             // Keep distribution sampling when callers request probabilities.
-            const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
+            greedy = params.n_probs == 0 && !params.samplers.empty() &&
                 ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
                  (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
             samplers.push_back(greedy ? llama_sampler_init_greedy() : llama_sampler_init_dist(params.seed));
@@ -449,7 +495,24 @@ struct common_sampler * common_sampler_init(
         /* .cur_p   = */ {},
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+        /* .greedy_fast = */ false,
+        /* .greedy_ban  = */ {},
     };
+
+    result->greedy_fast = greedy && !grmr && !rbudget && common_sampler_keeps_argmax(params);
+    for (const auto & b : params.logit_bias) {
+        if (b.bias != -INFINITY) {
+            result->greedy_fast = false;
+        }
+    }
+    if (result->greedy_fast) {
+        int32_t n_suppress = 0;
+        const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+        result->greedy_ban.assign(suppress, suppress + n_suppress);
+        for (const auto & b : params.logit_bias) {
+            result->greedy_ban.push_back(b.token);
+        }
+    }
 
     return result;
 }
@@ -533,6 +596,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
+        /* .greedy_fast = */ gsmpl->greedy_fast,
+        /* .greedy_ban  = */ gsmpl->greedy_ban,
     };
 }
 
@@ -554,6 +619,8 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng        = src->rng;
+    dst->greedy_fast = src->greedy_fast;
+    dst->greedy_ban  = src->greedy_ban;
     dst->t_total_us = src->t_total_us;
 }
 
@@ -623,6 +690,26 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & rbudget = gsmpl->rbudget;
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+
+    // greedy fast path: argmax over the raw logits instead of building and filtering all candidates
+    if (gsmpl->greedy_fast && llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL) {
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        if (logits != nullptr) {
+            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+            int32_t best = 0;
+            for (int32_t i = 1; i < n_vocab; ++i) {
+                if (logits[i] > logits[best]) {
+                    best = i;
+                }
+            }
+            if (std::find(gsmpl->greedy_ban.begin(), gsmpl->greedy_ban.end(), best) == gsmpl->greedy_ban.end()) {
+                gsmpl->cur.resize(1);
+                gsmpl->cur[0] = llama_token_data{best, logits[best], 1.0f};
+                cur_p = { gsmpl->cur.data(), 1, 0, true };
+                return best;
+            }
+        }
+    }
 
     gsmpl->set_logits(ctx, idx);
 
